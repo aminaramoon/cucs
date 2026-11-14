@@ -497,8 +497,8 @@ void decide_path_capability(path_info& info) noexcept
     }
     // Without any cuFile configuration file, cuFile runs on its built-in defaults,
     // whose RDMA address list is empty.
-    if (auto const& json = info.gds.cufile_json; info.matched_class == storage_class::gpfs &&
-                                                  json.examined && !json.found) {
+    if (auto const& json = info.gds.cufile_json;
+        info.matched_class == storage_class::gpfs && json.examined && !json.found) {
       set_verdict(info,
                   path_capability::compatibility_only,
                   "no cuFile configuration file (" + json.path +

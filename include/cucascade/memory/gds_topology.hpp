@@ -185,8 +185,8 @@ struct gds_setup_info {
  *        @c CUFILE_ENV_PATH_JSON the way cuFile does, empty means none.
  */
 [[nodiscard]] gds_setup_info discover_gds_setup(
-  discovery_roots const& roots                     = {},
-  std::string_view cufile_json_path                = {},
+  discovery_roots const& roots                         = {},
+  std::string_view cufile_json_path                    = {},
   std::optional<std::string> const& override_json_path = std::nullopt);
 
 /**

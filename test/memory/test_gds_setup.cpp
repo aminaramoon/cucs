@@ -380,8 +380,7 @@ TEST_CASE("gds setup: a host without GDS reports nothing loaded", "[gds_setup]")
   CHECK(info.cufile_json.error.find("not found") != std::string::npos);
 }
 
-TEST_CASE("gds setup: the override file is merged over the system file key by key",
-          "[gds_setup]")
+TEST_CASE("gds setup: the override file is merged over the system file key by key", "[gds_setup]")
 {
   fake_host host;
   host.write("etc/cufile.json", R"({

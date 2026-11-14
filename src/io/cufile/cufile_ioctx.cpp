@@ -281,8 +281,8 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
   std::vector<stream_gate> gates;
   // Pieces no smaller than cuFile still serves: a piece below gds_threshold would
   // take the POSIX path.
-  auto const split_bytes = std::max(_config.staging_piece_bytes,
-                                    align_up_block(std::max<std::size_t>(_config.gds_threshold, 1)));
+  auto const split_bytes = std::max(
+    _config.staging_piece_bytes, align_up_block(std::max<std::size_t>(_config.gds_threshold, 1)));
   auto const file_size    = object.size();
   std::size_t piece_count = 0;  // slices after splitting
 
@@ -370,7 +370,7 @@ std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config c
   } catch (std::exception const& e) {
     CUCASCADE_LOG_WARN("cufile: topology discovery failed ({}); planning without it", e.what());
   }
-  auto plan = plan_cufile_pool(cfg, topology ? &*topology : nullptr, probe_platform());
+  auto plan      = plan_cufile_pool(cfg, topology ? &*topology : nullptr, probe_platform());
   auto effective = cfg;
   if (plan.staging_piece_bytes != 0) effective.staging_piece_bytes = plan.staging_piece_bytes;
   // The plan's per-device staging caps (BAR1, cuFile's pinned limit) hold for a
@@ -384,7 +384,7 @@ std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config c
   if (n_reactors != 0) {
     plan.groups.clear();
     plan.flat_reactors = n_reactors;
-    plan.reason = "flat pool of " + std::to_string(n_reactors) + " reactors (configured)";
+    plan.reason        = "flat pool of " + std::to_string(n_reactors) + " reactors (configured)";
   }
   CUCASCADE_LOG_INFO("{}", describe(plan));
   for (auto const& warning : plan.warnings) {

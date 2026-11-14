@@ -132,8 +132,8 @@ class pattern_file {
 };
 
 /// Skip a test whose file cannot be opened O_DIRECT (the cuFile paths need it).
-#define REQUIRE_ODIRECT(file) \
-  do {                        \
+#define REQUIRE_ODIRECT(file)                                                           \
+  do {                                                                                  \
     if (!(file).odirect()) SKIP("the working directory's filesystem refuses O_DIRECT"); \
   } while (false)
 
@@ -913,8 +913,8 @@ TEST_CASE("cufile shutdown waits for an early staged copy before settling it",
   constexpr std::size_t size = 100000;
   rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
   stream.synchronize();
-  cufile_ioctx ioctx{1,
-                     std::make_shared<cufile_reactor::reactor_context>(staging_config(slot_class(11)))};
+  cufile_ioctx ioctx{
+    1, std::make_shared<cufile_reactor::reactor_context>(staging_config(slot_class(11)))};
   ioctx.start();
   auto object = ioctx.open_io_object(file.path());
   stream_latch latch;
@@ -981,9 +981,9 @@ TEST_CASE("cufile routes a read to its destination GPU's group, whatever the cal
   if (device_count() < 2) SKIP("needs two CUDA devices");
   pattern_file file{1UL << 20};
   config cfg;
-  cfg.reactors_per_device = 2;
-  cfg.staging_mode        = staging::never;
-  cfg.gds_threshold       = 1;
+  cfg.reactors_per_device    = 2;
+  cfg.staging_mode           = staging::never;
+  cfg.gds_threshold          = 1;
   constexpr std::size_t size = 200000;
   std::optional<rmm::cuda_stream> stream;
   std::optional<rmm::device_buffer> dst;
@@ -1071,11 +1071,13 @@ TEST_CASE("cufile staging that cuFile will not register falls back to direct rea
   {
     started_ioctx ioctx{cfg, 1};
     auto object = ioctx.get().open_io_object(file.path());
-    REQUIRE(
-      ioctx.get()
-        .device_read_async_io(
-          *object, 9, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
-        .get(60s) == size);
+    REQUIRE(ioctx.get()
+              .device_read_async_io(*object,
+                                    9,
+                                    size,
+                                    static_cast<std::uint8_t*>(dst.data()),
+                                    ::cuda::stream_ref{stream.value()})
+              .get(60s) == size);
     CHECK(matches_file(bytes_at(dst.data(), size), 9));
     auto const stats = ioctx.get().stats();
     CHECK(stats.staged_reads == 0);
@@ -1087,11 +1089,13 @@ TEST_CASE("cufile staging that cuFile will not register falls back to direct rea
     forced.staging_mode = staging::always;
     started_ioctx ioctx{forced, 1};
     auto object = ioctx.get().open_io_object(file.path());
-    REQUIRE(
-      ioctx.get()
-        .device_read_async_io(
-          *object, 9, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
-        .get(60s) == size);
+    REQUIRE(ioctx.get()
+              .device_read_async_io(*object,
+                                    9,
+                                    size,
+                                    static_cast<std::uint8_t*>(dst.data()),
+                                    ::cuda::stream_ref{stream.value()})
+              .get(60s) == size);
     CHECK(matches_file(bytes_at(dst.data(), size), 9));
     CHECK(ioctx.get().stats().staged_bytes == size);
   }

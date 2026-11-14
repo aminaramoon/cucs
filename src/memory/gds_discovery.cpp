@@ -642,7 +642,7 @@ cufile_config_file read_cufile_config(std::string const& path, std::string const
     json_value root;
     root.type = json_value::kind::object;
     std::string error;
-    bool failed = false;
+    bool failed       = false;
     std::size_t found = 0;
     for (auto const& name : {path, override_path}) {
       if (name.empty()) continue;
@@ -714,8 +714,8 @@ gds_setup_info discover_gds_setup(discovery_roots const& roots,
 
     info.force_compat_env = detail::force_compat_value(std::getenv("CUFILE_FORCE_COMPAT_MODE"));
 
-    std::string const path = cufile_json_path.empty() ? std::string{default_cufile_json}
-                                                      : std::string{cufile_json_path};
+    std::string const path =
+      cufile_json_path.empty() ? std::string{default_cufile_json} : std::string{cufile_json_path};
     std::string override_path;
     bool from_environment = false;
     if (override_json_path) {
