@@ -70,7 +70,10 @@ staging_slot staging_pool::acquire(int device,
         ++state.leased;
         return slot;
       }
-      if (require_registered && state.registration_failed) { return {}; }
+      if (require_registered && state.registration_failed_for != nullptr &&
+          state.registration_failed_for == cufile_api::get()) {
+        return {};
+      }
       if (cap_bytes != 0 && state.allocated_bytes + footprint > cap_bytes) { return {}; }
       // Claim the bytes now and room to keep the slot, so concurrent leases see
       // the cap and keeping it later cannot fail; the slow part runs unlocked.
@@ -101,12 +104,12 @@ staging_slot staging_pool::acquire(int device,
       device,
       false};
 
+    auto const* api   = cufile_api::get();
     bool try_register = false;
     {
       std::lock_guard lock(_mutex);
-      try_register = !_devices[device].registration_failed;
+      try_register = _devices[device].registration_failed_for != api;
     }
-    auto const* api = cufile_api::get();
     CUfileError_t status{};
     status.err = CU_FILE_SUCCESS;
     bool attempted = false;
@@ -122,7 +125,7 @@ staging_slot staging_pool::acquire(int device,
       std::lock_guard lock(_mutex);
       auto& state = _devices[device];
       if (slot.registered) { state.registered_bytes += slot.bytes; }
-      if (attempted && !slot.registered) { state.registration_failed = true; }
+      if (attempted && !slot.registered) { state.registration_failed_for = api; }
       if (require_registered && !slot.registered) {
         state.free.push_back(slot);  // capacity reserved above
         keep_unregistered = true;

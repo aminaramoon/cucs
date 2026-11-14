@@ -94,7 +94,9 @@ class staging_pool {
     std::size_t allocated_bytes{0};
     std::size_t registered_bytes{0};
     std::size_t leased{0};
-    bool registration_failed{false};
+    /// The cuFile table whose registration failed here (null = none): it is not
+    /// asked again, but another table (a test's substitute) still is.
+    void const* registration_failed_for{nullptr};
   };
 
   mutable std::mutex _mutex;
