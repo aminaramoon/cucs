@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <exception>
 #include <memory>
@@ -188,8 +189,23 @@ platform_info const& probe_platform() noexcept
   return info;
 }
 
+namespace {
+/// -1: no override; 0 / 1: what gds_available() reports (tests only).
+std::atomic<int> gds_available_override{-1};
+}  // namespace
+
+namespace detail {
+void set_gds_available_for_testing(std::optional<bool> value) noexcept
+{
+  gds_available_override.store(value ? (*value ? 1 : 0) : -1, std::memory_order_release);
+}
+}  // namespace detail
+
 bool gds_available() noexcept
 {
+  if (auto const forced = gds_available_override.load(std::memory_order_acquire); forced >= 0) {
+    return forced == 1;
+  }
   auto const& info = probe_platform();
   return info.driver_opened && info.properties_available && !info.compat_only &&
          !info.forced_compat;

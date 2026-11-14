@@ -23,6 +23,7 @@
 #include <dlfcn.h>
 
 #include <atomic>
+#include <cstdint>
 #include <optional>
 #include <tuple>
 
@@ -103,6 +104,9 @@ struct loaded_library {
 
 /// The table tests substitute for libcufile (see detail::set_cufile_api_for_testing).
 std::atomic<cufile_api const*> api_for_testing{nullptr};
+/// The substitute's generation (0 while libcufile serves); see cufile_api::generation.
+std::atomic<std::uint64_t> api_generation{0};
+std::atomic<std::uint64_t> next_generation{1};
 
 }  // namespace
 
@@ -110,6 +114,8 @@ namespace detail {
 
 void set_cufile_api_for_testing(cufile_api const* api) noexcept
 {
+  api_generation.store(api == nullptr ? 0 : next_generation.fetch_add(1),
+                       std::memory_order_release);
   api_for_testing.store(api, std::memory_order_release);
 }
 
@@ -122,6 +128,11 @@ cufile_api const* cufile_api::get() noexcept
     return substitute;
   }
   return loaded();
+}
+
+std::uint64_t cufile_api::generation() noexcept
+{
+  return api_generation.load(std::memory_order_acquire);
 }
 
 cufile_api const* cufile_api::loaded() noexcept

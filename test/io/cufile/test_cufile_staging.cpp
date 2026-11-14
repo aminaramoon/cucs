@@ -341,9 +341,26 @@ class scripted_cufile {
     std::lock_guard lock(state.mutex);
     state.max_return = bytes;
   }
+  /// Make cuFileBufRegister fail, as an exhausted BAR1 would.
+  void refuse_registration()
+  {
+    auto& state = fake();
+    std::lock_guard lock(state.mutex);
+    state.register_buffers = false;
+  }
 
  private:
   cufile_api _api{};
+};
+
+/// Makes gds_available() report GDS for the guard's lifetime, so automatic
+/// staging runs on hosts without a GDS stack.
+class gds_reported {
+ public:
+  gds_reported() { cucascade::io::cufile::detail::set_gds_available_for_testing(true); }
+  ~gds_reported() { cucascade::io::cufile::detail::set_gds_available_for_testing(std::nullopt); }
+  gds_reported(gds_reported const&)            = delete;
+  gds_reported& operator=(gds_reported const&) = delete;
 };
 
 /// A staging piece size whose slot (piece + two blocks, rounded up to 64 KiB) is
@@ -996,4 +1013,88 @@ TEST_CASE("cufile routes a read to its destination GPU's group, whatever the cal
   CHECK(on_one.direct_bytes + on_one.posix_device_bytes == size);
   CHECK(on_zero.direct_bytes + on_zero.posix_device_bytes == 0);
   ioctx.shutdown();
+}
+
+TEST_CASE("cufile automatic staging reads into registered slots when cuFile reports GDS",
+          "[io][cufile][staging][gpu]")
+{
+  if (device_count() == 0) SKIP("no CUDA device");
+  pattern_file file{1UL << 20};
+  scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
+  gds_reported gds;
+
+  rmm::cuda_stream stream;
+  constexpr std::size_t offset = 12345;
+  constexpr std::size_t size   = 400000;
+  rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
+  stream.synchronize();
+  auto cfg         = staging_config(slot_class(13));
+  cfg.staging_mode = staging::automatic;
+  started_ioctx ioctx{cfg, 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  REQUIRE(ioctx.get()
+            .device_read_async_io(*object,
+                                  offset,
+                                  size,
+                                  static_cast<std::uint8_t*>(dst.data()),
+                                  ::cuda::stream_ref{stream.value()})
+            .get(60s) == size);
+  CHECK(matches_file(bytes_at(dst.data(), size), offset));
+  check_calls_are_dma_ready(cufile);
+  CHECK(ioctx.get().stats().staged_bytes == size);
+}
+
+TEST_CASE("cufile staging that cuFile will not register falls back to direct reads",
+          "[io][cufile][staging][gpu]")
+{
+  if (device_count() == 0) SKIP("no CUDA device");
+  pattern_file file{1UL << 20};
+  scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
+  cufile.refuse_registration();
+  gds_reported gds;
+
+  auto cfg         = staging_config(slot_class(14));
+  cfg.staging_mode = staging::automatic;
+  // Registration is refused: nothing can be reserved, and nothing is allocated
+  // over and over trying.
+  CHECK(cucascade::io::cufile::reserve_staging(0, 2, cfg) == 0);
+  auto const allocated = cucascade::io::cufile::staging_usage_of(0).allocated_bytes;
+  CHECK(cucascade::io::cufile::reserve_staging(0, 2, cfg) == 0);
+  CHECK(cucascade::io::cufile::staging_usage_of(0).allocated_bytes == allocated);
+
+  rmm::cuda_stream stream;
+  constexpr std::size_t size = 300000;
+  rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
+  stream.synchronize();
+  {
+    started_ioctx ioctx{cfg, 1};
+    auto object = ioctx.get().open_io_object(file.path());
+    REQUIRE(
+      ioctx.get()
+        .device_read_async_io(
+          *object, 9, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
+        .get(60s) == size);
+    CHECK(matches_file(bytes_at(dst.data(), size), 9));
+    auto const stats = ioctx.get().stats();
+    CHECK(stats.staged_reads == 0);
+    CHECK(stats.direct_bytes == size);
+  }
+  // Forced staging still stages, into the unregistered slot (cuFile bounces it).
+  {
+    auto forced         = cfg;
+    forced.staging_mode = staging::always;
+    started_ioctx ioctx{forced, 1};
+    auto object = ioctx.get().open_io_object(file.path());
+    REQUIRE(
+      ioctx.get()
+        .device_read_async_io(
+          *object, 9, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
+        .get(60s) == size);
+    CHECK(matches_file(bytes_at(dst.data(), size), 9));
+    CHECK(ioctx.get().stats().staged_bytes == size);
+  }
+  // Freeing the device's spare staging lets a later registration try again.
+  std::ignore = cucascade::io::cufile::release_staging(0);
 }

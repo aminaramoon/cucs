@@ -62,6 +62,8 @@ struct gpu_topology_info {
   /// through BAR1: memory registered with @c cuFileBufRegister (or pinned for
   /// GPUDirect RDMA) is mapped into it, so it bounds how much can be registered
   /// (256 MiB on a T4; as large as device memory on data-center GPUs).
+  /// For a MIG instance: the physical GPU's BAR1, which all its instances share
+  /// (0 when NVML refuses the query without privileges).
   std::size_t bar1_total_bytes{0};
   std::size_t bar1_free_bytes{0};  ///< BAR1 free when discovered (NVML), 0 if unknown.
   std::optional<gpu_runtime_attributes>

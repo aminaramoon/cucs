@@ -176,6 +176,9 @@ TEST_CASE("cufile path capability: only the matching storage-class bit counts", 
   nfs.storage.devices.clear();
   CHECK(decided(nfs).capability == path_capability::direct_candidate);
   CHECK(decided(nfs).matched_class == storage_class::nfs);
+  auto rdma6                  = nfs;
+  rdma6.storage.super_options = "rw,vers=4.2,proto=rdma6";
+  CHECK(decided(rdma6).capability == path_capability::direct_candidate);
   auto tcp                  = nfs;
   tcp.storage.super_options = "rw,vers=4.2,proto=tcp";
   CHECK(decided(tcp).capability == path_capability::compatibility_only);

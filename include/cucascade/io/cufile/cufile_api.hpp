@@ -21,6 +21,7 @@
 #include <cufile.h>
 
 #include <cstddef>
+#include <cstdint>
 
 namespace cucascade::io::cufile {
 
@@ -130,6 +131,11 @@ struct cufile_api {
   /// libcufile's own table, never a test substitute: what the process-wide
   /// platform probe describes.  Null when the library is unavailable.
   [[nodiscard]] static cufile_api const* loaded() noexcept;
+
+  /// Which table @ref get returns: 0 for libcufile's, a fresh number for every
+  /// test substitute installed, so state kept per table (e.g. a failed
+  /// registration) never carries over to another one at the same address.
+  [[nodiscard]] static std::uint64_t generation() noexcept;
 
   /**
    * @brief Open the cuFile driver once per process (the test substitute's

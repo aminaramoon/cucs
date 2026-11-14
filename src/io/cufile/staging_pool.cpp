@@ -75,7 +75,7 @@ staging_slot staging_pool::acquire(int device,
         // Nothing to allocate when the slot could not be registered anyway.
         auto const* api = cufile_api::get();
         if (api == nullptr || api->buf_register == nullptr ||
-            (state.registration_failed_for != nullptr && state.registration_failed_for == api)) {
+            state.registration_failed_for == cufile_api::generation()) {
           return {};
         }
       }
@@ -109,13 +109,14 @@ staging_slot staging_pool::acquire(int device,
       device,
       false,
       raw,
-      nullptr};
+      0};
 
-    auto const* api   = cufile_api::get();
-    bool try_register = false;
+    auto const* api       = cufile_api::get();
+    auto const generation = cufile_api::generation();
+    bool try_register     = false;
     {
       std::lock_guard lock(_mutex);
-      try_register = _devices[device].registration_failed_for != api;
+      try_register = _devices[device].registration_failed_for != generation;
     }
     CUfileError_t status{};
     status.err     = CU_FILE_SUCCESS;
@@ -125,7 +126,7 @@ staging_slot staging_pool::acquire(int device,
       attempted       = true;
       status          = api->buf_register(slot.base, slot.bytes, 0);
       slot.registered = status.err == CU_FILE_SUCCESS;
-      if (slot.registered) slot.registered_by = api;
+      if (slot.registered) slot.registered_generation = generation;
     }
 
     bool keep_unregistered = false;
@@ -136,7 +137,7 @@ staging_slot staging_pool::acquire(int device,
       // A failed registration, or one that could not even be tried (no driver),
       // is not retried for this table.
       if (!slot.registered && (attempted || require_registered)) {
-        state.registration_failed_for = api;
+        state.registration_failed_for = generation;
       }
       if (require_registered && !slot.registered) {
         state.free.push_back(slot);  // capacity reserved above
@@ -185,7 +186,7 @@ std::size_t staging_pool::release_free(int device) noexcept
     if (it == _devices.end()) return 0;
     doomed.swap(it->second.free);
     // With the memory back, registering may succeed again.
-    it->second.registration_failed_for = nullptr;
+    it->second.registration_failed_for.reset();
   }
   std::size_t freed = 0;
   try {
@@ -195,11 +196,10 @@ std::size_t staging_pool::release_free(int device) noexcept
       // test's substitute while it is still installed (a removed one is gone).
       if (slot.registered) {
         cufile_api const* owner = nullptr;
-        if (auto const* real = cufile_api::loaded();
-            real != nullptr && real == slot.registered_by) {
-          owner = real;
-        } else if (auto const* current = cufile_api::get(); current == slot.registered_by) {
-          owner = current;
+        if (slot.registered_generation == 0) {
+          owner = cufile_api::loaded();
+        } else if (slot.registered_generation == cufile_api::generation()) {
+          owner = cufile_api::get();
         }
         if (owner != nullptr && owner->buf_deregister != nullptr) {
           std::ignore = owner->buf_deregister(slot.base);

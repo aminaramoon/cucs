@@ -137,7 +137,8 @@ struct nvidia_fs_info {
   std::string gds_version;  ///< "GDS Version" in the stats file; empty if unknown.
   /// "Mellanox PeerDirect Supported" in the stats file: whether RDMA filesystem
   /// clients (Storage Scale, NFSoRDMA, Lustre, ...) can DMA into GPU memory.
-  /// Unset when the stats file is unreadable.
+  /// Unset when the stats file is unreadable or does not report it (recent
+  /// nvidia-fs releases no longer print the line; see @c peer_memory_loaded).
   std::optional<bool> peer_direct_supported;
   std::optional<bool> io_stats_enabled;   ///< Per-I/O statistics are being collected.
   std::vector<nvidia_fs_gpu_stats> gpus;  ///< Per-GPU registration and cache usage.

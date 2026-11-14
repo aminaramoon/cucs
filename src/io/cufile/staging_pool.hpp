@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace cucascade::io::cufile::detail {
@@ -42,8 +43,8 @@ struct staging_slot {
   bool registered{false};
   /// What @c cudaMalloc returned (@c base is rounded up inside it).
   void* allocation{nullptr};
-  /// The cuFile table that registered it (null when not registered).
-  void const* registered_by{nullptr};
+  /// The cuFile table that registered it (@c cufile_api::generation()).
+  std::uint64_t registered_generation{0};
 
   [[nodiscard]] explicit operator bool() const noexcept { return base != nullptr; }
 };
@@ -102,9 +103,9 @@ class staging_pool {
     std::size_t allocated_bytes{0};
     std::size_t registered_bytes{0};
     std::size_t leased{0};
-    /// The cuFile table whose registration failed here (null = none): it is not
-    /// asked again, but another table (a test's substitute) still is.
-    void const* registration_failed_for{nullptr};
+    /// The cuFile table (@c cufile_api::generation()) whose registration failed
+    /// here: it is not asked again, but another table (a test's substitute) is.
+    std::optional<std::uint64_t> registration_failed_for;
   };
 
   mutable std::mutex _mutex;
