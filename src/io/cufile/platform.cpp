@@ -25,10 +25,12 @@
 
 #include <cufile.h>
 
+#include <array>
 #include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -54,26 +56,82 @@ bool force_compat_env_on(char const* value) noexcept
 
 namespace {
 
+/// Fill @p out from cuFile's parameter getters, when the library has them.
+void read_parameters(cufile_api const& api, platform_info::parameters_info& out) noexcept
+{
+  out.available = api.get_size_parameter != nullptr && api.get_bool_parameter != nullptr;
+  if (!out.available) return;
+  auto size = [&api](size_parameter param) -> std::optional<std::size_t> {
+    std::size_t value = 0;
+    if (api.get_size_parameter(param, &value).err != CU_FILE_SUCCESS) return std::nullopt;
+    return value;
+  };
+  auto flag = [&api](bool_parameter param) -> std::optional<bool> {
+    bool value = false;
+    if (api.get_bool_parameter(param, &value).err != CU_FILE_SUCCESS) return std::nullopt;
+    return value;
+  };
+  auto text = [&api](string_parameter param) -> std::optional<std::string> {
+    if (api.get_string_parameter == nullptr) return std::nullopt;
+    std::array<char, 256> buffer{};
+    if (api.get_string_parameter(param, buffer.data(), static_cast<int>(buffer.size())).err !=
+        CU_FILE_SUCCESS) {
+      return std::nullopt;
+    }
+    buffer.back() = '\0';
+    return std::string{buffer.data()};
+  };
+  try {
+    out.parallel_io              = flag(bool_parameter::execution_parallel_io);
+    out.max_io_threads           = size(size_parameter::execution_max_io_threads);
+    out.max_io_queue_depth       = size(size_parameter::execution_max_io_queue_depth);
+    out.min_io_threshold_size_kb = size(size_parameter::execution_min_io_threshold_kb);
+    out.max_request_parallelism  = size(size_parameter::execution_max_request_parallelism);
+    out.use_poll_mode            = flag(bool_parameter::use_poll_mode);
+    out.allow_compat_mode        = flag(bool_parameter::allow_compat_mode);
+    out.force_compat_mode        = flag(bool_parameter::force_compat_mode);
+    out.use_pci_p2pdma           = flag(bool_parameter::use_pci_p2pdma);
+    out.io_batch_size            = size(size_parameter::io_batch_size);
+    out.profile_stats            = size(size_parameter::profile_stats);
+    out.rdma_transport           = text(string_parameter::rdma_transport);
+    out.logging_level            = text(string_parameter::logging_level);
+  } catch (...) {
+    // Best effort: keep what was read.
+  }
+}
+
 [[nodiscard]] platform_info compute_platform() noexcept
 {
   platform_info info{};
   info.forced_compat = detail::force_compat_env_on(std::getenv("CUFILE_FORCE_COMPAT_MODE"));
   try {
-    auto const* api        = cufile_api::get();
+    auto const* api        = cufile_api::loaded();
     info.library_available = api != nullptr;
     if (!info.library_available) return info;
     info.version = cufile_api::version();
-    if (!cufile_api::open_driver()) return info;
+    if (!cufile_api::open_loaded_driver()) return info;
     info.driver_opened = true;
     CUfileDrvProps_t props{};
     if (api->driver_get_properties(&props).err != CU_FILE_SUCCESS) {
       CUCASCADE_LOG_WARN("cufile: cuFileDriverGetProperties failed; the GDS mode is unknown");
       return info;
     }
-    info.properties_available  = true;
-    info.dstatusflags          = props.nvfs.dstatusflags;
-    info.compat_only           = info.dstatusflags == 0;
-    info.max_direct_io_size_kb = props.nvfs.max_direct_io_size;
+    info.properties_available          = true;
+    info.dstatusflags                  = props.nvfs.dstatusflags;
+    info.compat_only                   = info.dstatusflags == 0;
+    info.max_direct_io_size_kb         = props.nvfs.max_direct_io_size;
+    info.nvfs_major_version            = props.nvfs.major_version;
+    info.nvfs_minor_version            = props.nvfs.minor_version;
+    info.poll_threshold_size_kb        = props.nvfs.poll_thresh_size;
+    info.dcontrolflags                 = props.nvfs.dcontrolflags;
+    info.fflags                        = props.fflags;
+    info.max_device_cache_size_kb      = props.max_device_cache_size;
+    info.per_buffer_cache_size_kb      = props.per_buffer_cache_size;
+    info.max_device_pinned_mem_size_kb = props.max_device_pinned_mem_size;
+    info.max_batch_io_size             = props.max_batch_io_size;
+    info.max_batch_io_timeout_msecs    = props.max_batch_io_timeout_msecs;
+    read_parameters(*api, info.parameters);
+    if (info.parameters.force_compat_mode.value_or(false)) info.forced_compat = true;
   } catch (std::exception const& e) {
     CUCASCADE_LOG_WARN("cufile: probing the cuFile library failed: {}", e.what());
   } catch (...) {
@@ -104,6 +162,24 @@ platform_info const& probe_platform() noexcept
       CUCASCADE_LOG_INFO("cufile: cuFile {} reports GPUDirect Storage (dstatusflags {:#x})",
                          result.version,
                          result.dstatusflags);
+    }
+    if (result.properties_available) {
+      auto const& p = result.parameters;
+      CUCASCADE_LOG_INFO(
+        "cufile: nvidia-fs {}.{}, max direct I/O {} KiB, bounce cache {} KiB/GPU in {} KiB "
+        "buffers, pinned limit {} KiB/GPU, poll mode {}, parallel_io {}, max_io_threads {}, "
+        "max_request_parallelism {}",
+        result.nvfs_major_version,
+        result.nvfs_minor_version,
+        result.max_direct_io_size_kb,
+        result.max_device_cache_size_kb,
+        result.per_buffer_cache_size_kb,
+        result.max_device_pinned_mem_size_kb,
+        (result.dcontrolflags & 1U) != 0 ? "on" : "off",
+        p.parallel_io ? (*p.parallel_io ? "on" : "off") : "unknown",
+        p.max_io_threads ? std::to_string(*p.max_io_threads) : std::string{"unknown"},
+        p.max_request_parallelism ? std::to_string(*p.max_request_parallelism)
+                                  : std::string{"unknown"});
     }
     return result;
   }();

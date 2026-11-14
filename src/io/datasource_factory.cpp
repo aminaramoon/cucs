@@ -20,6 +20,9 @@
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
+#include <cucascade/io/cufile/placement.hpp>
+#include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 #endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
@@ -86,8 +89,34 @@ factory_type make_cufile_ioctx_factory()
 {
   return [](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
-      auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile);
-      return std::make_shared<cufile::cufile_ioctx>(config.cufile_n_reactors, std::move(ctx));
+      if (config.cufile_n_reactors != 0) {
+        auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile);
+        return std::make_shared<cufile::cufile_ioctx>(config.cufile_n_reactors, std::move(ctx));
+      }
+      // Plan a group of reactors per GPU from the topology.  RDMA NICs are kept
+      // when their port is active even without an IP address (InfiniBand
+      // without IPoIB), since GDS over RDMA does not need one.
+      std::optional<cucascade::memory::system_topology_info> topology;
+      try {
+        cucascade::memory::topology_discovery discovery;
+        if (discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE)) {
+          topology = discovery.get_topology();
+        }
+      } catch (const std::exception& e) {
+        CUCASCADE_LOG_WARN("make_cufile_ioctx_factory: topology discovery failed: {}", e.what());
+      }
+      auto plan = cufile::plan_cufile_pool(
+        config.cufile, topology ? &*topology : nullptr, cufile::probe_platform());
+      CUCASCADE_LOG_INFO("{}", cufile::describe(plan));
+      std::vector<std::size_t> caps;
+      for (auto const& group : plan.groups) {
+        auto const index = static_cast<std::size_t>(group.device);
+        if (caps.size() <= index) caps.resize(index + 1, config.cufile.max_staging_bytes_per_device);
+        caps[index] = group.staging_cap_bytes;
+      }
+      auto ctx =
+        std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile, std::move(caps));
+      return std::make_shared<cufile::cufile_ioctx>(std::move(plan), std::move(ctx));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_cufile_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -227,13 +256,24 @@ std::optional<io_context_type> io_context_registry::lookup_path(
   // uring and rest claim disjoint paths (local files vs s3:// URLs), but both
   // cufile and uring answer true for a local file, and iteration order must not
   // decide between them: cufile is considered only when the config asked for
-  // it, and then it displaces uring.  The rules, per configured backend:
-  //   * cufile -- skip uring for local files (cufile wins); rest keeps s3://.
+  // it, and then it displaces uring for the paths it claims.  The rules, per
+  // configured backend:
+  //   * cufile -- cufile wins the local files its checker claims; uring keeps
+  //     any it declines (a narrowed checker, e.g. GDS-capable mounts only);
+  //     rest keeps s3://.
   //   * native -- skip cufile for local files (uring wins); rest keeps s3://.
+  bool cufile_claims = false;
+  if (_prefer_cufile) {
+    auto const cufile = _entries.find(io_context_type::cufile);
+    cufile_claims     = cufile != _entries.end() && cufile->second.checker(path);
+  }
   for (const auto& [type, entry] : _entries) {
+    if (type == io_context_type::cufile) {
+      if (cufile_claims) return type;
+      continue;
+    }
+    if (type == io_context_type::uring && cufile_claims) continue;
     if (!entry.checker(path)) continue;
-    if (_prefer_cufile && type == io_context_type::uring) { continue; }
-    if (!_prefer_cufile && type == io_context_type::cufile) { continue; }
     return type;
   }
   return std::nullopt;

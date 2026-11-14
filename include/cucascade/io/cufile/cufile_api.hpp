@@ -117,7 +117,8 @@ struct cufile_api {
   get_string_parameter_fn get_string_parameter{nullptr};
 
   /**
-   * @brief The process-wide table, loaded on first call.
+   * @brief The table every cuFile call goes through: libcufile's, loaded on first
+   *        call, unless a test substituted its own (@c detail::set_cufile_api_for_testing).
    *
    * Thread-safe; never throws.
    *
@@ -126,8 +127,13 @@ struct cufile_api {
    */
   [[nodiscard]] static cufile_api const* get() noexcept;
 
+  /// libcufile's own table, never a test substitute: what the process-wide
+  /// platform probe describes.  Null when the library is unavailable.
+  [[nodiscard]] static cufile_api const* loaded() noexcept;
+
   /**
-   * @brief Open the cuFile driver once per process.
+   * @brief Open the cuFile driver once per process (the test substitute's
+   *        @c driver_open, every call, while one is installed).
    *
    * Later calls return the first call's outcome.  The driver is never closed: cuFile releases it
    * at process exit.  Thread-safe; never throws.
@@ -135,6 +141,9 @@ struct cufile_api {
    * @return Whether `cuFileDriverOpen` succeeded (false when the library is unavailable).
    */
   [[nodiscard]] static bool open_driver() noexcept;
+
+  /// As @ref open_driver, always for libcufile itself.
+  [[nodiscard]] static bool open_loaded_driver() noexcept;
 
   /**
    * @brief `cuFileGetVersion`, e.g. 1170 for libcufile 1.17.

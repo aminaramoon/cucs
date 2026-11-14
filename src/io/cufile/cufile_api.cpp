@@ -17,10 +17,12 @@
  */
 
 #include <cucascade/io/cufile/cufile_api.hpp>
+#include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/log/logging.hpp>
 
 #include <dlfcn.h>
 
+#include <atomic>
 #include <optional>
 #include <tuple>
 
@@ -99,18 +101,48 @@ struct loaded_library {
   return loaded;
 }
 
+/// The table tests substitute for libcufile (see detail::set_cufile_api_for_testing).
+std::atomic<cufile_api const*> api_for_testing{nullptr};
+
 }  // namespace
+
+namespace detail {
+
+void set_cufile_api_for_testing(cufile_api const* api) noexcept
+{
+  api_for_testing.store(api, std::memory_order_release);
+}
+
+}  // namespace detail
 
 cufile_api const* cufile_api::get() noexcept
 {
-  auto const& loaded = library();
-  return loaded.api.has_value() ? &*loaded.api : nullptr;
+  if (auto const* substitute = api_for_testing.load(std::memory_order_acquire);
+      substitute != nullptr) {
+    return substitute;
+  }
+  return loaded();
+}
+
+cufile_api const* cufile_api::loaded() noexcept
+{
+  auto const& library_state = library();
+  return library_state.api.has_value() ? &*library_state.api : nullptr;
 }
 
 bool cufile_api::open_driver() noexcept
 {
+  if (auto const* substitute = api_for_testing.load(std::memory_order_acquire);
+      substitute != nullptr) {
+    return substitute->driver_open != nullptr && substitute->driver_open().err == CU_FILE_SUCCESS;
+  }
+  return open_loaded_driver();
+}
+
+bool cufile_api::open_loaded_driver() noexcept
+{
   static bool const opened = [] {
-    auto const* api = get();
+    auto const* api = loaded();
     if (api == nullptr) { return false; }
     auto const status = api->driver_open();
     if (status.err != CU_FILE_SUCCESS) {
