@@ -326,8 +326,15 @@ class scripted_cufile {
   cufile_api _api{};
 };
 
-/// A forced-staging config with its own slot size, so the process-wide staging
-/// pool hands this test slots no other test registered.
+/// A staging piece size whose slot (piece + two blocks, rounded up to 64 KiB) is
+/// exactly @p k x 64 KiB: tests use distinct @p k so the process-wide staging pool
+/// never hands one test another's slots.
+[[nodiscard]] constexpr std::size_t slot_class(std::size_t k) noexcept
+{
+  return k * (64UL << 10) - 2 * block;
+}
+
+/// A forced-staging config with pieces of @p piece_bytes.
 [[nodiscard]] config staging_config(std::size_t piece_bytes)
 {
   config cfg;
@@ -436,7 +443,7 @@ TEST_CASE("cufile staged reads ask cuFile only for aligned ranges within the fil
   // A file ending in a partial block; pieces of 64 KiB so ranges span several.
   pattern_file file{(3UL << 20) + 1234};
   scripted_cufile cufile;
-  started_ioctx ioctx{staging_config(64UL << 10)};
+  started_ioctx ioctx{staging_config(slot_class(3))};
   auto object = ioctx.get().open_io_object(file.path());
 
   struct sample {
@@ -490,7 +497,7 @@ TEST_CASE("cufile splits a large device read into pieces several reactors stage"
   if (device_count() == 0) SKIP("no CUDA device");
   pattern_file file{4UL << 20};
   scripted_cufile cufile;
-  constexpr std::size_t piece = 128UL << 10;
+  constexpr std::size_t piece = slot_class(4);
   started_ioctx ioctx{staging_config(piece), 4};
   auto object = ioctx.get().open_io_object(file.path());
 
@@ -520,7 +527,7 @@ TEST_CASE("cufile staged read that cuFile fails is served by POSIX instead",
   pattern_file file{1UL << 20};
   scripted_cufile cufile;
   cufile.fail_call(1);
-  started_ioctx ioctx{staging_config(132UL << 10), 1};
+  started_ioctx ioctx{staging_config(slot_class(5)), 1};
   auto object = ioctx.get().open_io_object(file.path());
 
   rmm::cuda_stream stream;
@@ -544,7 +551,7 @@ TEST_CASE("cufile staged reads continue after short cuFile returns", "[io][cufil
   pattern_file file{(1UL << 20) + 77};
   scripted_cufile cufile;
   cufile.max_return(block + 100);  // never a whole piece, and never block-aligned
-  started_ioctx ioctx{staging_config(136UL << 10), 1};
+  started_ioctx ioctx{staging_config(slot_class(6)), 1};
   auto object = ioctx.get().open_io_object(file.path());
 
   rmm::cuda_stream stream;
@@ -568,7 +575,7 @@ TEST_CASE("cufile reads a staged piece before its busy stream is ready; only the
   if (device_count() == 0) SKIP("no CUDA device");
   pattern_file file{1UL << 20};
   scripted_cufile cufile;
-  started_ioctx ioctx{staging_config(140UL << 10), 1};
+  started_ioctx ioctx{staging_config(slot_class(7)), 1};
   auto object = ioctx.get().open_io_object(file.path());
 
   rmm::cuda_stream stream;
@@ -712,7 +719,7 @@ TEST_CASE("cufile reads a destination on another GPU than the calling thread's",
   if (device_count() < 2) SKIP("needs two CUDA devices");
   pattern_file file{1UL << 20};
   scripted_cufile cufile;
-  started_ioctx ioctx{staging_config(144UL << 10), 1};
+  started_ioctx ioctx{staging_config(slot_class(8)), 1};
   auto object = ioctx.get().open_io_object(file.path());
 
   constexpr std::size_t offset = 100;
@@ -740,7 +747,7 @@ TEST_CASE("cufile reserves staging once per device and reuses it", "[io][cufile]
 {
   if (device_count() == 0) SKIP("no CUDA device");
   scripted_cufile cufile;
-  auto cfg  = staging_config(148UL << 10);
+  auto cfg  = staging_config(slot_class(9));
   auto const before = cucascade::io::cufile::staging_usage_of(0);
   CHECK(cucascade::io::cufile::reserve_staging(0, 3, cfg) == 3);
   auto const after = cucascade::io::cufile::staging_usage_of(0);
@@ -750,7 +757,7 @@ TEST_CASE("cufile reserves staging once per device and reuses it", "[io][cufile]
   CHECK(cucascade::io::cufile::reserve_staging(0, 3, cfg) == 3);
   CHECK(cucascade::io::cufile::staging_usage_of(0).allocated_bytes == after.allocated_bytes);
   // The cap stops a device's staging from growing past it.
-  auto capped                         = staging_config(152UL << 10);
+  auto capped                         = staging_config(slot_class(10));
   capped.max_staging_bytes_per_device = after.allocated_bytes;
   CHECK(cucascade::io::cufile::reserve_staging(0, 1, capped) == 0);
 }
