@@ -131,6 +131,16 @@ void collect_warnings(memory::system_topology_info const* topology,
       out.push_back("CUFILE_FORCE_COMPAT_MODE is set: every cuFile read bounces through host memory");
     }
   }
+  // cuFile moves one call in sequential chunks of max_direct_io_size, so that is
+  // all one reactor keeps in flight per call on a GDS path.
+  bool const gds = platform.driver_opened && platform.properties_available &&
+                   !platform.compat_only && !platform.forced_compat;
+  if (gds && platform.max_direct_io_size_kb != 0 && platform.max_direct_io_size_kb < 4096) {
+    out.push_back("cuFile's max_direct_io_size is " +
+                  std::to_string(platform.max_direct_io_size_kb) +
+                  " KiB: each call keeps at most that in flight, so a deep pool is needed; raise "
+                  "properties.max_direct_io_size_kb (up to 16384) in cufile.json");
+  }
   if (platform.properties_available && (platform.dcontrolflags & 1U) != 0 && on_gpfs) {
     out.push_back(
       "cuFile poll mode is on: Storage Scale does not support it (requests are converted to "
