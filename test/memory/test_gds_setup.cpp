@@ -431,7 +431,9 @@ TEST_CASE("gds setup: discovery on this host never throws", "[gds_setup]")
   REQUIRE_NOTHROW(info = discover_gds_setup());
   // Whatever the host has, the configuration file is one cuFile would read.
   CHECK_FALSE(info.cufile_json.path.empty());
-  if (info.cufile_json.parsed) { CHECK(info.cufile_json.found); }
+  CHECK(info.cufile_json.examined);
+  // No file at all means cuFile's defaults, which always "parse".
+  if (!info.cufile_json.found) { CHECK(info.cufile_json.parsed); }
   INFO("nvidia-fs loaded " << info.nvidia_fs.loaded << ", cufile.json " << info.cufile_json.path
                            << (info.cufile_json.found ? "" : " (absent)"));
 }
