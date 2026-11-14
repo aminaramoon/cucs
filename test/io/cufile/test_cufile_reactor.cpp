@@ -23,12 +23,15 @@
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
+#include <cucascade/io/cufile/placement.hpp>
+#include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -1247,6 +1250,27 @@ template <class Run>
   return rates[rates.size() / 2];
 }
 
+/// Which path served the probe's reads.
+void print_stats(cucascade::io::cufile::reactor_stats const& stats)
+{
+  std::printf(
+    "cufile paths: staged %llu reads / %.2f GB (%llu before their stream was ready), direct "
+    "%llu / %.2f GB, posix-device %llu / %.2f GB, host %llu / %.2f GB, cuFile failures %llu, "
+    "parked %llu\n",
+    static_cast<unsigned long long>(stats.staged_reads),
+    static_cast<double>(stats.staged_bytes) / 1e9,
+    static_cast<unsigned long long>(stats.early_staged_reads),
+    static_cast<unsigned long long>(stats.direct_reads),
+    static_cast<double>(stats.direct_bytes) / 1e9,
+    static_cast<unsigned long long>(stats.posix_device_reads),
+    static_cast<double>(stats.posix_device_bytes) / 1e9,
+    static_cast<unsigned long long>(stats.host_reads),
+    static_cast<double>(stats.host_bytes) / 1e9,
+    static_cast<unsigned long long>(stats.cufile_failures),
+    static_cast<unsigned long long>(stats.parked_slices));
+  std::fflush(stdout);
+}
+
 /// Run every probe scenario against @p ctx and print one line per scenario.
 void run_probe(std::string const& label,
                cucascade::io::ioctx& ctx,
@@ -1324,6 +1348,59 @@ void run_probe(std::string const& label,
     });
   }
 
+  // Parquet-shaped reads: column chunks of 1-8 MiB at arbitrary file offsets into
+  // arbitrary (256 B-aligned, as RMM hands them out, plus an odd byte) device
+  // addresses, 64 per vectored call, from four submitting threads at once.
+  {
+    struct chunk {
+      std::size_t offset;
+      std::size_t size;
+      std::size_t dst;
+    };
+    std::vector<chunk> chunks;
+    std::uint64_t state = 0x2545F4914F6CDD1DULL;
+    auto next           = [&state] {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      return state;
+    };
+    std::size_t placed = 0;
+    std::size_t total  = 0;
+    while (true) {
+      auto const size   = (1UL << 20) + next() % (7UL << 20);
+      auto const offset = next() % (bytes - size);
+      auto const where  = (placed + 255) / 256 * 256 + (next() % 2);
+      if (where + size > window) break;
+      chunks.push_back(chunk{offset, size, where});
+      placed = where + size;
+      total += size;
+    }
+    constexpr std::size_t submitters = 4;
+    constexpr std::size_t per_call   = 64;
+    scenario("parquet 1-8 MiB unaligned x4", total, [&] {
+      std::vector<std::thread> threads;
+      for (std::size_t t = 0; t < submitters; ++t) {
+        threads.emplace_back([&, t] {
+          for (std::size_t first = t * per_call; first < chunks.size();
+               first += submitters * per_call) {
+            std::vector<cucascade::io::slice> slices;
+            std::size_t expected = 0;
+            for (std::size_t i = first; i < std::min(chunks.size(), first + per_call); ++i) {
+              slices.emplace_back(chunks[i].offset, chunks[i].size, base + chunks[i].dst);
+              expected += chunks[i].size;
+            }
+            REQUIRE(ctx.device_readv_async_io(*object, slices, streams[t % n_stream]).get(120s) ==
+                    expected);
+          }
+        });
+      }
+      for (auto& thread : threads) {
+        thread.join();
+      }
+    });
+  }
+
   {
     constexpr std::size_t piece = 4UL << 20;
     std::vector<std::uint8_t> host(window);
@@ -1360,8 +1437,39 @@ TEST_CASE("cufile throughput probe", "[.cufile-bench]")
   if (which == "both" || which == "cufile") {
     config cfg{};
     cfg.gds_threshold = env_size("CUCASCADE_IO_BENCH_GDS_THRESHOLD", cfg.gds_threshold);
-    started_ioctx ioctx{cfg, reactors};
-    run_probe("cufile", ioctx.get(), path, file_bytes, rounds);
+    cfg.reactors_per_device = env_size("CUCASCADE_IO_BENCH_REACTORS_PER_GPU", 0);
+    cfg.storage_hint_path   = path;
+    if (char const* mode = std::getenv("CUCASCADE_IO_BENCH_STAGING"); mode != nullptr) {
+      std::string const value{mode};
+      cfg.staging_mode = value == "always"   ? cucascade::io::cufile::staging::always
+                         : value == "never"  ? cucascade::io::cufile::staging::never
+                                             : cucascade::io::cufile::staging::automatic;
+    }
+    // CUCASCADE_IO_BENCH_REACTORS=0 plans a per-GPU pool from the topology, as
+    // the datasource factory does by default.
+    if (reactors == 0) {
+      cucascade::memory::topology_discovery discovery;
+      std::optional<cucascade::memory::system_topology_info> topology;
+      if (discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE)) {
+        topology = discovery.get_topology();
+      }
+      auto plan = cucascade::io::cufile::plan_cufile_pool(
+        cfg, topology ? &*topology : nullptr, cucascade::io::cufile::probe_platform());
+      std::printf("%s\n", cucascade::io::cufile::describe(plan).c_str());
+      for (auto const& warning : plan.warnings) {
+        std::printf("warning: %s\n", warning.c_str());
+      }
+      if (plan.staging_piece_bytes != 0) cfg.staging_piece_bytes = plan.staging_piece_bytes;
+      cufile_ioctx planned{plan, std::make_shared<cufile_reactor::reactor_context>(cfg)};
+      planned.start();
+      run_probe("cufile", planned, path, file_bytes, rounds);
+      print_stats(planned.stats());
+      planned.shutdown();
+    } else {
+      started_ioctx ioctx{cfg, reactors};
+      run_probe("cufile", ioctx.get(), path, file_bytes, rounds);
+      print_stats(ioctx.get().stats());
+    }
   }
   if (which == "both" || which == "uring") {
     cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
