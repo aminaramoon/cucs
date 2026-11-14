@@ -27,8 +27,6 @@
 
 #include <cucascade/io/cufile/platform.hpp>
 
-#include <cufile.h>
-
 #include <chrono>
 #include <cstddef>
 #include <optional>
