@@ -95,19 +95,25 @@ struct cufile_json_settings {
 };
 
 /**
- * @brief Where cuFile's configuration file is and what it says.
+ * @brief Where cuFile's configuration comes from and what it says.
  *
- * cuFile reads @c $CUFILE_ENV_PATH_JSON when that is set, else
- * @c /etc/cufile.json; a host without the file runs cuFile on its built-in
- * defaults.  The file is JSON with @c // and @c /&lowast; &lowast;/ comments.
+ * cuFile starts from its built-in defaults, applies @c /etc/cufile.json, then
+ * the file @c $CUFILE_ENV_PATH_JSON names (read with @c secure_getenv), whose
+ * keys win one by one; a missing file is skipped.  The files are JSON with
+ * @c // and @c /&lowast; &lowast;/ comments.  @c settings is the merged result.
  */
 struct cufile_config_file {
-  std::string path;               ///< The file cuFile would read.
-  bool from_environment{false};   ///< @c path came from @c CUFILE_ENV_PATH_JSON.
-  bool found{false};              ///< The file exists and could be opened.
-  bool parsed{false};             ///< It was read and parsed; @c settings is meaningful.
-  std::string error;              ///< Why it was not found or parsed; empty otherwise.
-  cufile_json_settings settings;  ///< What it sets (all unset unless @c parsed).
+  std::string path;           ///< The system file (@c /etc/cufile.json).
+  std::string override_path;  ///< The file @c CUFILE_ENV_PATH_JSON names; empty if none.
+  /// @c override_path came from @c CUFILE_ENV_PATH_JSON (not from a caller).
+  bool from_environment{false};
+  bool examined{false};  ///< Discovery looked for the files (false: never looked).
+  bool found{false};     ///< At least one of the files exists and could be read.
+  /// Every file found was parsed, so @c settings is meaningful (also when no file
+  /// exists: then it is all unset, i.e. cuFile's defaults).
+  bool parsed{false};
+  std::string error;              ///< Why a file was not found or parsed; empty otherwise.
+  cufile_json_settings settings;  ///< The merged settings (unset = cuFile's default).
 };
 
 /**
@@ -172,17 +178,22 @@ struct gds_setup_info {
  * cannot be read is left at its default.
  *
  * @param roots Where procfs / sysfs are mounted; tests point them at a fake tree.
- * @param cufile_json_path The configuration file to read; empty resolves it the
- *        way cuFile does (@c $CUFILE_ENV_PATH_JSON, else @c /etc/cufile.json).
+ * @param cufile_json_path The system configuration file; empty means
+ *        @c /etc/cufile.json.
+ * @param override_json_path The file merged on top; unset reads
+ *        @c CUFILE_ENV_PATH_JSON the way cuFile does, empty means none.
  */
-[[nodiscard]] gds_setup_info discover_gds_setup(discovery_roots const& roots      = {},
-                                                std::string_view cufile_json_path = {});
+[[nodiscard]] gds_setup_info discover_gds_setup(
+  discovery_roots const& roots                     = {},
+  std::string_view cufile_json_path                = {},
+  std::optional<std::string> const& override_json_path = std::nullopt);
 
 /**
- * @brief Read and parse a cuFile configuration file.  Never throws.
- *
- * @param path The file; it is reported back in @c cufile_config_file::path.
+ * @brief Read cuFile's configuration the way cuFile does: @p path, then
+ *        @p override_path (if not empty) merged on top key by key.  A missing
+ *        file is skipped.  Never throws.
  */
-[[nodiscard]] cufile_config_file read_cufile_config(std::string const& path);
+[[nodiscard]] cufile_config_file read_cufile_config(std::string const& path,
+                                                    std::string const& override_path = {});
 
 }  // namespace cucascade::memory

@@ -116,6 +116,9 @@ struct pool_plan {
  * - Warnings: GDS setup problems visible from here (see @ref pool_plan::warnings),
  *   e.g. Storage Scale storage without GDS, or GDS without RDMA addresses.
  *
+ * Groups are planned for @c cfg.devices, or for every visible device when that
+ * is empty (unknown devices are reported in @ref pool_plan::warnings).
+ *
  * Calls the CUDA runtime (device count and PCI bus IDs) but creates nothing.
  * Never throws: whatever cannot be learned is reported in the reasons.
  *

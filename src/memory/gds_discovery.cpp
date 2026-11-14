@@ -435,6 +435,74 @@ void extract_settings(json_value const& root, cufile_json_settings& out)
   return true;
 }
 
+/// Merge @p from into @p into the way cuFile layers its configuration files:
+/// objects merge member by member (recursively), anything else is replaced.
+void merge_into(json_value& into, json_value const& from)
+{
+  if (into.type != json_value::kind::object || from.type != json_value::kind::object) {
+    into = from;
+    return;
+  }
+  for (auto const& member : from.members) {
+    json_value* found = nullptr;
+    for (auto& existing : into.members) {
+      if (existing.key == member.key) found = &existing.value;  // the last one wins
+    }
+    if (found != nullptr) {
+      merge_into(*found, member.value);
+    } else {
+      into.members.push_back(member);
+    }
+  }
+}
+
+/// Parse @p text into @p root (a JSON object); false with @p error set otherwise.
+[[nodiscard]] bool parse_tree(std::string_view text, json_value& root, std::string& error)
+{
+  json_reader reader{text};
+  if (!reader.parse(root)) {
+    error = reader.error();
+    return false;
+  }
+  if (root.type != json_value::kind::object) {
+    error = "the top level is not a JSON object";
+    return false;
+  }
+  return true;
+}
+
+/// What happened to one configuration file.
+enum class file_outcome : std::uint8_t { missing, parsed, failed };
+
+/// Read and parse @p path into @p root; a missing file leaves @p root alone.
+[[nodiscard]] file_outcome load_tree(std::string const& path, json_value& root, std::string& error)
+{
+  std::error_code ec;
+  auto const size = fs::file_size(path, ec);
+  if (ec) {
+    if (ec == std::errc::no_such_file_or_directory) return file_outcome::missing;
+    error = path + ": cannot stat: " + ec.message();
+    return file_outcome::failed;
+  }
+  if (size > max_cufile_json_bytes) {
+    error = path + ": larger than " + std::to_string(max_cufile_json_bytes) + " bytes";
+    return file_outcome::failed;
+  }
+  std::string text;
+  if (!read_small_file(path, text)) {
+    error = path + ": cannot be read";
+    return file_outcome::failed;
+  }
+  json_value tree;
+  std::string why;
+  if (!parse_tree(text, tree, why)) {
+    error = path + ": not valid JSON: " + why;
+    return file_outcome::failed;
+  }
+  merge_into(root, tree);
+  return file_outcome::parsed;
+}
+
 [[nodiscard]] std::optional<std::size_t> parse_size_value(std::string_view text) noexcept
 {
   std::size_t value    = 0;
@@ -455,15 +523,7 @@ bool parse_cufile_json(std::string_view text,
 {
   try {
     json_value root;
-    json_reader reader{text};
-    if (!reader.parse(root)) {
-      error = reader.error();
-      return false;
-    }
-    if (root.type != json_value::kind::object) {
-      error = "the top level is not a JSON object";
-      return false;
-    }
+    if (!parse_tree(text, root, error)) return false;
     cufile_json_settings settings;
     extract_settings(root, settings);
     out = std::move(settings);
@@ -572,42 +632,52 @@ bool force_compat_value(char const* value) noexcept
 
 }  // namespace detail
 
-cufile_config_file read_cufile_config(std::string const& path)
+cufile_config_file read_cufile_config(std::string const& path, std::string const& override_path)
 {
   cufile_config_file file;
   try {
-    file.path = path;
-    std::error_code ec;
-    auto const size = fs::file_size(path, ec);
-    if (ec) {
-      file.error = ec == std::errc::no_such_file_or_directory
-                     ? "not found (cuFile uses its built-in defaults)"
-                     : "cannot stat: " + ec.message();
-      return file;
-    }
-    if (size > max_cufile_json_bytes) {
-      file.found = true;
-      file.error = "larger than " + std::to_string(max_cufile_json_bytes) + " bytes";
-      return file;
-    }
-    std::string text;
-    if (!read_small_file(path, text)) {
-      file.error = "cannot be read";
-      return file;
-    }
-    file.found = true;
+    file.path          = path;
+    file.override_path = override_path;
+    file.examined      = true;
+    json_value root;
+    root.type = json_value::kind::object;
     std::string error;
-    file.parsed = detail::parse_cufile_json(text, file.settings, error);
-    if (!file.parsed) { file.error = "not valid JSON: " + error; }
+    bool failed = false;
+    std::size_t found = 0;
+    for (auto const& name : {path, override_path}) {
+      if (name.empty()) continue;
+      std::string why;
+      switch (load_tree(name, root, why)) {
+        case file_outcome::missing: break;
+        case file_outcome::parsed: ++found; break;
+        case file_outcome::failed:
+          ++found;
+          failed = true;
+          error += (error.empty() ? "" : "; ") + why;
+          break;
+      }
+    }
+    file.found  = found != 0;
+    file.parsed = !failed;
+    if (failed) {
+      file.error = error;
+    } else {
+      extract_settings(root, file.settings);
+      if (!file.found) file.error = "not found (cuFile uses its built-in defaults)";
+    }
   } catch (std::exception const& e) {
-    file.error = e.what();
+    file.parsed = false;
+    file.error  = e.what();
   } catch (...) {
-    file.error = "unknown error";
+    file.parsed = false;
+    file.error  = "unknown error";
   }
   return file;
 }
 
-gds_setup_info discover_gds_setup(discovery_roots const& roots, std::string_view cufile_json_path)
+gds_setup_info discover_gds_setup(discovery_roots const& roots,
+                                  std::string_view cufile_json_path,
+                                  std::optional<std::string> const& override_json_path)
 {
   gds_setup_info info;
   try {
@@ -644,14 +714,19 @@ gds_setup_info discover_gds_setup(discovery_roots const& roots, std::string_view
 
     info.force_compat_env = detail::force_compat_value(std::getenv("CUFILE_FORCE_COMPAT_MODE"));
 
-    std::string path{cufile_json_path};
+    std::string const path = cufile_json_path.empty() ? std::string{default_cufile_json}
+                                                      : std::string{cufile_json_path};
+    std::string override_path;
     bool from_environment = false;
-    if (path.empty()) {
-      char const* from_env = std::getenv("CUFILE_ENV_PATH_JSON");
-      from_environment     = from_env != nullptr && *from_env != '\0';
-      path                 = from_environment ? std::string{from_env} : default_cufile_json;
+    if (override_json_path) {
+      override_path = *override_json_path;
+    } else if (char const* from_env = ::secure_getenv("CUFILE_ENV_PATH_JSON");
+               from_env != nullptr && *from_env != '\0') {
+      // cuFile reads the variable with secure_getenv, so this does too.
+      override_path    = from_env;
+      from_environment = true;
     }
-    info.cufile_json                  = read_cufile_config(path);
+    info.cufile_json                  = read_cufile_config(path, override_path);
     info.cufile_json.from_environment = from_environment;
   } catch (...) {
     // Discovery is best effort: keep whatever was learned.

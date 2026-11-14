@@ -122,6 +122,10 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   /// How the pool has served its reads so far: every reactor's counters summed.
   [[nodiscard]] reactor_stats stats() const noexcept;
 
+  /// As @ref stats, for the reactors of @p device's group only (zero when the
+  /// pool has no group for it, e.g. a flat pool).
+  [[nodiscard]] reactor_stats stats(int device) const noexcept;
+
   /// The plan the pool was built from (one flat group when built from a count).
   [[nodiscard]] pool_plan const& plan() const noexcept { return _plan; }
 

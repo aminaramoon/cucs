@@ -436,7 +436,9 @@ void decide_path_capability(path_info& info) noexcept
         // GDS serves NFS only over RDMA.
         if (info.matched_class == storage_class::nfs &&
             !has_option(storage.super_options, "proto=rdma") &&
-            !has_option(storage.mount_options, "proto=rdma")) {
+            !has_option(storage.super_options, "proto=rdma6") &&
+            !has_option(storage.mount_options, "proto=rdma") &&
+            !has_option(storage.mount_options, "proto=rdma6")) {
           info.filesystem_supported = false;
         }
         break;
@@ -475,6 +477,17 @@ void decide_path_capability(path_info& info) noexcept
                     ? "NFS mount " + storage.mount_point +
                         " is not over RDMA (no proto=rdma): GDS serves NFS over RDMA only"
                     : "filesystem " + storage.filesystem_type + " is not served by GDS on " + cls);
+      return;
+    }
+    // Without any cuFile configuration file, cuFile runs on its built-in defaults,
+    // whose RDMA address list is empty.
+    if (auto const& json = info.gds.cufile_json; info.matched_class == storage_class::gpfs &&
+                                                  json.examined && !json.found) {
+      set_verdict(info,
+                  path_capability::compatibility_only,
+                  "no cuFile configuration file (" + json.path +
+                    "): Storage Scale GDS reads need rdma_dev_addr_list and fall back to "
+                    "compatibility mode without it");
       return;
     }
     if (auto const& json = info.gds.cufile_json; json.parsed) {

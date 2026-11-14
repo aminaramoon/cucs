@@ -224,19 +224,36 @@ pool_plan plan_cufile_pool(config const& cfg,
     collect_warnings(topology, platform, hint ? &*hint : nullptr, plan.warnings);
 
     // cuFile moves a call in sequential chunks of max_direct_io_size: pieces no
-    // larger than that spread over more reactors instead.
+    // larger than that spread over more reactors instead -- but never below a
+    // size cuFile still serves (gds_threshold) or 1 MiB.
     auto effective = cfg;
     if (stage && platform.max_direct_io_size_kb != 0) {
-      auto const chunk = (platform.max_direct_io_size_kb * 1024) & ~(IO_BLOCK_SIZE - 1);
-      if (chunk >= IO_BLOCK_SIZE && chunk < effective.staging_piece_bytes) {
-        effective.staging_piece_bytes = chunk;
-      }
+      auto const floor = std::max<std::size_t>(
+        1UL << 20, (cfg.gds_threshold + IO_BLOCK_SIZE - 1) & ~(IO_BLOCK_SIZE - 1));
+      auto const chunk =
+        std::max(floor, (platform.max_direct_io_size_kb * 1024) & ~(IO_BLOCK_SIZE - 1));
+      if (chunk < effective.staging_piece_bytes) effective.staging_piece_bytes = chunk;
     }
     plan.staging_piece_bytes  = effective.staging_piece_bytes;
     auto const allowed        = exec::thread_util::get_current_thread_affinity();
     auto const slot_footprint = effective.staging_slot_bytes() + (64UL << 10);
 
-    for (int device = 0; device < count; ++device) {
+    std::vector<int> devices;
+    for (int device : cfg.devices) {
+      if (device >= 0 && device < count &&
+          std::find(devices.begin(), devices.end(), device) == devices.end()) {
+        devices.push_back(device);
+      } else {
+        plan.warnings.push_back("devices lists " + std::to_string(device) +
+                                ", which is not a visible CUDA device (or repeats): ignored");
+      }
+    }
+    if (devices.empty()) {
+      for (int device = 0; device < count; ++device) {
+        devices.push_back(device);
+      }
+    }
+    for (int const device : devices) {
       device_group_plan group;
       group.device     = device;
       group.n_reactors = per_device;
@@ -277,7 +294,11 @@ pool_plan plan_cufile_pool(config const& cfg,
           if (limit != 0 && (cap == 0 || limit < cap)) cap = limit;
         };
         if (gpu != nullptr) tighten(gpu->bar1_free_bytes / 2);
-        tighten(platform.max_device_pinned_mem_size_kb * 1024);
+        // cuFile counts its own bounce buffers against the pinned limit too.
+        if (platform.max_device_pinned_mem_size_kb > platform.max_device_cache_size_kb) {
+          tighten((platform.max_device_pinned_mem_size_kb - platform.max_device_cache_size_kb) *
+                  1024);
+        }
         group.staging_cap_bytes = cap;
         auto wanted             = per_device * cfg.staging_slots_per_reactor;
         if (cap != 0) wanted = std::min(wanted, cap / slot_footprint);

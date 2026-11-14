@@ -456,6 +456,16 @@ class cufile_reactor {
   /// first use.  The calling thread's current device must be @p device_id.
   [[nodiscard]] cudaStream_t copy_stream(int device_id);
 
+  /// The reactor-owned stream of @p device_id for the copies of host+device
+  /// pairs, which wait there for their caller's gate: kept apart from
+  /// @ref copy_stream, which the worker synchronizes on, so a busy caller stream
+  /// never stalls the worker.  Created on first use, like @ref copy_stream.
+  [[nodiscard]] cudaStream_t pair_stream(int device_id);
+
+  /// The stream of @p device_id in @p streams, created non-blocking on first use.
+  [[nodiscard]] static cudaStream_t device_stream(std::vector<owned_stream>& streams,
+                                                  int device_id);
+
   /// Read @p request's range straight into the slice's device buffer with
   /// synchronous @c cuFileRead calls, once the slice's stream has drained the work
   /// queued before the read.  Returns true when @p request was settled (success or
@@ -561,6 +571,8 @@ class cufile_reactor {
   std::vector<waiting_slice> _waiting;
   /// Staging-copy streams, indexed by device id.
   std::vector<owned_stream> _copy_streams;
+  /// Gated pair-copy streams, indexed by device id.
+  std::vector<owned_stream> _pair_streams;
   /// Pinned (portable) staging for device-only POSIX reads and unaligned host
   /// reads, taken from a process-wide pool on first use (so a reactor that never
   /// stages holds no pinned memory) and given back to it at shutdown.

@@ -115,11 +115,27 @@ class pattern_file {
   [[nodiscard]] std::string path() const { return _path.string(); }
   [[nodiscard]] std::size_t size() const noexcept { return _size; }
 
+  /// Whether the filesystem holding the file accepts O_DIRECT, which cuFile
+  /// registration (scripted or real) needs.
+  [[nodiscard]] bool odirect() const
+  {
+    int const fd = ::open(_path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+  }
+
  private:
   static inline std::atomic<int> next_id{0};
   std::filesystem::path _path;
   std::size_t _size;
 };
+
+/// Skip a test whose file cannot be opened O_DIRECT (the cuFile paths need it).
+#define REQUIRE_ODIRECT(file) \
+  do {                        \
+    if (!(file).odirect()) SKIP("the working directory's filesystem refuses O_DIRECT"); \
+  } while (false)
 
 [[nodiscard]] int device_count()
 {
@@ -447,8 +463,7 @@ TEST_CASE("cufile staged reads ask cuFile only for aligned ranges within the fil
   // A file ending in a partial block; pieces of 64 KiB so ranges span several.
   pattern_file file{(3UL << 20) + 1234};
   scripted_cufile cufile;
-  started_ioctx ioctx{staging_config(slot_class(3))};
-  auto object = ioctx.get().open_io_object(file.path());
+  REQUIRE_ODIRECT(file);
 
   struct sample {
     std::size_t offset;
@@ -468,6 +483,10 @@ TEST_CASE("cufile staged reads ask cuFile only for aligned ranges within the fil
   rmm::cuda_stream stream;
   constexpr std::size_t guard = 64;
   rmm::device_buffer dst(s.size + s.misalign + 2 * guard, ::cuda::stream_ref{stream.value()});
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{staging_config(slot_class(3))};
+  auto object = ioctx.get().open_io_object(file.path());
   REQUIRE(cudaMemsetAsync(dst.data(), 0xEE, dst.size(), stream.value()) == cudaSuccess);
   auto* const target = static_cast<std::uint8_t*>(dst.data()) + guard + s.misalign;
   REQUIRE(
@@ -501,14 +520,17 @@ TEST_CASE("cufile splits a large device read into pieces several reactors stage"
   if (device_count() == 0) SKIP("no CUDA device");
   pattern_file file{4UL << 20};
   scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
   constexpr std::size_t piece = slot_class(4);
-  started_ioctx ioctx{staging_config(piece), 4};
-  auto object = ioctx.get().open_io_object(file.path());
 
   rmm::cuda_stream stream;
   constexpr std::size_t offset = 777;
   constexpr std::size_t size   = (2UL << 20) + 99;
   rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{staging_config(piece), 4};
+  auto object = ioctx.get().open_io_object(file.path());
   REQUIRE(ioctx.get()
             .device_read_async_io(*object,
                                   offset,
@@ -533,14 +555,17 @@ TEST_CASE("cufile staged read that cuFile fails is served by POSIX instead",
   if (device_count() == 0) SKIP("no CUDA device");
   pattern_file file{1UL << 20};
   scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
   cufile.fail_call(1);
-  started_ioctx ioctx{staging_config(slot_class(5)), 1};
-  auto object = ioctx.get().open_io_object(file.path());
 
   rmm::cuda_stream stream;
   constexpr std::size_t offset = 4100;
   constexpr std::size_t size   = 100000;
   rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{staging_config(slot_class(5)), 1};
+  auto object = ioctx.get().open_io_object(file.path());
   REQUIRE(ioctx.get()
             .device_read_async_io(*object,
                                   offset,
@@ -560,14 +585,17 @@ TEST_CASE("cufile staged reads continue after short cuFile returns", "[io][cufil
   if (device_count() == 0) SKIP("no CUDA device");
   pattern_file file{(1UL << 20) + 77};
   scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
   cufile.max_return(block + 100);  // never a whole piece, and never block-aligned
-  started_ioctx ioctx{staging_config(slot_class(6)), 1};
-  auto object = ioctx.get().open_io_object(file.path());
 
   rmm::cuda_stream stream;
   constexpr std::size_t offset = 3;
   std::size_t const size       = file.size() - offset;
   rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{staging_config(slot_class(6)), 1};
+  auto object = ioctx.get().open_io_object(file.path());
   REQUIRE(ioctx.get()
             .device_read_async_io(*object,
                                   offset,
@@ -588,13 +616,16 @@ TEST_CASE("cufile reads a staged piece before its busy stream is ready; only the
   if (device_count() == 0) SKIP("no CUDA device");
   pattern_file file{1UL << 20};
   scripted_cufile cufile;
-  started_ioctx ioctx{staging_config(slot_class(7)), 1};
-  auto object = ioctx.get().open_io_object(file.path());
+  REQUIRE_ODIRECT(file);
 
   rmm::cuda_stream stream;
   constexpr std::size_t offset = 8192 + 5;
   constexpr std::size_t size   = 100000;
   rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{staging_config(slot_class(7)), 1};
+  auto object = ioctx.get().open_io_object(file.path());
   REQUIRE(cudaMemsetAsync(dst.data(), 0, size, stream.value()) == cudaSuccess);
   stream_latch latch;
   latch.hold(stream.value());
@@ -629,11 +660,13 @@ TEST_CASE("cufile device read on a per-thread default stream waits for that thre
   // The real cuFile (or POSIX): the gate must hold whatever path serves the read.
   config cfg;
   cfg.gds_threshold = 1;
-  started_ioctx ioctx{cfg, 1};
-  auto object = ioctx.get().open_io_object(file.path());
 
   constexpr std::size_t size = 300000;
   rmm::device_buffer dst(size, ::cuda::stream_ref{cudaStream_t{nullptr}});
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{cfg, 1};
+  auto object = ioctx.get().open_io_object(file.path());
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
   stream_latch latch;
   std::optional<cucascade::exec::semi_future<std::size_t>> future;
@@ -675,11 +708,13 @@ TEST_CASE("cufile refuses a device read on a stream being captured, leaving the 
 {
   if (device_count() == 0) SKIP("no CUDA device");
   pattern_file file{64UL << 10};
-  started_ioctx ioctx{config{}, 1};
-  auto object = ioctx.get().open_io_object(file.path());
 
   rmm::cuda_stream stream;
   rmm::device_buffer dst(file.size(), ::cuda::stream_ref{stream.value()});
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{config{}, 1};
+  auto object = ioctx.get().open_io_object(file.path());
   stream.synchronize();
   REQUIRE(cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeRelaxed) == cudaSuccess);
   auto future = ioctx.get().device_read_async_io(*object,
@@ -703,13 +738,15 @@ TEST_CASE("cufile parked device slices do not hold up other requests on the reac
   cfg.gds_threshold = 1;
   cfg.max_inflight  = 2;
   cfg.staging_mode  = staging::never;
-  started_ioctx ioctx{cfg, 1};
-  auto object = ioctx.get().open_io_object(file.path());
 
   rmm::cuda_stream busy;
   constexpr std::size_t slices = 32;
   constexpr std::size_t piece  = 4096;
   rmm::device_buffer dst(slices * piece, ::cuda::stream_ref{busy.value()});
+  // Built after the destination, so a failing test shuts it down (waiting for
+  // any read in flight) before the destination is freed.
+  started_ioctx ioctx{cfg, 1};
+  auto object = ioctx.get().open_io_object(file.path());
   busy.synchronize();
   stream_latch latch;
   latch.hold(busy.value());
@@ -739,8 +776,7 @@ TEST_CASE("cufile reads a destination on another GPU than the calling thread's",
   if (device_count() < 2) SKIP("needs two CUDA devices");
   pattern_file file{1UL << 20};
   scripted_cufile cufile;
-  started_ioctx ioctx{staging_config(slot_class(8)), 1};
-  auto object = ioctx.get().open_io_object(file.path());
+  REQUIRE_ODIRECT(file);
 
   constexpr std::size_t offset = 100;
   constexpr std::size_t size   = 200000;
@@ -752,6 +788,8 @@ TEST_CASE("cufile reads a destination on another GPU than the calling thread's",
     dst.emplace(size, ::cuda::stream_ref{stream->value()});
     stream->synchronize();
   }
+  started_ioctx ioctx{staging_config(slot_class(8)), 1};
+  auto object = ioctx.get().open_io_object(file.path());
   rmm::cuda_set_device_raii const on_zero{rmm::cuda_device_id{0}};
   stream_latch latch;
   latch.hold(stream->value());  // busy, so the gate is a real event on GPU 1
@@ -844,4 +882,118 @@ TEST_CASE("cufile pool plan sizes staging within the configured cap", "[io][cufi
     CHECK(group.staging_cap_bytes <= cfg.max_staging_bytes_per_device);
     CHECK(group.cpus.empty());  // no topology: unpinned
   }
+}
+
+TEST_CASE("cufile shutdown waits for an early staged copy before settling it",
+          "[io][cufile][staging][gpu]")
+{
+  if (device_count() == 0) SKIP("no CUDA device");
+  pattern_file file{1UL << 20};
+  scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
+
+  rmm::cuda_stream stream;
+  constexpr std::size_t size = 100000;
+  rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
+  stream.synchronize();
+  cufile_ioctx ioctx{1,
+                     std::make_shared<cufile_reactor::reactor_context>(staging_config(slot_class(11)))};
+  ioctx.start();
+  auto object = ioctx.open_io_object(file.path());
+  stream_latch latch;
+  latch.hold(stream.value());
+  auto future = ioctx.device_read_async_io(
+    *object, 5, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()});
+  auto const deadline = std::chrono::steady_clock::now() + 10s;
+  while (cufile.calls().empty() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(cufile.calls().size() == 1);  // read early, its copy waiting for the stream
+
+  // Shutdown must not give the request back while its copy may still write the
+  // destination: it returns only once the stream let the copy run.
+  auto stopped = std::async(std::launch::async, [&ioctx] { ioctx.shutdown(); });
+  CHECK(stopped.wait_for(300ms) == std::future_status::timeout);
+  CHECK_FALSE(future.is_ready());
+  latch.release();
+  REQUIRE(stopped.wait_for(30s) == std::future_status::ready);
+  // Settled (as cancelled, since shutdown took it), and only after the copy landed.
+  REQUIRE(std::move(future).wait(5s));
+  CHECK(matches_file(bytes_at(dst.data(), size), 5));
+}
+
+TEST_CASE("cufile early staged read that cuFile fails is served by POSIX after its stream",
+          "[io][cufile][staging][gpu]")
+{
+  if (device_count() == 0) SKIP("no CUDA device");
+  pattern_file file{1UL << 20};
+  scripted_cufile cufile;
+  REQUIRE_ODIRECT(file);
+  cufile.fail_call(1);
+
+  rmm::cuda_stream stream;
+  constexpr std::size_t offset = 777;
+  constexpr std::size_t size   = 300000;
+  rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
+  stream.synchronize();
+  started_ioctx ioctx{staging_config(slot_class(12)), 1};
+  auto object = ioctx.get().open_io_object(file.path());
+  stream_latch latch;
+  latch.hold(stream.value());
+  auto future = ioctx.get().device_read_async_io(*object,
+                                                 offset,
+                                                 size,
+                                                 static_cast<std::uint8_t*>(dst.data()),
+                                                 ::cuda::stream_ref{stream.value()});
+  // The failed cuFile call happened early; the POSIX retry writes the destination
+  // itself, so it must wait for the stream.
+  std::this_thread::sleep_for(200ms);
+  CHECK_FALSE(future.is_ready());
+  latch.release();
+  REQUIRE(std::move(future).get(60s) == size);
+  CHECK(matches_file(bytes_at(dst.data(), size), offset));
+  auto const stats = ioctx.get().stats();
+  CHECK(stats.cufile_failures == 1);
+  CHECK(stats.posix_device_reads == 1);
+  CHECK(stats.early_staged_reads == 0);
+}
+
+TEST_CASE("cufile routes a read to its destination GPU's group, whatever the caller's device",
+          "[io][cufile][staging][gpu]")
+{
+  if (device_count() < 2) SKIP("needs two CUDA devices");
+  pattern_file file{1UL << 20};
+  config cfg;
+  cfg.reactors_per_device = 2;
+  cfg.staging_mode        = staging::never;
+  cfg.gds_threshold       = 1;
+  constexpr std::size_t size = 200000;
+  std::optional<rmm::cuda_stream> stream;
+  std::optional<rmm::device_buffer> dst;
+  {
+    rmm::cuda_set_device_raii const on_one{rmm::cuda_device_id{1}};
+    stream.emplace();
+    dst.emplace(size, ::cuda::stream_ref{stream->value()});
+    stream->synchronize();
+  }
+  auto const plan =
+    cucascade::io::cufile::plan_cufile_pool(cfg, nullptr, cucascade::io::cufile::probe_platform());
+  cufile_ioctx ioctx{plan, std::make_shared<cufile_reactor::reactor_context>(cfg)};
+  ioctx.start();
+  auto object = ioctx.open_io_object(file.path());
+  {
+    rmm::cuda_set_device_raii const on_zero{rmm::cuda_device_id{0}};
+    REQUIRE(ioctx
+              .device_read_async_io(*object,
+                                    0,
+                                    size,
+                                    static_cast<std::uint8_t*>(dst->data()),
+                                    ::cuda::stream_ref{stream->value()})
+              .get(60s) == size);
+  }
+  auto const on_one  = ioctx.stats(1);
+  auto const on_zero = ioctx.stats(0);
+  CHECK(on_one.direct_bytes + on_one.posix_device_bytes == size);
+  CHECK(on_zero.direct_bytes + on_zero.posix_device_bytes == 0);
+  ioctx.shutdown();
 }

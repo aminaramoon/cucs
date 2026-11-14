@@ -337,7 +337,7 @@ TEST_CASE("gds setup: discovery reads a fixture host", "[gds_setup]")
   host.write("proc/driver/nvidia-fs/stats", nvfs_stats);
   host.write("etc/cufile.json", stock_cufile_json);
 
-  auto const info = discover_gds_setup(host.roots(), host.path("etc/cufile.json"));
+  auto const info = discover_gds_setup(host.roots(), host.path("etc/cufile.json"), std::string{});
   CHECK(info.nvidia_fs.loaded);
   CHECK(info.kernel_path_present());
   CHECK(info.nvidia_fs.version == "2.26.1");  // sysfs wins over the stats file
@@ -365,16 +365,53 @@ TEST_CASE("gds setup: a host without GDS reports nothing loaded", "[gds_setup]")
   fake_host host;
   host.write("proc/modules", "ena 155648 0 - Live 0x0\n");
 
-  auto const info = discover_gds_setup(host.roots(), host.path("etc/cufile.json"));
+  auto const info = discover_gds_setup(host.roots(), host.path("etc/cufile.json"), std::string{});
   CHECK_FALSE(info.nvidia_fs.loaded);
   CHECK_FALSE(info.kernel_path_present());
   CHECK(info.nvidia_fs.version.empty());
   CHECK_FALSE(info.nvidia_fs.peer_direct_supported.has_value());
   CHECK_FALSE(info.peer_memory_loaded);
   CHECK_FALSE(info.gpfs_client_loaded);
+  // No file at all: cuFile runs on its defaults, which the (empty) settings are.
+  CHECK(info.cufile_json.examined);
   CHECK_FALSE(info.cufile_json.found);
-  CHECK_FALSE(info.cufile_json.parsed);
+  CHECK(info.cufile_json.parsed);
+  CHECK(info.cufile_json.settings.rdma_dev_addr_list.empty());
   CHECK(info.cufile_json.error.find("not found") != std::string::npos);
+}
+
+TEST_CASE("gds setup: the override file is merged over the system file key by key",
+          "[gds_setup]")
+{
+  fake_host host;
+  host.write("etc/cufile.json", R"({
+      "properties": { "max_direct_io_size_kb": 16384, "rdma_dev_addr_list": ["10.0.0.11"] },
+      "denylist": { "mounts": ["/scratch"] },
+      "logging": { "level": "ERROR" } })");
+  host.write("override.json", R"({
+      "properties": { "max_direct_io_size_kb": 4096 },
+      "logging": { "level": "WARN" } })");
+
+  auto const merged = read_cufile_config(host.path("etc/cufile.json"), host.path("override.json"));
+  REQUIRE(merged.parsed);
+  CHECK(merged.found);
+  CHECK(merged.override_path == host.path("override.json"));
+  CHECK(merged.settings.max_direct_io_size_kb == 4096U);  // the override wins
+  CHECK(merged.settings.rdma_dev_addr_list == std::vector<std::string>{"10.0.0.11"});  // kept
+  CHECK(merged.settings.denied_mounts == std::vector<std::string>{"/scratch"});
+  CHECK(merged.settings.logging_level == std::string{"WARN"});
+
+  // A missing override is skipped, like cuFile does.
+  auto const base_only =
+    read_cufile_config(host.path("etc/cufile.json"), host.path("missing.json"));
+  REQUIRE(base_only.parsed);
+  CHECK(base_only.settings.max_direct_io_size_kb == 16384U);
+
+  // Discovery takes the override path from the caller when given one.
+  auto const info =
+    discover_gds_setup(host.roots(), host.path("etc/cufile.json"), host.path("override.json"));
+  CHECK(info.cufile_json.settings.max_direct_io_size_kb == 4096U);
+  CHECK_FALSE(info.cufile_json.from_environment);
 }
 
 TEST_CASE("gds setup: an unparsable cufile.json is found but not parsed", "[gds_setup]")

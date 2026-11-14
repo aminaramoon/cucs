@@ -314,26 +314,16 @@ void print_environment(std::string const& path,
 // Pools and workloads
 // ---------------------------------------------------------------------------
 
-/// A started pool planned for @p devices only, shut down on scope exit; its
-/// staging is released afterwards so the next point can use another slot size.
+/// A started pool planned for @p devices only (exactly as the datasource
+/// factory would build it), shut down on scope exit; its staging is released
+/// afterwards so the next point can use another slot size.
 class tuned_pool {
  public:
-  tuned_pool(cufile::config cfg,
-             std::vector<int> const& devices,
-             std::optional<memory::system_topology_info> const& topology)
-    : _devices(devices)
+  tuned_pool(cufile::config cfg, std::vector<int> const& devices) : _devices(devices)
   {
-    auto plan =
-      cufile::plan_cufile_pool(cfg, topology ? &*topology : nullptr, cufile::probe_platform());
-    std::erase_if(plan.groups, [&devices](cufile::device_group_plan const& group) {
-      return std::find(devices.begin(), devices.end(), group.device) == devices.end();
-    });
-    if (plan.staging_piece_bytes != 0) cfg.staging_piece_bytes = plan.staging_piece_bytes;
-    std::vector<std::size_t> caps;
-    for (auto const& group : plan.groups) {
-      auto const index = static_cast<std::size_t>(group.device);
-      if (caps.size() <= index) caps.resize(index + 1, cfg.max_staging_bytes_per_device);
-      caps[index] = group.staging_cap_bytes;
+    cfg.devices = devices;
+    _ioctx      = cufile::make_cufile_ioctx(0, cfg);
+    for (auto const& group : _ioctx->plan().groups) {
       if (cfg.staging_mode != cufile::staging::never &&
           group.staging_slots < group.n_reactors * cfg.staging_slots_per_reactor) {
         std::printf("  note: GPU %d gets %zu of %zu staging slots (%s)\n",
@@ -343,10 +333,8 @@ class tuned_pool {
                     group.reason.c_str());
       }
     }
-    _piece = cfg.staging_piece_bytes;
-    _ioctx = std::make_shared<cufile::cufile_ioctx>(
-      std::move(plan),
-      std::make_shared<cufile::cufile_reactor::reactor_context>(std::move(cfg), std::move(caps)));
+    _piece = _ioctx->plan().staging_piece_bytes != 0 ? _ioctx->plan().staging_piece_bytes
+                                                     : cfg.staging_piece_bytes;
     _ioctx->start();
   }
   ~tuned_pool()
@@ -540,7 +528,7 @@ TEST_CASE("cufile tuning sweep", "[.cufile-tune]")
           cfg.staging_mode        = v.mode;
           cfg.staging_piece_bytes = std::max<std::size_t>(size, 1UL << 20);
           drop_cache(path);
-          tuned_pool pool{cfg, {gpus.front()}, topology};
+          tuned_pool pool{cfg, {gpus.front()}};
           auto object = pool.ioctx().open_io_object(path);
           rmm::cuda_set_device_raii const on_device{rmm::cuda_device_id{gpus.front()}};
           rmm::cuda_stream stream;
@@ -609,7 +597,7 @@ TEST_CASE("cufile tuning sweep", "[.cufile-tune]")
           run_load.per_call = std::max<std::size_t>(load.per_call, 2 * depth / load.submitters);
           try {
             drop_cache(path);
-            tuned_pool pool{cfg, {gpus.front()}, topology};
+            tuned_pool pool{cfg, {gpus.front()}};
             auto object = pool.ioctx().open_io_object(path);
             auto [bytes, elapsed] =
               run_parquet(pool.ioctx(), *object, {gpus.front()}, run_load, seconds);
@@ -654,7 +642,7 @@ TEST_CASE("cufile tuning sweep", "[.cufile-tune]")
       cfg.staging_piece_bytes          = chosen.piece;
       cfg.max_staging_bytes_per_device = 0;
       drop_cache(path);
-      tuned_pool pool{cfg, gpus, topology};
+      tuned_pool pool{cfg, gpus};
       auto object       = pool.ioctx().open_io_object(path);
       auto run_load     = load;
       run_load.per_call = std::max<std::size_t>(load.per_call, 2 * chosen.depth / load.submitters);

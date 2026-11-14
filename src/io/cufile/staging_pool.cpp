@@ -71,9 +71,13 @@ staging_slot staging_pool::acquire(int device,
         ++state.leased;
         return slot;
       }
-      if (require_registered && state.registration_failed_for != nullptr &&
-          state.registration_failed_for == cufile_api::get()) {
-        return {};
+      if (require_registered) {
+        // Nothing to allocate when the slot could not be registered anyway.
+        auto const* api = cufile_api::get();
+        if (api == nullptr || api->buf_register == nullptr ||
+            (state.registration_failed_for != nullptr && state.registration_failed_for == api)) {
+          return {};
+        }
       }
       if (cap_bytes != 0 && state.allocated_bytes + footprint > cap_bytes) { return {}; }
       // Claim the bytes now and room to keep the slot, so concurrent leases see
@@ -129,7 +133,11 @@ staging_slot staging_pool::acquire(int device,
       std::lock_guard lock(_mutex);
       auto& state = _devices[device];
       if (slot.registered) { state.registered_bytes += slot.bytes; }
-      if (attempted && !slot.registered) { state.registration_failed_for = api; }
+      // A failed registration, or one that could not even be tried (no driver),
+      // is not retried for this table.
+      if (!slot.registered && (attempted || require_registered)) {
+        state.registration_failed_for = api;
+      }
       if (require_registered && !slot.registered) {
         state.free.push_back(slot);  // capacity reserved above
         keep_unregistered = true;
@@ -176,6 +184,8 @@ std::size_t staging_pool::release_free(int device) noexcept
     auto const it = _devices.find(device);
     if (it == _devices.end()) return 0;
     doomed.swap(it->second.free);
+    // With the memory back, registering may succeed again.
+    it->second.registration_failed_for = nullptr;
   }
   std::size_t freed = 0;
   try {

@@ -1020,6 +1020,9 @@ TEST_CASE("cufile shutdown cancels a device read still waiting for its stream", 
   CAPTURE(threshold);
   config cfg{};
   cfg.gds_threshold = threshold;
+  // A parked read: with staging the read would be issued early on a GDS host and
+  // shutdown would have to wait for its copy (covered in test_cufile_staging.cpp).
+  cfg.staging_mode = cucascade::io::cufile::staging::never;
   cufile_ioctx ioctx{1, std::make_shared<cufile_reactor::reactor_context>(cfg)};
   ioctx.start();
   auto object = ioctx.open_io_object(file.path());
@@ -1367,7 +1370,7 @@ void run_probe(std::string const& label,
     };
     std::size_t placed = 0;
     std::size_t total  = 0;
-    while (true) {
+    while (bytes > (16UL << 20)) {
       auto const size   = (1UL << 20) + next() % (7UL << 20);
       auto const offset = next() % (bytes - size);
       auto const where  = (placed + 255) / 256 * 256 + (next() % 2);
@@ -1379,6 +1382,9 @@ void run_probe(std::string const& label,
     constexpr std::size_t submitters = 4;
     constexpr std::size_t per_call   = 64;
     scenario("parquet 1-8 MiB unaligned x4", total, [&] {
+      // Catch2 assertions are not thread-safe: the threads count failures and
+      // the scenario checks them after joining.
+      std::atomic<std::size_t> failures{0};
       std::vector<std::thread> threads;
       for (std::size_t t = 0; t < submitters; ++t) {
         threads.emplace_back([&, t] {
@@ -1390,14 +1396,21 @@ void run_probe(std::string const& label,
               slices.emplace_back(chunks[i].offset, chunks[i].size, base + chunks[i].dst);
               expected += chunks[i].size;
             }
-            REQUIRE(ctx.device_readv_async_io(*object, slices, streams[t % n_stream]).get(120s) ==
-                    expected);
+            try {
+              if (ctx.device_readv_async_io(*object, slices, streams[t % n_stream]).get(120s) !=
+                  expected) {
+                failures.fetch_add(1);
+              }
+            } catch (...) {
+              failures.fetch_add(1);
+            }
           }
         });
       }
       for (auto& thread : threads) {
         thread.join();
       }
+      REQUIRE(failures.load() == 0);
     });
   }
 
@@ -1448,23 +1461,16 @@ TEST_CASE("cufile throughput probe", "[.cufile-bench]")
     // CUCASCADE_IO_BENCH_REACTORS=0 plans a per-GPU pool from the topology, as
     // the datasource factory does by default.
     if (reactors == 0) {
-      cucascade::memory::topology_discovery discovery;
-      std::optional<cucascade::memory::system_topology_info> topology;
-      if (discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE)) {
-        topology = discovery.get_topology();
-      }
-      auto plan = cucascade::io::cufile::plan_cufile_pool(
-        cfg, topology ? &*topology : nullptr, cucascade::io::cufile::probe_platform());
-      std::printf("%s\n", cucascade::io::cufile::describe(plan).c_str());
-      for (auto const& warning : plan.warnings) {
+      // Exactly what the datasource factory builds.
+      auto planned = cucascade::io::cufile::make_cufile_ioctx(0, cfg);
+      std::printf("%s\n", cucascade::io::cufile::describe(planned->plan()).c_str());
+      for (auto const& warning : planned->plan().warnings) {
         std::printf("warning: %s\n", warning.c_str());
       }
-      if (plan.staging_piece_bytes != 0) cfg.staging_piece_bytes = plan.staging_piece_bytes;
-      cufile_ioctx planned{plan, std::make_shared<cufile_reactor::reactor_context>(cfg)};
-      planned.start();
-      run_probe("cufile", planned, path, file_bytes, rounds);
-      print_stats(planned.stats());
-      planned.shutdown();
+      planned->start();
+      run_probe("cufile", *planned, path, file_bytes, rounds);
+      print_stats(planned->stats());
+      planned->shutdown();
     } else {
       started_ioctx ioctx{cfg, reactors};
       run_probe("cufile", ioctx.get(), path, file_bytes, rounds);

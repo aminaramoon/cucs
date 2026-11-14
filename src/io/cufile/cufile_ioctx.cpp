@@ -217,6 +217,18 @@ reactor_stats cufile_ioctx::stats() const noexcept
   return total;
 }
 
+reactor_stats cufile_ioctx::stats(int device) const noexcept
+{
+  reactor_stats total;
+  for (auto const& group : _groups) {
+    if (group.device != device || device < 0) continue;
+    for (std::size_t i = group.first; i < group.first + group.count; ++i) {
+      total += _reactors[i]->stats();
+    }
+  }
+  return total;
+}
+
 std::vector<cufile_reactor*> cufile_ioctx::next_reactor(
   [[maybe_unused]] cufile_io_object const& object,
   std::size_t n_slices,
@@ -267,7 +279,10 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
     std::shared_ptr<cucascade::cuda::cuda_event> gate;
   };
   std::vector<stream_gate> gates;
-  auto const split_bytes  = _config.staging_piece_bytes;
+  // Pieces no smaller than cuFile still serves: a piece below gds_threshold would
+  // take the POSIX path.
+  auto const split_bytes = std::max(_config.staging_piece_bytes,
+                                    align_up_block(std::max<std::size_t>(_config.gds_threshold, 1)));
   auto const file_size    = object.size();
   std::size_t piece_count = 0;  // slices after splitting
 
@@ -346,10 +361,6 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
 
 std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config const& cfg)
 {
-  if (n_reactors != 0) {
-    return std::make_shared<cufile_ioctx>(n_reactors,
-                                          std::make_shared<cufile_reactor::reactor_context>(cfg));
-  }
   std::optional<memory::system_topology_info> topology;
   try {
     memory::topology_discovery discovery;
@@ -360,17 +371,24 @@ std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config c
     CUCASCADE_LOG_WARN("cufile: topology discovery failed ({}); planning without it", e.what());
   }
   auto plan = plan_cufile_pool(cfg, topology ? &*topology : nullptr, probe_platform());
-  CUCASCADE_LOG_INFO("{}", describe(plan));
-  for (auto const& warning : plan.warnings) {
-    CUCASCADE_LOG_WARN("cufile: {}", warning);
-  }
   auto effective = cfg;
   if (plan.staging_piece_bytes != 0) effective.staging_piece_bytes = plan.staging_piece_bytes;
+  // The plan's per-device staging caps (BAR1, cuFile's pinned limit) hold for a
+  // flat pool too; only the groups are dropped.
   std::vector<std::size_t> caps;
   for (auto const& group : plan.groups) {
     auto const index = static_cast<std::size_t>(group.device);
     if (caps.size() <= index) caps.resize(index + 1, effective.max_staging_bytes_per_device);
     caps[index] = group.staging_cap_bytes;
+  }
+  if (n_reactors != 0) {
+    plan.groups.clear();
+    plan.flat_reactors = n_reactors;
+    plan.reason = "flat pool of " + std::to_string(n_reactors) + " reactors (configured)";
+  }
+  CUCASCADE_LOG_INFO("{}", describe(plan));
+  for (auto const& warning : plan.warnings) {
+    CUCASCADE_LOG_WARN("cufile: {}", warning);
   }
   auto ctx =
     std::make_shared<cufile_reactor::reactor_context>(std::move(effective), std::move(caps));

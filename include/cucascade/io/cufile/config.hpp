@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace cucascade::io::cufile {
 
@@ -157,9 +158,11 @@ struct config {
   std::size_t staging_slots_per_reactor{2};
 
   /// Process-wide cap on registered staging per device, in bytes; 0 = no cap
-  /// beyond the device limits.  Slots are also refused once registering more
-  /// would exceed half the GPU's free BAR1 or cuFile's
-  /// @c max_device_pinned_mem_size; a reactor without a slot reads directly.
+  /// beyond the device limits.  A pool built by @c make_cufile_ioctx (or the
+  /// registry) also stays within half the GPU's free BAR1 and cuFile's
+  /// @c max_device_pinned_mem_size less its bounce cache; a registration that
+  /// fails anyway turns staging off on that device.  A reactor without a slot
+  /// reads directly.
   /// Staging memory is allocated outside RMM and kept for the life of the
   /// process (freeing it would synchronize the device): account for it when
   /// sizing a GPU memory pool, or reserve it up front (@c reserve_staging).
@@ -178,6 +181,12 @@ struct config {
   /// of the GPU, intersected with the process's affinity), so the I/O for a GPU
   /// is issued from its own socket, next to its NIC on an RDMA filesystem.
   bool pin_to_device_cpus{true};
+
+  /// CUDA devices a planned pool serves, a group of reactors (and reserved
+  /// staging) each; empty = every visible device.  List the GPUs the process
+  /// reads into, so no reactors or staging are spent on others; a read into a
+  /// device without a group is served by the whole pool.
+  std::vector<int> devices{};
 
   /// A file on the storage the pool will mostly read, used only to size it
   /// (network vs local; see @ref reactors_per_device).  Empty = unknown.

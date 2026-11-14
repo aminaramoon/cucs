@@ -635,6 +635,7 @@ void cufile_reactor::shutdown()
     // scratch and copy streams now rather than with the reactor.
     _scratch.reset();
     _copy_streams.clear();
+    _pair_streams.clear();
     _staging.clear();
     return;
   }
@@ -1041,7 +1042,6 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
       entry->owner       = std::move(request);
       entry->owner_bytes = end - offset;
       ++_staged_inflight;
-      _counters.early_staged_reads.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
     wait_for_gate();
@@ -1184,7 +1184,7 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
   auto status          = cudaSuccess;
   if (slice.d_buffer.ready_gate_set) {
     try {
-      copy_on = copy_stream(device_id);
+      copy_on = pair_stream(device_id);
     } catch (...) {
       request->finish_error(std::current_exception(), /*host_data_valid=*/true);
       return;
@@ -1391,12 +1391,22 @@ void cufile_reactor::pinned_deleter::operator()(std::uint8_t* memory) const noex
 
 cudaStream_t cufile_reactor::copy_stream(int device_id)
 {
+  return device_stream(_copy_streams, device_id);
+}
+
+cudaStream_t cufile_reactor::pair_stream(int device_id)
+{
+  return device_stream(_pair_streams, device_id);
+}
+
+cudaStream_t cufile_reactor::device_stream(std::vector<owned_stream>& streams, int device_id)
+{
   if (device_id < 0) {
     throw std::invalid_argument("cufile_reactor: copy stream of an unresolved device");
   }
   auto const index = static_cast<std::size_t>(device_id);
-  if (_copy_streams.size() <= index) _copy_streams.resize(index + 1);
-  auto& owned = _copy_streams[index];
+  if (streams.size() <= index) streams.resize(index + 1);
+  auto& owned = streams[index];
   if (owned.stream == nullptr) {
     CUCASCADE_CUDA_TRY(cudaStreamCreateWithFlags(&owned.stream, cudaStreamNonBlocking));
     owned.device_id = device_id;
@@ -1527,7 +1537,9 @@ void cufile_reactor::poll_staged(bool wait, grouped_coordinator::error_type cons
       } else if (error != nullptr) {
         request->finish_error(*error);
       } else {
+        // Only reads issued before their stream was ready ever own a slot.
         _counters.staged_reads.fetch_add(1, std::memory_order_relaxed);
+        _counters.early_staged_reads.fetch_add(1, std::memory_order_relaxed);
         _counters.staged_bytes.fetch_add(entry.owner_bytes, std::memory_order_relaxed);
         request->finish_success();
       }

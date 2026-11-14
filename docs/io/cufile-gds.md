@@ -95,17 +95,23 @@ capture stays valid.
   requests.
 
 The future of a read settles only once every slice has stopped touching its
-destination, and the bytes are then visible from any stream.
+destination, and the bytes are then visible from any stream. The same holds
+at shutdown. A read issued early whose copy is still waiting for its stream
+keeps `shutdown()` waiting until that stream lets the copy run. So never shut
+the ioctx down while holding a stream whose work waits on something issued
+after the shutdown.
 
 ## Sizing the pool: one group of reactors per GPU
 
 `io_config::cufile_n_reactors = 0` is the default. It makes the factory
 discover the topology and call `cufile::plan_cufile_pool`, which builds:
 
-- **one group of reactors per visible GPU.** A device read goes to the group of
-  its destination's GPU, which comes from the pointer
-  (`cudaPointerGetAttributes`), not from the calling thread. Each GPU therefore
-  has its own queue depth and is never stuck behind another GPU's backlog.
+- **one group of reactors per GPU** in `cufile.devices`, or per visible GPU
+  when that is empty. A device read goes to the group of its destination's GPU,
+  which comes from the pointer (`cudaPointerGetAttributes`), not from the
+  calling thread. Each GPU therefore has its own queue depth and is never stuck
+  behind another GPU's backlog. A request's slices travel together to the group
+  of its first device slice.
 - **reactors per GPU** set by Little's law (bytes in flight = throughput ×
   latency). At 50 GB/s and 2–5 ms per RDMA read, 100–250 MB must be in flight
   per GPU, which is 12–31 reads of 8 MB. Unless `reactors_per_device` is set,
@@ -125,7 +131,10 @@ discover the topology and call `cufile::plan_cufile_pool`, which builds:
 The plan is logged once (`cufile pool: ...`). Setup problems the planner can
 see are logged as warnings; see [the checklist](#ibm-storage-scale-checklist).
 A positive `cufile_n_reactors` keeps the old behaviour: one flat, unpinned
-pool of that many reactors shared by every GPU.
+pool of that many reactors shared by every GPU. It still gets the plan's
+per-GPU staging caps and piece size. `cufile::make_cufile_ioctx(n_reactors,
+cfg)` builds exactly what the registry's factory builds, but throws on failure
+instead of returning null. Use it when an engine constructs the ioctx itself.
 
 ```cpp
 cucascade::io::io_config config;
@@ -160,7 +169,7 @@ Passive (`memory::topology_discovery::discover()`, no CUDA or cuFile loaded):
 
 | Where | What |
 |-------|------|
-| `system_topology_info::gds` (`gds_setup_info`) | nvidia-fs loaded / version / GDS version / PeerDirect support / per-GPU registered and cache MiB; `nvidia_peermem`, `ib_core`, Storage Scale (`mmfs26`/`mmfslinux`), Lustre, BeeGFS, WekaFS and NFS-over-RDMA modules; `CUFILE_FORCE_COMPAT_MODE`; `cufile.json` (`$CUFILE_ENV_PATH_JSON` or `/etc/cufile.json`), parsed: direct-I/O size, bounce cache, pinned limit, poll mode, compat mode, RDMA addresses and policy, the execution thread pool, `fs.gpfs.*`, the denylists |
+| `system_topology_info::gds` (`gds_setup_info`) | nvidia-fs loaded / version / GDS version / PeerDirect support / per-GPU registered and cache MiB; `nvidia_peermem`, `ib_core`, Storage Scale (`mmfs26`/`mmfslinux`), Lustre, BeeGFS, WekaFS and NFS-over-RDMA modules; `CUFILE_FORCE_COMPAT_MODE`; `cufile.json` as cuFile layers it (`/etc/cufile.json`, then the file `$CUFILE_ENV_PATH_JSON` names merged on top key by key), parsed: direct-I/O size, bounce cache, pinned limit, poll mode, compat mode, RDMA addresses and policy, the execution thread pool, `fs.gpfs.*`, the denylists |
 | `gpu_topology_info` | `memory_total_bytes`, `bar1_total_bytes`, `bar1_free_bytes`, `network_device_path` (PCIe distance to the GPU's NICs) |
 | `network_device_info` | `active_ports`, `link_layer` (InfiniBand / Ethernet), `rate_gbps` |
 | `path_storage_info` | `preferred_io_size` (`st_blksize`; Storage Scale reports its block size here), `filesystem_block_size` (`f_bsize`) |
@@ -210,9 +219,10 @@ Two user-level claims proved wrong when checked against the docs:
 
 ## Verifying the path a read took
 
-- `cufile_ioctx::stats()` (`reactor_stats`): staged, direct and POSIX reads
-  and bytes, `early_staged_reads`, `cufile_failures`, `parked_slices`. On a GDS
-  host, Parquet device reads should land in `staged_bytes`.
+- `cufile_ioctx::stats()` (`reactor_stats`), or `stats(device)` for one GPU's
+  group: staged, direct and POSIX reads and bytes, `early_staged_reads`,
+  `cufile_failures`, `parked_slices`. On a GDS host, Parquet device reads should
+  land in `staged_bytes`.
 - `gds_stats -p <pid> -l 3`: per-GPU `n_nvfs_reads` / `n_p2p_reads`
   (direct) versus `n_posix_reads` (compat), bounce-pool use, per-NIC RDMA
   bytes. `cufile.json` `profile.cufile_stats: 3` enables it.
@@ -280,6 +290,7 @@ points.
 | `max_staging_bytes_per_device` | 1 GiB | Process-wide cap on staging per GPU (0 = no cap) |
 | `reactors_per_device` | 0 (auto) | Reactors per GPU in a planned pool |
 | `pin_to_device_cpus` | true | Pin each group to its GPU's CPUs |
+| `devices` | empty (all) | GPUs a planned pool serves; list the ones the process reads into |
 | `storage_hint_path` | empty | A file on the main storage, used only to size the pool |
 | `gds_threshold` | 256 KiB | Smaller device reads use POSIX |
 | `max_op_bytes` | 64 MiB | Largest direct `cuFileRead`; byte quantum of a scheduling pass |
