@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -102,7 +103,9 @@ staging_slot staging_pool::acquire(int device,
       reinterpret_cast<std::uint8_t*>((address + gpu_page - 1) / gpu_page * gpu_page),
       bytes,
       device,
-      false};
+      false,
+      raw,
+      nullptr};
 
     auto const* api   = cufile_api::get();
     bool try_register = false;
@@ -118,6 +121,7 @@ staging_slot staging_pool::acquire(int device,
       attempted       = true;
       status          = api->buf_register(slot.base, slot.bytes, 0);
       slot.registered = status.err == CU_FILE_SUCCESS;
+      if (slot.registered) slot.registered_by = api;
     }
 
     bool keep_unregistered = false;
@@ -164,6 +168,50 @@ void staging_pool::release(staging_slot slot) noexcept
   }
 }
 
+std::size_t staging_pool::release_free(int device) noexcept
+{
+  std::vector<staging_slot> doomed;
+  {
+    std::lock_guard lock(_mutex);
+    auto const it = _devices.find(device);
+    if (it == _devices.end()) return 0;
+    doomed.swap(it->second.free);
+  }
+  std::size_t freed = 0;
+  try {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+    for (auto const& slot : doomed) {
+      // Deregister through the table that registered it: libcufile's own, or a
+      // test's substitute while it is still installed (a removed one is gone).
+      if (slot.registered) {
+        cufile_api const* owner = nullptr;
+        if (auto const* real = cufile_api::loaded(); real != nullptr && real == slot.registered_by) {
+          owner = real;
+        } else if (auto const* current = cufile_api::get(); current == slot.registered_by) {
+          owner = current;
+        }
+        if (owner != nullptr && owner->buf_deregister != nullptr) {
+          std::ignore = owner->buf_deregister(slot.base);
+        }
+      }
+      if (cudaFree(slot.allocation) != cudaSuccess) {
+        std::ignore = cudaGetLastError();
+        continue;
+      }
+      freed += slot.bytes + gpu_page;
+      std::lock_guard lock(_mutex);
+      auto& state = _devices[device];
+      state.allocated_bytes -= std::min(state.allocated_bytes, slot.bytes + gpu_page);
+      if (slot.registered) {
+        state.registered_bytes -= std::min(state.registered_bytes, slot.bytes);
+      }
+    }
+  } catch (...) {
+    // A failed device switch: whatever was not freed is leaked, not reused.
+  }
+  return freed;
+}
+
 staging_usage staging_pool::usage(int device) const noexcept
 {
   staging_usage usage;
@@ -206,6 +254,11 @@ std::size_t reserve_staging(int device, std::size_t slots, config const& cfg) no
 staging_usage staging_usage_of(int device) noexcept
 {
   return detail::staging_pool::instance().usage(device);
+}
+
+std::size_t release_staging(int device) noexcept
+{
+  return detail::staging_pool::instance().release_free(device);
 }
 
 }  // namespace cucascade::io::cufile

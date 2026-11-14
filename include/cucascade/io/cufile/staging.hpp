@@ -57,4 +57,16 @@ struct staging_usage {
 /// What @p device holds for staging now.  Never throws.
 [[nodiscard]] staging_usage staging_usage_of(int device) noexcept;
 
+/**
+ * @brief Give back the staging slots of @p device that no reactor holds:
+ *        deregister them from cuFile and free them.
+ *
+ * Synchronizes the device (@c cudaFree).  For tools that change the slot size
+ * between runs, and for an application handing the memory back once its cuFile
+ * ioctxs are shut down; slots reactors still hold are untouched.  Never throws.
+ *
+ * @return The bytes freed.
+ */
+std::size_t release_staging(int device) noexcept;
+
 }  // namespace cucascade::io::cufile

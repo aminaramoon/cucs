@@ -23,6 +23,7 @@
 #include <cucascade/io/cufile/placement.hpp>
 #include <cucascade/io/cufile/staging.hpp>
 #include <cucascade/log/logging.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -33,6 +34,7 @@
 #include <exception>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -46,6 +48,42 @@ namespace {
 [[nodiscard]] constexpr std::size_t align_down_block(std::size_t value) noexcept
 {
   return value & ~(IO_BLOCK_SIZE - 1);
+}
+
+/// Round @p value up to a multiple of @c IO_BLOCK_SIZE.
+[[nodiscard]] constexpr std::size_t align_up_block(std::size_t value) noexcept
+{
+  return align_down_block(value + IO_BLOCK_SIZE - 1);
+}
+
+/**
+ * The distance between the piece boundaries of [@p begin, @p end) split into
+ * pieces of at most @p split bytes (a multiple of 4 KiB): boundaries fall at
+ * align_down(begin) + k * step, and the pieces come out near-equal, so none is a
+ * sliver.
+ */
+[[nodiscard]] std::size_t split_step(std::size_t begin, std::size_t end, std::size_t split) noexcept
+{
+  auto const span  = end - align_down_block(begin);
+  auto const count = (span + split - 1) / split;
+  return std::min(split, align_up_block((span + count - 1) / count));
+}
+
+/// How many pieces the cuFile ioctx splits @p slice into (1 = not split): only
+/// device-only slices without a cache completion, larger than @p split bytes.
+[[nodiscard]] std::size_t split_pieces(prepared_io_slice const& slice,
+                                       std::size_t file_size,
+                                       std::size_t split) noexcept
+{
+  if (split == 0 || !slice.has_device_request() || slice.has_host_request() ||
+      slice.on_complete != nullptr || slice.rng.offset >= file_size) {
+    return 1;
+  }
+  auto const begin = slice.rng.offset;
+  auto const end   = begin + std::min(slice.rng.size, file_size - begin);
+  if (end - begin <= split) return 1;
+  auto const step = split_step(begin, end, split);
+  return (end - align_down_block(begin) + step - 1) / step;
 }
 
 /// The reactors of a planned pool, each placed in its GPU's group.
@@ -268,34 +306,28 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
     slice.d_buffer.ready_gate     = found->gate;
     slice.d_buffer.ready_gate_set = true;
 
-    bool const device_only = !slice.has_host_request() && slice.on_complete == nullptr;
-    if (device_only && split_bytes != 0 && slice.rng.offset < file_size) {
-      auto const begin = slice.rng.offset;
-      auto const end   = begin + std::min(slice.rng.size, file_size - begin);
-      // Pieces end at align_down(begin) + k * split_bytes (see below).
-      piece_count += (end - align_down_block(begin) + split_bytes - 1) / split_bytes - 1;
+    if (auto const pieces = split_pieces(slice, file_size, split_bytes); pieces > 1) {
+      piece_count += pieces - 1;
     }
   }
   if (piece_count == 0) return;
   piece_count += slices.size();
 
-  // Split device-only slices on 4 KiB boundaries: piece k ends at
-  // align_down(offset) + k * split_bytes, so every piece but the first starts
-  // aligned and each fits one staging slot.
+  // Split on 4 KiB boundaries into near-equal pieces (see split_step): every
+  // piece but the first starts aligned, each fits one staging slot, and none is
+  // a sliver that would fall below gds_threshold.
   std::vector<prepared_io_slice> pieces;
   // Reserved up front: once slices start moving, nothing may throw.
   pieces.reserve(piece_count);
   for (auto& slice : slices) {
-    bool const device_only = slice.has_device_request() && !slice.has_host_request() &&
-                             slice.on_complete == nullptr && slice.rng.offset < file_size;
-    auto const size = device_only ? std::min(slice.rng.size, file_size - slice.rng.offset) : 0;
-    if (!device_only || size <= split_bytes) {
+    if (split_pieces(slice, file_size, split_bytes) <= 1) {
       pieces.push_back(std::move(slice));
       continue;
     }
     auto const begin = slice.rng.offset;
-    auto const end   = begin + size;
-    auto boundary    = align_down_block(begin) + split_bytes;
+    auto const end   = begin + std::min(slice.rng.size, file_size - begin);
+    auto const step  = split_step(begin, end, split_bytes);
+    auto boundary    = align_down_block(begin) + step;
     for (auto position = begin; position < end;) {
       auto const stop = std::min(boundary, end);
       prepared_io_slice piece;
@@ -305,10 +337,43 @@ void cufile_ioctx::prepare_device_slices(io_object const& object,
       piece.priority = slice.priority;
       pieces.push_back(std::move(piece));
       position = stop;
-      boundary += split_bytes;
+      boundary += step;
     }
   }
   slices = std::move(pieces);
+}
+
+std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors, config const& cfg)
+{
+  if (n_reactors != 0) {
+    return std::make_shared<cufile_ioctx>(n_reactors,
+                                          std::make_shared<cufile_reactor::reactor_context>(cfg));
+  }
+  std::optional<memory::system_topology_info> topology;
+  try {
+    memory::topology_discovery discovery;
+    if (discovery.discover(memory::NetworkDeviceVerification::EXISTS_ACTIVE)) {
+      topology = discovery.get_topology();
+    }
+  } catch (std::exception const& e) {
+    CUCASCADE_LOG_WARN("cufile: topology discovery failed ({}); planning without it", e.what());
+  }
+  auto plan = plan_cufile_pool(cfg, topology ? &*topology : nullptr, probe_platform());
+  CUCASCADE_LOG_INFO("{}", describe(plan));
+  for (auto const& warning : plan.warnings) {
+    CUCASCADE_LOG_WARN("cufile: {}", warning);
+  }
+  auto effective = cfg;
+  if (plan.staging_piece_bytes != 0) effective.staging_piece_bytes = plan.staging_piece_bytes;
+  std::vector<std::size_t> caps;
+  for (auto const& group : plan.groups) {
+    auto const index = static_cast<std::size_t>(group.device);
+    if (caps.size() <= index) caps.resize(index + 1, effective.max_staging_bytes_per_device);
+    caps[index] = group.staging_cap_bytes;
+  }
+  auto ctx =
+    std::make_shared<cufile_reactor::reactor_context>(std::move(effective), std::move(caps));
+  return std::make_shared<cufile_ioctx>(std::move(plan), std::move(ctx));
 }
 
 exec::semi_future<std::size_t> cufile_ioctx::mixed_readv_async_io(

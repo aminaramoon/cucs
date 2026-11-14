@@ -20,9 +20,6 @@
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
-#include <cucascade/io/cufile/placement.hpp>
-#include <cucascade/io/cufile/platform.hpp>
-#include <cucascade/memory/topology_discovery.hpp>
 #endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
@@ -89,39 +86,7 @@ factory_type make_cufile_ioctx_factory()
 {
   return [](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
-      if (config.cufile_n_reactors != 0) {
-        auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile);
-        return std::make_shared<cufile::cufile_ioctx>(config.cufile_n_reactors, std::move(ctx));
-      }
-      // Plan a group of reactors per GPU from the topology.  RDMA NICs are kept
-      // when their port is active even without an IP address (InfiniBand
-      // without IPoIB), since GDS over RDMA does not need one.
-      std::optional<cucascade::memory::system_topology_info> topology;
-      try {
-        cucascade::memory::topology_discovery discovery;
-        if (discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE)) {
-          topology = discovery.get_topology();
-        }
-      } catch (const std::exception& e) {
-        CUCASCADE_LOG_WARN("make_cufile_ioctx_factory: topology discovery failed: {}", e.what());
-      }
-      auto plan = cufile::plan_cufile_pool(
-        config.cufile, topology ? &*topology : nullptr, cufile::probe_platform());
-      CUCASCADE_LOG_INFO("{}", cufile::describe(plan));
-      for (auto const& warning : plan.warnings) {
-        CUCASCADE_LOG_WARN("cufile: {}", warning);
-      }
-      auto cfg = config.cufile;
-      if (plan.staging_piece_bytes != 0) cfg.staging_piece_bytes = plan.staging_piece_bytes;
-      std::vector<std::size_t> caps;
-      for (auto const& group : plan.groups) {
-        auto const index = static_cast<std::size_t>(group.device);
-        if (caps.size() <= index) caps.resize(index + 1, cfg.max_staging_bytes_per_device);
-        caps[index] = group.staging_cap_bytes;
-      }
-      auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(std::move(cfg),
-                                                                           std::move(caps));
-      return std::make_shared<cufile::cufile_ioctx>(std::move(plan), std::move(ctx));
+      return cufile::make_cufile_ioctx(config.cufile_n_reactors, config.cufile);
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_cufile_ioctx_factory: construction failed: {}", e.what());
       return nullptr;

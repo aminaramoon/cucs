@@ -40,6 +40,10 @@ struct staging_slot {
   std::size_t bytes{0};
   int device{-1};
   bool registered{false};
+  /// What @c cudaMalloc returned (@c base is rounded up inside it).
+  void* allocation{nullptr};
+  /// The cuFile table that registered it (null when not registered).
+  void const* registered_by{nullptr};
 
   [[nodiscard]] explicit operator bool() const noexcept { return base != nullptr; }
 };
@@ -85,6 +89,10 @@ class staging_pool {
 
   /// What @p device holds now.
   [[nodiscard]] staging_usage usage(int device) const noexcept;
+
+  /// Deregister and free every slot of @p device no reactor holds; returns the
+  /// bytes freed.  Synchronizes the device (@c cudaFree).
+  std::size_t release_free(int device) noexcept;
 
  private:
   staging_pool() = default;

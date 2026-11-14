@@ -146,4 +146,22 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   std::vector<group_range> _groups;
 };
 
+/**
+ * @brief Build the cuFile ioctx the datasource factory builds, throwing on failure.
+ *
+ * With @p n_reactors 0 (the @c io_config::cufile_n_reactors default), discovers
+ * the topology (NVML and sysfs; RDMA NICs kept when their port is active, IP or
+ * not), plans a pool per GPU with @ref plan_cufile_pool, logs the plan at INFO and
+ * each of its warnings at WARN, applies the plan's staging piece size and
+ * per-device staging caps, and builds the pool from the plan.  With a positive
+ * @p n_reactors, builds one flat pool of that many reactors from @p cfg as is.
+ * The ioctx is not started.
+ *
+ * @throws std::invalid_argument / std::runtime_error when @p cfg is malformed or
+ *         a reactor cannot be built (the registry's factory reports the same as a
+ *         null ioctx).
+ */
+[[nodiscard]] std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors,
+                                                              config const& cfg);
+
 }  // namespace cucascade::io::cufile
