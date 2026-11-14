@@ -23,6 +23,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cufile.h>
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -82,19 +84,75 @@ struct pci_address {
   return nullptr;
 }
 
+/// Whether @p platform reports a real GDS mode for storage class bit @p bit.
+[[nodiscard]] bool class_bit_set(platform_info const& platform, int bit) noexcept
+{
+  return platform.properties_available &&
+         (platform.dstatusflags & (1U << static_cast<unsigned>(bit))) != 0;
+}
+
+/// Setup problems that cost GDS throughput, as far as the topology and the
+/// storage hint show them.
+void collect_warnings(memory::system_topology_info const* topology,
+                      platform_info const& platform,
+                      memory::path_storage_info const* hint,
+                      std::vector<std::string>& out)
+{
+  bool const on_gpfs = hint != nullptr && hint->filesystem_type == "gpfs";
+  bool const gpfs_gds = class_bit_set(platform, CU_FILE_GPFS_SUPPORTED);
+  if (on_gpfs && platform.driver_opened && !gpfs_gds) {
+    out.push_back(
+      "storage_hint_path is on IBM Storage Scale but cuFile reports no GDS mode for it: every "
+      "read goes through cuFile's compatibility mode (host bounce).  Check `gdscheck -p`, "
+      "verbsGPUDirectStorage=yes / verbsRdma=enable on the cluster, nvidia_peermem or DMA-BUF, "
+      "and that GDS clients are supported on this CPU architecture (IBM documents x86 only)");
+  }
+  if (topology != nullptr) {
+    auto const& gds = topology->gds;
+    if (gpfs_gds && gds.cufile_json.parsed && gds.cufile_json.settings.rdma_dev_addr_list.empty()) {
+      out.push_back("cuFile reports GDS for Storage Scale but " + gds.cufile_json.path +
+                    " lists no rdma_dev_addr_list: Storage Scale GDS reads fall back to "
+                    "compatibility mode without RDMA client addresses (set them to the IPs of the "
+                    "RDMA ports in verbsPorts)");
+    }
+    if (gpfs_gds && !gds.peer_memory_loaded) {
+      out.push_back(
+        "cuFile reports GDS for Storage Scale but nvidia_peermem is not loaded: GPU memory must "
+        "be registered with the HCA through DMA-BUF instead (check `gdscheck -p`)");
+    }
+    if (on_gpfs && gds.cufile_json.parsed) {
+      auto const& denied = gds.cufile_json.settings.denied_filesystems;
+      if (std::find(denied.begin(), denied.end(), "gpfs") != denied.end()) {
+        out.push_back(gds.cufile_json.path +
+                      " denylists the gpfs filesystem: cuFile never uses GDS for it");
+      }
+    }
+    if (gds.force_compat_env) {
+      out.push_back("CUFILE_FORCE_COMPAT_MODE is set: every cuFile read bounces through host memory");
+    }
+  }
+  if (platform.properties_available && (platform.dcontrolflags & 1U) != 0 && on_gpfs) {
+    out.push_back(
+      "cuFile poll mode is on: Storage Scale does not support it (requests are converted to "
+      "synchronous GDS I/O); set properties.use_poll_mode false");
+  }
+}
+
 /// Reactors per GPU and why.
-[[nodiscard]] std::size_t reactors_per_device(config const& cfg, std::string& why)
+[[nodiscard]] std::size_t reactors_per_device(config const& cfg,
+                                              memory::path_storage_info const* hint,
+                                              std::string& why)
 {
   if (cfg.reactors_per_device != 0) {
     why = std::to_string(cfg.reactors_per_device) + " reactors (configured)";
     return cfg.reactors_per_device;
   }
-  if (cfg.storage_hint_path.empty()) {
+  if (hint == nullptr) {
     why = std::to_string(default_reactors_per_device) +
           " reactors (storage unknown: no storage_hint_path)";
     return default_reactors_per_device;
   }
-  auto const storage = memory::topology_discovery::discover_storage_for_path(cfg.storage_hint_path);
+  auto const& storage = *hint;
   switch (storage.kind) {
     case memory::storage_kind::network:
       why = std::to_string(network_reactors_per_device) + " reactors (" +
@@ -142,14 +200,30 @@ pool_plan plan_cufile_pool(config const& cfg,
       return plan;
     }
 
+    std::optional<memory::path_storage_info> hint;
+    if (!cfg.storage_hint_path.empty()) {
+      hint = memory::topology_discovery::discover_storage_for_path(cfg.storage_hint_path);
+    }
     std::string sizing;
-    auto const per_device = reactors_per_device(cfg, sizing);
+    auto const per_device = reactors_per_device(cfg, hint ? &*hint : nullptr, sizing);
     bool const gds        = platform.driver_opened && platform.properties_available &&
                      !platform.compat_only && !platform.forced_compat;
     bool const stage = cfg.staging_mode == staging::always ||
                        (cfg.staging_mode == staging::automatic && gds);
+    collect_warnings(topology, platform, hint ? &*hint : nullptr, plan.warnings);
+
+    // cuFile moves a call in sequential chunks of max_direct_io_size: pieces no
+    // larger than that spread over more reactors instead.
+    auto effective = cfg;
+    if (stage && platform.max_direct_io_size_kb != 0) {
+      auto const chunk = (platform.max_direct_io_size_kb * 1024) & ~(IO_BLOCK_SIZE - 1);
+      if (chunk >= IO_BLOCK_SIZE && chunk < effective.staging_piece_bytes) {
+        effective.staging_piece_bytes = chunk;
+      }
+    }
+    plan.staging_piece_bytes  = effective.staging_piece_bytes;
     auto const allowed        = exec::thread_util::get_current_thread_affinity();
-    auto const slot_footprint = cfg.staging_slot_bytes() + (64UL << 10);
+    auto const slot_footprint = effective.staging_slot_bytes() + (64UL << 10);
 
     for (int device = 0; device < count; ++device) {
       device_group_plan group;
@@ -199,7 +273,7 @@ pool_plan plan_cufile_pool(config const& cfg,
         if (cap != 0) wanted = std::min(wanted, cap / slot_footprint);
         group.staging_slots = wanted;
         staging_why         = std::to_string(wanted) + " staging slots of " +
-                      std::to_string(cfg.staging_slot_bytes() >> 10) + " KiB" +
+                      std::to_string(effective.staging_slot_bytes() >> 10) + " KiB" +
                       (cap != 0 ? " (cap " + std::to_string(cap >> 20) + " MiB)" : "");
         if (wanted < per_device * cfg.staging_slots_per_reactor) {
           staging_why += "; fewer than reactors x slots: the cap, BAR1 or cuFile's pinned limit "
@@ -226,6 +300,9 @@ pool_plan plan_cufile_pool(config const& cfg,
 std::string describe(pool_plan const& plan)
 {
   std::string out = "cufile pool: " + plan.reason;
+  if (plan.staging_piece_bytes != 0) {
+    out += ", staged pieces of " + std::to_string(plan.staging_piece_bytes >> 10) + " KiB";
+  }
   for (auto const& group : plan.groups) {
     out += "; GPU " + std::to_string(group.device) + " (" + group.pci_bus_id + "): " + group.reason;
   }

@@ -108,14 +108,19 @@ factory_type make_cufile_ioctx_factory()
       auto plan = cufile::plan_cufile_pool(
         config.cufile, topology ? &*topology : nullptr, cufile::probe_platform());
       CUCASCADE_LOG_INFO("{}", cufile::describe(plan));
+      for (auto const& warning : plan.warnings) {
+        CUCASCADE_LOG_WARN("cufile: {}", warning);
+      }
+      auto cfg = config.cufile;
+      if (plan.staging_piece_bytes != 0) cfg.staging_piece_bytes = plan.staging_piece_bytes;
       std::vector<std::size_t> caps;
       for (auto const& group : plan.groups) {
         auto const index = static_cast<std::size_t>(group.device);
-        if (caps.size() <= index) caps.resize(index + 1, config.cufile.max_staging_bytes_per_device);
+        if (caps.size() <= index) caps.resize(index + 1, cfg.max_staging_bytes_per_device);
         caps[index] = group.staging_cap_bytes;
       }
-      auto ctx =
-        std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile, std::move(caps));
+      auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(std::move(cfg),
+                                                                           std::move(caps));
       return std::make_shared<cufile::cufile_ioctx>(std::move(plan), std::move(ctx));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_cufile_ioctx_factory: construction failed: {}", e.what());

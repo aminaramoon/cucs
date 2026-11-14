@@ -64,7 +64,15 @@ struct pool_plan {
   /// total via @c io_config::cufile_n_reactors).
   std::vector<device_group_plan> groups;
   std::size_t flat_reactors{0};  ///< Reactors of a flat pool (when @c groups is empty).
-  std::string reason;            ///< Overall summary, in words.
+  /// The staging piece size the pool should use: the config's, capped at cuFile's
+  /// @c max_direct_io_size (cuFile issues a larger call as sequential chunks of
+  /// that size, so smaller pieces spread over more reactors read faster).
+  std::size_t staging_piece_bytes{0};
+  std::string reason;  ///< Overall summary, in words.
+  /// Setup problems found while planning that cost GDS throughput, each a
+  /// sentence an operator can act on (e.g. an empty @c rdma_dev_addr_list with a
+  /// GDS-enabled Storage Scale client).  Logged as warnings by the factory.
+  std::vector<std::string> warnings;
 
   /// Reactors the pool runs.
   [[nodiscard]] std::size_t total_reactors() const noexcept
@@ -103,7 +111,10 @@ struct pool_plan {
  * - Staging (only when @c cfg.staging_mode is @c always, or @c automatic and
  *   @p platform reports GDS): reactors x @c staging_slots_per_reactor slots,
  *   bounded by @c cfg.max_staging_bytes_per_device, half the BAR1 free at
- *   discovery and cuFile's @c max_device_pinned_mem_size.
+ *   discovery and cuFile's @c max_device_pinned_mem_size; pieces no larger than
+ *   cuFile's @c max_direct_io_size.
+ * - Warnings: GDS setup problems visible from here (see @ref pool_plan::warnings),
+ *   e.g. Storage Scale storage without GDS, or GDS without RDMA addresses.
  *
  * Calls the CUDA runtime (device count and PCI bus IDs) but creates nothing.
  * Never throws: whatever cannot be learned is reported in the reasons.

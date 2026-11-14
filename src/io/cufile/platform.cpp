@@ -25,6 +25,7 @@
 
 #include <cufile.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <exception>
@@ -36,6 +37,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io::cufile {
 
@@ -297,6 +299,24 @@ void fill_policy(path_info& info, config const& cfg)
   info.compat_mode = cfg.compat_mode.value_or(compat::automatic);
   info.use_odirect = cfg.use_odirect;
   info.platform    = probe_platform();
+  info.gds         = memory::discover_gds_setup();
+}
+
+/// Whether @p options (a comma-separated mount option list) holds @p option.
+[[nodiscard]] bool has_option(std::string const& options, std::string_view option) noexcept
+{
+  std::size_t start = 0;
+  while (start <= options.size()) {
+    auto const comma = std::min(options.find(',', start), options.size());
+    if (std::string_view{options}.substr(start, comma - start) == option) return true;
+    start = comma + 1;
+  }
+  return false;
+}
+
+[[nodiscard]] bool listed(std::vector<std::string> const& list, std::string const& value) noexcept
+{
+  return !value.empty() && std::find(list.begin(), list.end(), value) != list.end();
 }
 
 void fill_from_object(path_info& info, cufile_io_object const& object)
@@ -413,6 +433,12 @@ void decide_path_capability(path_info& info) noexcept
             "network filesystem " + storage.filesystem_type + " has no GDS storage class");
           return;
         }
+        // GDS serves NFS only over RDMA.
+        if (info.matched_class == storage_class::nfs &&
+            !has_option(storage.super_options, "proto=rdma") &&
+            !has_option(storage.mount_options, "proto=rdma")) {
+          info.filesystem_supported = false;
+        }
         break;
       case storage_kind::memory:
         set_verdict(info,
@@ -445,8 +471,32 @@ void decide_path_capability(path_info& info) noexcept
     if (!info.filesystem_supported) {
       set_verdict(info,
                   path_capability::compatibility_only,
-                  "filesystem " + storage.filesystem_type + " is not served by GDS on " + cls);
+                  info.matched_class == storage_class::nfs
+                    ? "NFS mount " + storage.mount_point +
+                        " is not over RDMA (no proto=rdma): GDS serves NFS over RDMA only"
+                    : "filesystem " + storage.filesystem_type + " is not served by GDS on " + cls);
       return;
+    }
+    if (auto const& json = info.gds.cufile_json; json.parsed) {
+      if (listed(json.settings.denied_filesystems, storage.filesystem_type) ||
+          listed(json.settings.denied_mounts, storage.mount_point)) {
+        set_verdict(info,
+                    path_capability::compatibility_only,
+                    json.path + " denylists " +
+                      (listed(json.settings.denied_mounts, storage.mount_point)
+                         ? "mount " + storage.mount_point
+                         : "filesystem " + storage.filesystem_type) +
+                      ": cuFile does not use GDS for it");
+        return;
+      }
+      if (info.matched_class == storage_class::gpfs && json.settings.rdma_dev_addr_list.empty()) {
+        set_verdict(info,
+                    path_capability::compatibility_only,
+                    json.path +
+                      " lists no rdma_dev_addr_list: Storage Scale GDS reads need the client's "
+                      "RDMA addresses and fall back to compatibility mode without them");
+        return;
+      }
     }
     if (!info.direct_open) {
       set_verdict(info,

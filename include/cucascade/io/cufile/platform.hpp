@@ -190,6 +190,10 @@ struct path_info {
 
   // -- storage --------------------------------------------------------------
   memory::path_storage_info storage;                  ///< Passive mount / device discovery.
+  /// The host's GDS setup (nvidia-fs, peer memory, cufile.json), passively
+  /// discovered; its cufile.json denylist and Storage Scale RDMA addresses
+  /// feed the verdict.  Left default (nothing parsed) when not discovered.
+  memory::gds_setup_info gds;
   storage_class matched_class = storage_class::none;  ///< Class the verdict checked.
   /// Whether the driver reports a real GDS mode for @c matched_class (its
   /// @c dstatusflags bit is set).  Never inferred from any other bit.

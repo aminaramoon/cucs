@@ -809,11 +809,13 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
       switch (gate_of(slice)) {
         case gate_state::ready: break;
         case gate_state::pending: {
-          auto const span = align_up_block(slice.rng.offset + clamped) -
-                            align_down_block(slice.rng.offset);
-          bool const early = staging != nullptr && _config.staging_slots_per_reactor > 1 &&
-                             span <= _config.staging_slot_bytes() &&
-                             staging->free_count() >= 2 && inflight_count() < _config.max_inflight;
+          bool const early =
+            staging != nullptr && _config.staging_slots_per_reactor > 1 &&
+            detail::staged_calls(slice.rng.offset,
+                                 slice.rng.offset + clamped,
+                                 file->size(),
+                                 align_down_block(_config.staging_slot_bytes())) == 1 &&
+            staging->free_count() >= 2 && inflight_count() < _config.max_inflight;
           if (!early) {
             park_on_gate(obj, std::move(slice), coordinator);
             return;
@@ -965,9 +967,10 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
   auto const& gate     = slice.d_buffer.ready_gate;
   auto const offset    = request->io_rng.offset;
   auto const end       = offset + request->io_rng.size;
-  auto const tail_end  = align_up_block(file.size());
+  auto const file_size = file.size();
+  auto const body_end  = align_down_block(file_size);
   auto* const dst      = slice.d_buffer.data;
-  auto const slot_size = entry->slot.bytes;
+  auto const slot_size = align_down_block(entry->slot.bytes);
   std::optional<grouped_coordinator::error_type> failure;
   auto wait_for_gate = [&]() noexcept {
     if (!gate_pending) return;
@@ -983,11 +986,17 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
       break;
     }
     // Widen the piece to whole blocks: an aligned file offset, length and slot
-    // address are what cuFile can DMA into registered memory directly.  The read
-    // may run past the end of the file by less than a block; it returns short.
+    // address are what cuFile can DMA into registered memory directly.  Never
+    // past the end of the file, though (what a GDS path does there is not
+    // specified, and some nvidia-fs builds trip over it): a range ending in the
+    // file's partial last block reads the aligned body first and that tail in a
+    // call of its own, so the body stays eligible for direct DMA.
     auto const aligned_offset = align_down_block(pos);
-    auto const want =
-      std::min(std::min(align_up_block(end), tail_end) - aligned_offset, slot_size);
+    auto stop                 = std::min(align_up_block(end), aligned_offset + slot_size);
+    if (stop > file_size) {
+      stop = aligned_offset < body_end ? body_end : file_size;
+    }
+    auto const want = stop - aligned_offset;
     errno          = 0;
     auto const got = api->read(
       file.cufile_handle(), entry->slot.base, want, static_cast<off_t>(aligned_offset), 0);
@@ -1005,8 +1014,7 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
     // where data was expected means the file shrank underneath us; more than
     // asked is malformed.
     if (static_cast<std::size_t>(got) > want || piece_end <= pos ||
-        (static_cast<std::size_t>(got) < want && read_end < tail_end &&
-         ++short_reads > max_short_reads)) {
+        (static_cast<std::size_t>(got) < want && ++short_reads > max_short_reads)) {
       failure = std::make_error_code(std::errc::io_error);
       break;
     }
@@ -1142,9 +1150,11 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
     return;
   }
   // A host-only read goes O_DIRECT (staged through the scratch when it is not
-  // block-aligned), like the uring reactor's; a host+device pair, or a file
-  // without an O_DIRECT fd, reads through the page cache.
-  bool const direct = !slice.has_device_request() &&
+  // block-aligned), like the uring reactor's, and so does a host+device pair of
+  // a file cuFile serves (buffered reads of a file read with GDS cost the GDS
+  // reads performance); other pairs, and files without an O_DIRECT fd, read
+  // through the page cache.
+  bool const direct = (!slice.has_device_request() || file.cufile_registered()) &&
                       uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
   auto const bytes_read = direct
                             ? read_host_direct(file, base, request->io_rng)
@@ -1285,7 +1295,13 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
 
   auto const offset = request.io_rng.offset;
   auto const size   = request.io_rng.size;
-  std::size_t done  = 0;
+  // A file cuFile serves is read O_DIRECT here too, whole blocks around each
+  // piece: buffered reads of a file being read with GDS cost the GDS reads
+  // performance (IBM documents it for Storage Scale) and fill the page cache with
+  // blocks the direct path must keep coherent.
+  bool direct = file.cufile_registered() &&
+                uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
+  std::size_t done = 0;
   for (std::size_t piece = 0; done < size; ++piece) {
     if (_stop_source.stop_requested()) {
       std::ignore = drain();
@@ -1302,10 +1318,33 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
       }
     }
     auto* const buffer = scratch_base + slot * scratch_slot_bytes;
-    auto const want    = std::min(scratch_slot_bytes, size - done);
+    auto const pos     = offset + done;
+    std::uint8_t const* source = buffer;
+    std::size_t want{0};
     std::size_t got{0};
     try {
-      got = pread_all(file.buffered_fd(), buffer, want, offset + done);
+      if (direct) {
+        // The widened piece must fit the slot: up to a block of head and tail.
+        want                     = std::min(scratch_slot_bytes - 2 * IO_BLOCK_SIZE, size - done);
+        auto const aligned_begin = align_down_block(pos);
+        auto const head          = pos - aligned_begin;
+        try {
+          auto const read = pread_all(
+            file.direct_fd(), buffer, align_up_block(pos + want) - aligned_begin, aligned_begin);
+          got    = read > head ? std::min(read - head, want) : 0;
+          source = buffer + head;
+        } catch (std::system_error const& error) {
+          // The filesystem refused O_DIRECT at run time: the page cache from here on.
+          if (!uring::detail::is_odirect_runtime_error(error.code().value())) throw;
+          direct = false;
+          want   = std::min(scratch_slot_bytes, size - done);
+          got    = pread_all(file.buffered_fd(), buffer, want, pos);
+          source = buffer;
+        }
+      } else {
+        want = std::min(scratch_slot_bytes, size - done);
+        got  = pread_all(file.buffered_fd(), buffer, want, pos);
+      }
     } catch (...) {
       std::ignore = drain();
       throw;
@@ -1320,7 +1359,7 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
     auto status = delay_staging_copy(stream);
     if (status == cudaSuccess) {
       status =
-        cudaMemcpyAsync(slice.d_buffer.data + done, buffer, want, cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(slice.d_buffer.data + done, source, want, cudaMemcpyHostToDevice, stream);
     }
     if (status == cudaSuccess) status = record_copy_event(copied[slot].get(), stream);
     if (status != cudaSuccess) {
@@ -1672,6 +1711,23 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
 }
 
 namespace detail {
+
+std::size_t staged_calls(std::size_t begin,
+                         std::size_t end,
+                         std::size_t file_size,
+                         std::size_t slot_bytes) noexcept
+{
+  if (begin >= end || slot_bytes < IO_BLOCK_SIZE) return 0;
+  auto const body_end = align_down_block(file_size);
+  std::size_t calls   = 0;
+  for (auto pos = begin; pos < end; ++calls) {
+    auto const aligned_offset = align_down_block(pos);
+    auto stop                 = std::min(align_up_block(end), aligned_offset + slot_bytes);
+    if (stop > file_size) stop = aligned_offset < body_end ? body_end : file_size;
+    pos = std::min(stop, end);
+  }
+  return calls;
+}
 
 std::size_t next_piece(std::size_t pos,
                        std::size_t end,
