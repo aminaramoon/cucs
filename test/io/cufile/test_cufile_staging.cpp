@@ -244,10 +244,14 @@ ssize_t fake_read(
   }
   std::vector<std::uint8_t> host(limit);
   auto const got = ::pread(owned->fd, host.data(), limit, file_offset);
-  if (got > 0 && cudaMemcpy(static_cast<std::uint8_t*>(base) + buffer_offset,
-                            host.data(),
-                            static_cast<std::size_t>(got),
-                            cudaMemcpyHostToDevice) != cudaSuccess) {
+  // Like cuFileRead, return only once the bytes are in device memory: a plain
+  // cudaMemcpy from pageable memory may return before its DMA has landed.
+  if (got > 0 && (cudaMemcpyAsync(static_cast<std::uint8_t*>(base) + buffer_offset,
+                                  host.data(),
+                                  static_cast<std::size_t>(got),
+                                  cudaMemcpyHostToDevice,
+                                  cudaStreamPerThread) != cudaSuccess ||
+                  cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess)) {
     errno = EIO;
     return -1;
   }
