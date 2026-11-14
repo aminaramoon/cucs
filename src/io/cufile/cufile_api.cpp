@@ -76,6 +76,18 @@ struct loaded_library {
   need(api.read, "cuFileRead");
   if (!complete) { return loaded; }
 
+  // Optional entry points: a library without them still serves reads.  Buffer registration is
+  // usable only as a pair, so a library exporting one without the other gets neither.
+  bool const has_register   = resolve(api.buf_register, library, "cuFileBufRegister");
+  bool const has_deregister = resolve(api.buf_deregister, library, "cuFileBufDeregister");
+  if (!has_register || !has_deregister) {
+    api.buf_register   = nullptr;
+    api.buf_deregister = nullptr;
+  }
+  std::ignore = resolve(api.get_size_parameter, library, "cuFileGetParameterSizeT");
+  std::ignore = resolve(api.get_bool_parameter, library, "cuFileGetParameterBool");
+  std::ignore = resolve(api.get_string_parameter, library, "cuFileGetParameterString");
+
   loaded.api  = api;
   std::ignore = resolve(loaded.get_version, library, "cuFileGetVersion");
   return loaded;

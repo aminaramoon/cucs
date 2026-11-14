@@ -706,9 +706,11 @@ include(CMakePackageConfigHelpers)
 
 # Install headers
 if(CUCASCADE_TOPOLOGY_ONLY)
-  # topology_discovery.hpp includes net_topology.hpp (NIC discovery, built into
-  # this library), so both are part of the installed API.
+  # topology_discovery.hpp includes net_topology.hpp (NIC discovery) and
+  # gds_topology.hpp (GPUDirect Storage setup), both built into this library, so
+  # they are part of the installed API.
   install(FILES include/cucascade/memory/topology_discovery.hpp
+                include/cucascade/memory/gds_topology.hpp
                 include/cucascade/memory/net_topology.hpp
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cucascade/memory)
   install(FILES include/cucascade/nvtx.hpp
