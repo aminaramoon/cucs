@@ -457,11 +457,11 @@ TEST_CASE("cufile staged reads ask cuFile only for aligned ranges within the fil
 
   rmm::cuda_stream stream;
   constexpr std::size_t guard = 64;
-  rmm::device_buffer dst(s.size + s.misalign + 2 * guard, stream.view());
+  rmm::device_buffer dst(s.size + s.misalign + 2 * guard, ::cuda::stream_ref{stream.value()});
   REQUIRE(cudaMemsetAsync(dst.data(), 0xEE, dst.size(), stream.value()) == cudaSuccess);
   auto* const target = static_cast<std::uint8_t*>(dst.data()) + guard + s.misalign;
   REQUIRE(ioctx.get()
-            .device_read_async_io(*object, s.offset, s.size, target, stream.view())
+            .device_read_async_io(*object, s.offset, s.size, target, ::cuda::stream_ref{stream.value()})
             .get(60s) == s.size);
 
   auto const all = bytes_at(dst.data(), dst.size());
@@ -497,10 +497,10 @@ TEST_CASE("cufile splits a large device read into pieces several reactors stage"
   rmm::cuda_stream stream;
   constexpr std::size_t offset = 777;
   constexpr std::size_t size   = (2UL << 20) + 99;
-  rmm::device_buffer dst(size, stream.view());
+  rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
   REQUIRE(ioctx.get()
             .device_read_async_io(
-              *object, offset, size, static_cast<std::uint8_t*>(dst.data()), stream.view())
+              *object, offset, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
             .get(60s) == size);
   CHECK(matches_file(bytes_at(dst.data(), size), offset));
 
@@ -526,10 +526,10 @@ TEST_CASE("cufile staged read that cuFile fails is served by POSIX instead",
   rmm::cuda_stream stream;
   constexpr std::size_t offset = 4100;
   constexpr std::size_t size   = 100000;
-  rmm::device_buffer dst(size, stream.view());
+  rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
   REQUIRE(ioctx.get()
             .device_read_async_io(
-              *object, offset, size, static_cast<std::uint8_t*>(dst.data()), stream.view())
+              *object, offset, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
             .get(60s) == size);
   CHECK(matches_file(bytes_at(dst.data(), size), offset));
   auto const stats = ioctx.get().stats();
@@ -550,10 +550,10 @@ TEST_CASE("cufile staged reads continue after short cuFile returns", "[io][cufil
   rmm::cuda_stream stream;
   constexpr std::size_t offset = 3;
   std::size_t const size       = file.size() - offset;
-  rmm::device_buffer dst(size, stream.view());
+  rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
   REQUIRE(ioctx.get()
             .device_read_async_io(
-              *object, offset, size, static_cast<std::uint8_t*>(dst.data()), stream.view())
+              *object, offset, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
             .get(60s) == size);
   CHECK(matches_file(bytes_at(dst.data(), size), offset));
   CHECK(ioctx.get().stats().cufile_failures == 0);
@@ -574,13 +574,13 @@ TEST_CASE("cufile reads a staged piece before its busy stream is ready; only the
   rmm::cuda_stream stream;
   constexpr std::size_t offset = 8192 + 5;
   constexpr std::size_t size   = 100000;
-  rmm::device_buffer dst(size, stream.view());
+  rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
   REQUIRE(cudaMemsetAsync(dst.data(), 0, size, stream.value()) == cudaSuccess);
   stream_latch latch;
   latch.hold(stream.value());
 
   auto future = ioctx.get().device_read_async_io(
-    *object, offset, size, static_cast<std::uint8_t*>(dst.data()), stream.view());
+    *object, offset, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()});
   // The storage read happens while the stream is held...
   auto const deadline = std::chrono::steady_clock::now() + 10s;
   while (cufile.calls().empty() && std::chrono::steady_clock::now() < deadline) {
@@ -610,7 +610,7 @@ TEST_CASE("cufile device read on a per-thread default stream waits for that thre
   auto object = ioctx.get().open_io_object(file.path());
 
   constexpr std::size_t size = 300000;
-  rmm::device_buffer dst(size, rmm::cuda_stream_view{});
+  rmm::device_buffer dst(size, ::cuda::stream_ref{cudaStream_t{nullptr}});
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
   stream_latch latch;
   std::optional<cucascade::exec::semi_future<std::size_t>> future;
@@ -656,11 +656,11 @@ TEST_CASE("cufile refuses a device read on a stream being captured, leaving the 
   auto object = ioctx.get().open_io_object(file.path());
 
   rmm::cuda_stream stream;
-  rmm::device_buffer dst(file.size(), stream.view());
+  rmm::device_buffer dst(file.size(), ::cuda::stream_ref{stream.value()});
   stream.synchronize();
   REQUIRE(cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeRelaxed) == cudaSuccess);
   auto future = ioctx.get().device_read_async_io(
-    *object, 0, file.size(), static_cast<std::uint8_t*>(dst.data()), stream.view());
+    *object, 0, file.size(), static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()});
   cudaGraph_t graph{};
   // The capture was not invalidated by the refused read.
   CHECK(cudaStreamEndCapture(stream.value(), &graph) == cudaSuccess);
@@ -683,7 +683,7 @@ TEST_CASE("cufile parked device slices do not hold up other requests on the reac
   rmm::cuda_stream busy;
   constexpr std::size_t slices = 32;
   constexpr std::size_t piece  = 4096;
-  rmm::device_buffer dst(slices * piece, busy.view());
+  rmm::device_buffer dst(slices * piece, ::cuda::stream_ref{busy.value()});
   busy.synchronize();
   stream_latch latch;
   latch.hold(busy.value());
@@ -691,7 +691,7 @@ TEST_CASE("cufile parked device slices do not hold up other requests on the reac
   for (std::size_t i = 0; i < slices; ++i) {
     ranges.emplace_back(i * piece, piece, static_cast<std::uint8_t*>(dst.data()) + i * piece);
   }
-  auto parked = ioctx.get().device_readv_async_io(*object, ranges, busy.view());
+  auto parked = ioctx.get().device_readv_async_io(*object, ranges, ::cuda::stream_ref{busy.value()});
 
   // More slices are parked than the in-flight window holds, yet a host read on the
   // same (only) reactor is served while the stream stays busy.
@@ -722,14 +722,14 @@ TEST_CASE("cufile reads a destination on another GPU than the calling thread's",
   {
     rmm::cuda_set_device_raii const on_one{rmm::cuda_device_id{1}};
     stream.emplace();
-    dst.emplace(size, stream->view());
+    dst.emplace(size, ::cuda::stream_ref{stream->value()});
     stream->synchronize();
   }
   rmm::cuda_set_device_raii const on_zero{rmm::cuda_device_id{0}};
   stream_latch latch;
   latch.hold(stream->value());  // busy, so the gate is a real event on GPU 1
   auto future = ioctx.get().device_read_async_io(
-    *object, offset, size, static_cast<std::uint8_t*>(dst->data()), stream->view());
+    *object, offset, size, static_cast<std::uint8_t*>(dst->data()), ::cuda::stream_ref{stream->value()});
   latch.release();
   REQUIRE(std::move(future).get(60s) == size);
   rmm::cuda_set_device_raii const back_on_one{rmm::cuda_device_id{1}};
