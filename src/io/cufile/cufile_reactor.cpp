@@ -370,9 +370,6 @@ class scratch_pool {
   std::vector<std::uint8_t*> _free;
 };
 
-/// Short reads tolerated in a row before a device slice is declared failed.
-constexpr int max_short_reads = 64;
-
 /**
  * @brief Request selection for the worker: strict priority with bounded low service.
  *
@@ -978,8 +975,7 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
     std::ignore  = gate->synchronize_no_throw();
   };
 
-  auto pos        = offset;
-  int short_reads = 0;
+  auto pos = offset;
   while (pos < end) {
     if (_stop_source.stop_requested()) {
       failure = canceled_error();
@@ -1012,13 +1008,12 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
     auto const piece_end = std::min(read_end, end);
     // The range was clamped to the size recorded at open, so reading nothing
     // where data was expected means the file shrank underneath us; more than
-    // asked is malformed.
-    if (static_cast<std::size_t>(got) > want || piece_end <= pos ||
-        (static_cast<std::size_t>(got) < want && ++short_reads > max_short_reads)) {
+    // asked is malformed.  A short read that made progress is carried on from
+    // where it stopped: every call moves `pos`, so the loop ends.
+    if (static_cast<std::size_t>(got) > want || piece_end <= pos) {
       failure = std::make_error_code(std::errc::io_error);
       break;
     }
-    if (static_cast<std::size_t>(got) == want) short_reads = 0;
 
     // Scatter the wanted bytes on the slot's stream, ordered after the caller's
     // earlier work by the gate.
@@ -1085,8 +1080,7 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
   {
     // The destination is never registered with cuFile: each piece is addressed
     // by its exact device pointer with a zero buffer offset.
-    auto pos        = offset;
-    int short_reads = 0;
+    auto pos = offset;
     while (pos < end) {
       if (_stop_source.stop_requested()) {
         failure = canceled_error();
@@ -1103,11 +1097,11 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
       }
       // The range was clamped to the size recorded at open, so nothing read here
       // is a sign that the file shrank underneath us; more than asked is malformed.
-      if (got == 0 || static_cast<std::size_t>(got) > want || ++short_reads > max_short_reads) {
+      // A short read that made progress is carried on from where it stopped.
+      if (got == 0 || static_cast<std::size_t>(got) > want) {
         failure = std::make_error_code(std::errc::io_error);
         break;
       }
-      if (static_cast<std::size_t>(got) == want) short_reads = 0;
       pos += static_cast<std::size_t>(got);
     }
   }
