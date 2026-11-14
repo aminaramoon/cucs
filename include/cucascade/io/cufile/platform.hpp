@@ -62,8 +62,8 @@ struct platform_info {
   std::size_t max_direct_io_size_kb{0};  ///< cuFile's largest single DMA, in KiB.
 
   // -- the rest of cuFileDriverGetProperties (meaningful with properties_available) --
-  unsigned nvfs_major_version{0};  ///< nvidia-fs driver version cuFile talks to (0 = none).
-  unsigned nvfs_minor_version{0};  ///< Its minor version.
+  unsigned nvfs_major_version{0};         ///< nvidia-fs driver version cuFile talks to (0 = none).
+  unsigned nvfs_minor_version{0};         ///< Its minor version.
   std::size_t poll_threshold_size_kb{0};  ///< Reads up to this size are polled (poll mode).
   /// @c CUfileDriverControlFlags: bit 0 poll mode, bit 1 compatibility mode allowed.
   unsigned dcontrolflags{0};
@@ -90,16 +90,16 @@ struct platform_info {
    *        the library predates the parameter API.
    */
   struct parameters_info {
-    bool available{false};  ///< The library has @c cuFileGetParameter*.
-    std::optional<bool> parallel_io;                       ///< execution.parallel_io
-    std::optional<std::size_t> max_io_threads;            ///< execution.max_io_threads
-    std::optional<std::size_t> max_io_queue_depth;        ///< execution.max_io_queue_depth
+    bool available{false};                          ///< The library has @c cuFileGetParameter*.
+    std::optional<bool> parallel_io;                ///< execution.parallel_io
+    std::optional<std::size_t> max_io_threads;      ///< execution.max_io_threads
+    std::optional<std::size_t> max_io_queue_depth;  ///< execution.max_io_queue_depth
     std::optional<std::size_t> min_io_threshold_size_kb;  ///< execution.min_io_threshold_size_kb
     std::optional<std::size_t> max_request_parallelism;   ///< execution.max_request_parallelism
-    std::optional<bool> use_poll_mode;                     ///< properties.use_poll_mode
-    std::optional<bool> allow_compat_mode;                 ///< properties.allow_compat_mode
-    std::optional<bool> force_compat_mode;                 ///< forced compatibility mode
-    std::optional<bool> use_pci_p2pdma;                    ///< properties.use_pci_p2pdma
+    std::optional<bool> use_poll_mode;                    ///< properties.use_poll_mode
+    std::optional<bool> allow_compat_mode;                ///< properties.allow_compat_mode
+    std::optional<bool> force_compat_mode;                ///< forced compatibility mode
+    std::optional<bool> use_pci_p2pdma;                   ///< properties.use_pci_p2pdma
     std::optional<std::size_t> io_batch_size;             ///< properties.io_batchsize
     std::optional<std::size_t> profile_stats;             ///< profile.cufile_stats level
     std::optional<std::string> rdma_transport;            ///< RDMA transport cuFile uses
@@ -189,7 +189,7 @@ struct path_info {
   platform_info platform;  ///< The process-wide cuFile snapshot.
 
   // -- storage --------------------------------------------------------------
-  memory::path_storage_info storage;                  ///< Passive mount / device discovery.
+  memory::path_storage_info storage;  ///< Passive mount / device discovery.
   /// The host's GDS setup (nvidia-fs, peer memory, cufile.json), passively
   /// discovered; its cufile.json denylist and Storage Scale RDMA addresses
   /// feed the verdict.  Left default (nothing parsed) when not discovered.

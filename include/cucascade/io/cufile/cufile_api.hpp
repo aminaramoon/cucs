@@ -32,18 +32,18 @@ namespace cucascade::io::cufile {
  * anyway.  The values are the header's enumerators, identical in libcufile 1.16 through 1.20.
  */
 enum class size_parameter : int {
-  profile_stats                 = 0,
-  execution_max_io_queue_depth  = 1,
-  execution_max_io_threads      = 2,
-  execution_min_io_threshold_kb = 3,
+  profile_stats                     = 0,
+  execution_max_io_queue_depth      = 1,
+  execution_max_io_threads          = 2,
+  execution_min_io_threshold_kb     = 3,
   execution_max_request_parallelism = 4,
-  max_direct_io_size_kb         = 5,
-  max_device_cache_size_kb      = 6,
-  per_buffer_cache_size_kb      = 7,
-  max_device_pinned_mem_size_kb = 8,
-  io_batch_size                 = 9,
-  poll_threshold_size_kb        = 10,
-  batch_io_timeout_ms           = 11,
+  max_direct_io_size_kb             = 5,
+  max_device_cache_size_kb          = 6,
+  per_buffer_cache_size_kb          = 7,
+  max_device_pinned_mem_size_kb     = 8,
+  io_batch_size                     = 9,
+  poll_threshold_size_kb            = 10,
+  batch_io_timeout_ms               = 11,
 };
 
 /// cuFile's boolean configuration parameters (@c CUFileBoolConfigParameter_t); see

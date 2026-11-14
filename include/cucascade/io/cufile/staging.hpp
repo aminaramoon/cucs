@@ -52,7 +52,9 @@ struct staging_usage {
  *         (fewer than asked when the cap, device memory, BAR1 or cuFile's pinned
  *         memory limit stopped it; 0 when cuFile cannot register memory).
  */
-[[nodiscard]] std::size_t reserve_staging(int device, std::size_t slots, config const& cfg) noexcept;
+[[nodiscard]] std::size_t reserve_staging(int device,
+                                          std::size_t slots,
+                                          config const& cfg) noexcept;
 
 /// What @p device holds for staging now.  Never throws.
 [[nodiscard]] staging_usage staging_usage_of(int device) noexcept;

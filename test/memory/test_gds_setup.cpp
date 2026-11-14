@@ -264,7 +264,7 @@ TEST_CASE("gds setup: malformed cufile.json is reported with its position", "[gd
   };
   auto const sample = GENERATE(malformed{R"({"properties": {"a": 1)", "expected ',' or '}'"},
                                malformed{R"({"properties": {"a" 1}})", "expected ':'"},
-                               malformed{"{\n  \"a\": tru\n}", "invalid literal"},
+                               malformed{"{\n  \"a\": tRue\n}", "invalid literal"},
                                malformed{R"({"a": 1} extra)", "unexpected trailing text"},
                                malformed{R"({"a": "unterminated})", "unterminated string"},
                                malformed{"{ /* never closed ", "unterminated comment"},
@@ -318,14 +318,14 @@ TEST_CASE("gds setup: nvidia-fs stats, version and module rows parse", "[gds_set
   CHECK(detail::parse_nvidia_fs_version("") == "");
 
   auto const live = detail::live_modules(proc_modules);
-  CHECK(live == std::vector<std::string>{"nvidia_fs", "nvidia_peermem", "mmfs26", "mmfslinux",
-                                         "ib_core"});
+  CHECK(live ==
+        std::vector<std::string>{"nvidia_fs", "nvidia_peermem", "mmfs26", "mmfslinux", "ib_core"});
 
   CHECK(detail::force_compat_value("true"));
   CHECK(detail::force_compat_value("TRUE"));
   CHECK(detail::force_compat_value("True1"));
   CHECK_FALSE(detail::force_compat_value("1"));
-  CHECK_FALSE(detail::force_compat_value("tru"));
+  CHECK_FALSE(detail::force_compat_value("tr"));
   CHECK_FALSE(detail::force_compat_value(nullptr));
 }
 

@@ -44,11 +44,11 @@ inline constexpr std::size_t default_reactors_per_device = 16;
  * @brief One GPU's share of a planned cuFile pool.
  */
 struct device_group_plan {
-  int device{-1};              ///< CUDA ordinal.
-  std::string pci_bus_id;      ///< As CUDA reports it, e.g. "0000:1B:00.0".
-  int numa_node{-1};           ///< The GPU's NUMA node (-1 if unknown).
-  std::size_t n_reactors{0};   ///< Reactors serving it: its queue depth.
-  std::vector<int> cpus;       ///< CPUs those reactors are pinned to; empty = unpinned.
+  int device{-1};                ///< CUDA ordinal.
+  std::string pci_bus_id;        ///< As CUDA reports it, e.g. "0000:1B:00.0".
+  int numa_node{-1};             ///< The GPU's NUMA node (-1 if unknown).
+  std::size_t n_reactors{0};     ///< Reactors serving it: its queue depth.
+  std::vector<int> cpus;         ///< CPUs those reactors are pinned to; empty = unpinned.
   std::size_t staging_slots{0};  ///< Registered staging slots reserved for it at start.
   /// Cap on registered staging for this device, in bytes (0 = none): the config's
   /// cap, half of the BAR1 free at planning time, and cuFile's pinned-memory limit.

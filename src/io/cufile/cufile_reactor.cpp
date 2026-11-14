@@ -989,12 +989,10 @@ bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
     // call of its own, so the body stays eligible for direct DMA.
     auto const aligned_offset = align_down_block(pos);
     auto stop                 = std::min(align_up_block(end), aligned_offset + slot_size);
-    if (stop > file_size) {
-      stop = aligned_offset < body_end ? body_end : file_size;
-    }
+    if (stop > file_size) { stop = aligned_offset < body_end ? body_end : file_size; }
     auto const want = stop - aligned_offset;
-    errno          = 0;
-    auto const got = api->read(
+    errno           = 0;
+    auto const got  = api->read(
       file.cufile_handle(), entry->slot.base, want, static_cast<off_t>(aligned_offset), 0);
     if (got < 0) {
       log_cufile_failure_once(file, got, errno);
@@ -1196,8 +1194,8 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
     }
   }
   if (status == cudaSuccess) {
-    auto copy              = *request->device_copy;
-    copy.d_buffer.stream   = ::cuda::stream_ref{copy_on};
+    auto copy            = *request->device_copy;
+    copy.d_buffer.stream = ::cuda::stream_ref{copy_on};
     copy.d_buffer.ready_gate.reset();
     status = copy.copy_async(request->io_rng, request->iovecs);
   }
@@ -1311,8 +1309,8 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
         return;
       }
     }
-    auto* const buffer = scratch_base + slot * scratch_slot_bytes;
-    auto const pos     = offset + done;
+    auto* const buffer         = scratch_base + slot * scratch_slot_bytes;
+    auto const pos             = offset + done;
     std::uint8_t const* source = buffer;
     std::size_t want{0};
     std::size_t got{0};

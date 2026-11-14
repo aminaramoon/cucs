@@ -231,10 +231,10 @@ void print_environment(std::string const& path,
               verdict.storage.mount_source.c_str(),
               verdict.storage.filesystem_block_size,
               verdict.storage.preferred_io_size,
-              verdict.capability == cufile::path_capability::direct_candidate     ? "DIRECT CANDIDATE"
+              verdict.capability == cufile::path_capability::direct_candidate ? "DIRECT CANDIDATE"
               : verdict.capability == cufile::path_capability::compatibility_only ? "COMPAT ONLY"
               : verdict.capability == cufile::path_capability::unavailable        ? "UNAVAILABLE"
-                                                                                   : "UNKNOWN",
+                                                                                  : "UNKNOWN",
               verdict.reason.c_str());
 
   if (!topology) {
@@ -247,9 +247,8 @@ void print_environment(std::string const& path,
     "Lustre %s, BeeGFS %s, WekaFS %s, NFS/RDMA %s, CUFILE_FORCE_COMPAT_MODE %s\n",
     gds.nvidia_fs.loaded ? "loaded" : "absent",
     gds.nvidia_fs.version.c_str(),
-    gds.nvidia_fs.peer_direct_supported
-      ? (*gds.nvidia_fs.peer_direct_supported ? "yes" : "no")
-      : "?",
+    gds.nvidia_fs.peer_direct_supported ? (*gds.nvidia_fs.peer_direct_supported ? "yes" : "no")
+                                        : "?",
     gds.peer_memory_loaded ? "loaded" : "absent",
     gds.rdma_core_loaded ? "loaded" : "absent",
     gds.gpfs_client_loaded ? "loaded" : "absent",
@@ -324,8 +323,8 @@ class tuned_pool {
              std::optional<memory::system_topology_info> const& topology)
     : _devices(devices)
   {
-    auto plan = cufile::plan_cufile_pool(
-      cfg, topology ? &*topology : nullptr, cufile::probe_platform());
+    auto plan =
+      cufile::plan_cufile_pool(cfg, topology ? &*topology : nullptr, cufile::probe_platform());
     std::erase_if(plan.groups, [&devices](cufile::device_group_plan const& group) {
       return std::find(devices.begin(), devices.end(), group.device) == devices.end();
     });
@@ -411,8 +410,7 @@ struct workload {
             std::size_t expected = 0;
             std::size_t placed   = 0;
             for (std::size_t i = 0; i < load.per_call; ++i) {
-              auto const size =
-                load.chunk_min + next() % (load.chunk_max - load.chunk_min + 1);
+              auto const size   = load.chunk_min + next() % (load.chunk_max - load.chunk_min + 1);
               auto const offset = next() % (file_size - size);
               auto const where  = (placed + 255) / 256 * 256 + (next() & 1);
               slices.emplace_back(offset, size, base + where);
@@ -523,7 +521,8 @@ TEST_CASE("cufile tuning sweep", "[.cufile-tune]")
   // -- A: latency by read size, one read in flight -----------------------------
   if (!skipped('A')) {
     std::printf("\n== A. latency, 1 reactor, 1 read in flight (GPU %d)\n", gpus.front());
-    std::printf("%10s %-17s %9s %9s %9s %9s\n", "size", "path", "p50 ms", "p90 ms", "p99 ms", "GB/s");
+    std::printf(
+      "%10s %-17s %9s %9s %9s %9s\n", "size", "path", "p50 ms", "p90 ms", "p99 ms", "GB/s");
     struct variant {
       char const* name;
       cufile::staging mode;
@@ -556,15 +555,18 @@ TEST_CASE("cufile tuning sweep", "[.cufile-tune]")
             auto offset = next() % (file_bytes - size);
             if (v.aligned) offset &= ~(block - 1);
             auto const t0 = clock_type::now();
-            total += pool.ioctx().device_read_async_io(*object, offset, size, dst, stream).get(600s);
-            latencies.push_back(std::chrono::duration<double, std::milli>(clock_type::now() - t0).count());
+            total +=
+              pool.ioctx().device_read_async_io(*object, offset, size, dst, stream).get(600s);
+            latencies.push_back(
+              std::chrono::duration<double, std::milli>(clock_type::now() - t0).count());
             if (latencies.size() >= 100000) break;
           }
           auto const elapsed = clock_type::now() - begin;
           std::sort(latencies.begin(), latencies.end());
           auto pct = [&latencies](double q) {
-            return latencies[std::min(latencies.size() - 1,
-                                      static_cast<std::size_t>(q * static_cast<double>(latencies.size())))];
+            return latencies[std::min(
+              latencies.size() - 1,
+              static_cast<std::size_t>(q * static_cast<double>(latencies.size())))];
           };
           std::printf("%7zu KiB %-17s %9.3f %9.3f %9.3f %9.2f",
                       kib,
@@ -587,7 +589,8 @@ TEST_CASE("cufile tuning sweep", "[.cufile-tune]")
   std::vector<point> results;
   if (!skipped('B')) {
     std::printf(
-      "\n== B. Parquet-shaped reads (%zu-%zu KiB, unaligned), GPU %d, %zu submitters x %zu ranges\n",
+      "\n== B. Parquet-shaped reads (%zu-%zu KiB, unaligned), GPU %d, %zu submitters x %zu "
+      "ranges\n",
       load.chunk_min >> 10,
       load.chunk_max >> 10,
       gpus.front(),
@@ -652,11 +655,11 @@ TEST_CASE("cufile tuning sweep", "[.cufile-tune]")
       cfg.max_staging_bytes_per_device = 0;
       drop_cache(path);
       tuned_pool pool{cfg, gpus, topology};
-      auto object = pool.ioctx().open_io_object(path);
-      auto run_load = load;
+      auto object       = pool.ioctx().open_io_object(path);
+      auto run_load     = load;
       run_load.per_call = std::max<std::size_t>(load.per_call, 2 * chosen.depth / load.submitters);
       auto [bytes, elapsed] = run_parquet(pool.ioctx(), *object, gpus, run_load, seconds);
-      std::size_t total = 0;
+      std::size_t total     = 0;
       for (std::size_t d = 0; d < gpus.size(); ++d) {
         std::printf("GPU %d: %.2f GB/s\n", gpus[d], gbps(bytes[d], elapsed));
         total += bytes[d];

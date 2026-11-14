@@ -95,7 +95,8 @@ namespace {
   std::size_t index = 0;
   if (plan.groups.empty()) {
     for (std::size_t i = 0; i < plan.flat_reactors; ++i) {
-      reactors.push_back(std::make_unique<cufile_reactor>(ctx, "cufile-" + std::to_string(index++)));
+      reactors.push_back(
+        std::make_unique<cufile_reactor>(ctx, "cufile-" + std::to_string(index++)));
     }
     return reactors;
   }

@@ -72,8 +72,8 @@ struct pci_address {
   return out;
 }
 
-[[nodiscard]] memory::gpu_topology_info const* find_gpu(memory::system_topology_info const* topology,
-                                                        std::string const& pci_bus_id) noexcept
+[[nodiscard]] memory::gpu_topology_info const* find_gpu(
+  memory::system_topology_info const* topology, std::string const& pci_bus_id) noexcept
 {
   if (topology == nullptr) return nullptr;
   auto const wanted = parse_pci(pci_bus_id);
@@ -98,7 +98,7 @@ void collect_warnings(memory::system_topology_info const* topology,
                       memory::path_storage_info const* hint,
                       std::vector<std::string>& out)
 {
-  bool const on_gpfs = hint != nullptr && hint->filesystem_type == "gpfs";
+  bool const on_gpfs  = hint != nullptr && hint->filesystem_type == "gpfs";
   bool const gpfs_gds = class_bit_set(platform, CU_FILE_GPFS_SUPPORTED);
   if (on_gpfs && platform.driver_opened && !gpfs_gds) {
     out.push_back(
@@ -128,7 +128,8 @@ void collect_warnings(memory::system_topology_info const* topology,
       }
     }
     if (gds.force_compat_env) {
-      out.push_back("CUFILE_FORCE_COMPAT_MODE is set: every cuFile read bounces through host memory");
+      out.push_back(
+        "CUFILE_FORCE_COMPAT_MODE is set: every cuFile read bounces through host memory");
     }
   }
   // cuFile moves one call in sequential chunks of max_direct_io_size, so that is
@@ -165,8 +166,8 @@ void collect_warnings(memory::system_topology_info const* topology,
   auto const& storage = *hint;
   switch (storage.kind) {
     case memory::storage_kind::network:
-      why = std::to_string(network_reactors_per_device) + " reactors (" +
-            storage.filesystem_type + " on " + storage.mount_point +
+      why = std::to_string(network_reactors_per_device) + " reactors (" + storage.filesystem_type +
+            " on " + storage.mount_point +
             " is a network filesystem: deep queues hide its latency)";
       return network_reactors_per_device;
     case memory::storage_kind::local_block:
@@ -202,9 +203,9 @@ pool_plan plan_cufile_pool(config const& cfg,
   try {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) {
-      std::ignore        = cudaGetLastError();
-      plan.flat_reactors = cfg.reactors_per_device != 0 ? cfg.reactors_per_device
-                                                        : default_reactors_per_device;
+      std::ignore = cudaGetLastError();
+      plan.flat_reactors =
+        cfg.reactors_per_device != 0 ? cfg.reactors_per_device : default_reactors_per_device;
       plan.reason = "no CUDA device visible: one flat pool of " +
                     std::to_string(plan.flat_reactors) + " reactors";
       return plan;
@@ -218,8 +219,8 @@ pool_plan plan_cufile_pool(config const& cfg,
     auto const per_device = reactors_per_device(cfg, hint ? &*hint : nullptr, sizing);
     bool const gds        = platform.driver_opened && platform.properties_available &&
                      !platform.compat_only && !platform.forced_compat;
-    bool const stage = cfg.staging_mode == staging::always ||
-                       (cfg.staging_mode == staging::automatic && gds);
+    bool const stage =
+      cfg.staging_mode == staging::always || (cfg.staging_mode == staging::automatic && gds);
     collect_warnings(topology, platform, hint ? &*hint : nullptr, plan.warnings);
 
     // cuFile moves a call in sequential chunks of max_direct_io_size: pieces no
@@ -240,8 +241,7 @@ pool_plan plan_cufile_pool(config const& cfg,
       group.device     = device;
       group.n_reactors = per_device;
       std::array<char, 32> pci{};
-      if (cudaDeviceGetPCIBusId(pci.data(), static_cast<int>(pci.size()), device) ==
-          cudaSuccess) {
+      if (cudaDeviceGetPCIBusId(pci.data(), static_cast<int>(pci.size()), device) == cudaSuccess) {
         group.pci_bus_id = pci.data();
       } else {
         std::ignore = cudaGetLastError();
@@ -286,8 +286,9 @@ pool_plan plan_cufile_pool(config const& cfg,
                       std::to_string(effective.staging_slot_bytes() >> 10) + " KiB" +
                       (cap != 0 ? " (cap " + std::to_string(cap >> 20) + " MiB)" : "");
         if (wanted < per_device * cfg.staging_slots_per_reactor) {
-          staging_why += "; fewer than reactors x slots: the cap, BAR1 or cuFile's pinned limit "
-                         "binds, and reactors without a slot read directly";
+          staging_why +=
+            "; fewer than reactors x slots: the cap, BAR1 or cuFile's pinned limit "
+            "binds, and reactors without a slot read directly";
         }
       }
       group.reason = sizing + ", " + placement + ", " + staging_why;

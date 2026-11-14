@@ -69,11 +69,11 @@ struct cufile_json_settings {
   std::optional<bool> rdma_dynamic_routing;                  ///< Route through other GPUs/NICs.
 
   // -- "execution" (cuFile's internal I/O thread pool) ----------------------
-  std::optional<bool> parallel_io;                       ///< Split large I/O across threads.
-  std::optional<std::size_t> max_io_threads;             ///< Threads in that pool.
-  std::optional<std::size_t> max_io_queue_depth;         ///< Its queue depth.
-  std::optional<std::size_t> min_io_threshold_size_kb;   ///< Smallest I/O it splits.
-  std::optional<std::size_t> max_request_parallelism;    ///< Pieces one request is split into.
+  std::optional<bool> parallel_io;                      ///< Split large I/O across threads.
+  std::optional<std::size_t> max_io_threads;            ///< Threads in that pool.
+  std::optional<std::size_t> max_io_queue_depth;        ///< Its queue depth.
+  std::optional<std::size_t> min_io_threshold_size_kb;  ///< Smallest I/O it splits.
+  std::optional<std::size_t> max_request_parallelism;   ///< Pieces one request is split into.
 
   // -- "fs" -----------------------------------------------------------------
   std::optional<bool> gpfs_gds_write_support;  ///< fs.gpfs.gds_write_support.
@@ -90,7 +90,7 @@ struct cufile_json_settings {
   std::vector<std::string> denied_filesystems;  ///< denylist.filesystems
 
   // -- "profile" / "logging" ------------------------------------------------
-  std::optional<std::size_t> cufile_stats;  ///< profile.cufile_stats level (0-3).
+  std::optional<std::size_t> cufile_stats;   ///< profile.cufile_stats level (0-3).
   std::optional<std::string> logging_level;  ///< logging.level.
 };
 
@@ -102,11 +102,11 @@ struct cufile_json_settings {
  * defaults.  The file is JSON with @c // and @c /&lowast; &lowast;/ comments.
  */
 struct cufile_config_file {
-  std::string path;              ///< The file cuFile would read.
-  bool from_environment{false};  ///< @c path came from @c CUFILE_ENV_PATH_JSON.
-  bool found{false};             ///< The file exists and could be opened.
-  bool parsed{false};            ///< It was read and parsed; @c settings is meaningful.
-  std::string error;             ///< Why it was not found or parsed; empty otherwise.
+  std::string path;               ///< The file cuFile would read.
+  bool from_environment{false};   ///< @c path came from @c CUFILE_ENV_PATH_JSON.
+  bool found{false};              ///< The file exists and could be opened.
+  bool parsed{false};             ///< It was read and parsed; @c settings is meaningful.
+  std::string error;              ///< Why it was not found or parsed; empty otherwise.
   cufile_json_settings settings;  ///< What it sets (all unset unless @c parsed).
 };
 
@@ -114,10 +114,10 @@ struct cufile_config_file {
  * @brief One GPU's line in @c /proc/driver/nvidia-fs/stats.
  */
 struct nvidia_fs_gpu_stats {
-  std::string pci_bus_id;           ///< e.g. "0000:be:00.0".
-  std::size_t registered_mib{0};    ///< Memory registered with cuFileBufRegister.
-  std::size_t cache_mib{0};         ///< nvidia-fs bounce cache in use.
-  std::size_t max_pinned_mib{0};    ///< Peak pinned (BAR1-mapped) memory.
+  std::string pci_bus_id;              ///< e.g. "0000:be:00.0".
+  std::size_t registered_mib{0};       ///< Memory registered with cuFileBufRegister.
+  std::size_t cache_mib{0};            ///< nvidia-fs bounce cache in use.
+  std::size_t max_pinned_mib{0};       ///< Peak pinned (BAR1-mapped) memory.
   std::size_t cross_root_port_pct{0};  ///< Share of I/O crossing a PCIe root port.
 };
 
@@ -126,14 +126,14 @@ struct nvidia_fs_gpu_stats {
  *        for NVMe and for RDMA filesystem clients.
  */
 struct nvidia_fs_info {
-  bool loaded{false};         ///< The @c nvidia_fs module is live (@c /proc/modules).
-  std::string version;        ///< Driver version, e.g. "2.20.5"; empty if unknown.
-  std::string gds_version;    ///< "GDS Version" in the stats file; empty if unknown.
+  bool loaded{false};       ///< The @c nvidia_fs module is live (@c /proc/modules).
+  std::string version;      ///< Driver version, e.g. "2.20.5"; empty if unknown.
+  std::string gds_version;  ///< "GDS Version" in the stats file; empty if unknown.
   /// "Mellanox PeerDirect Supported" in the stats file: whether RDMA filesystem
   /// clients (Storage Scale, NFSoRDMA, Lustre, ...) can DMA into GPU memory.
   /// Unset when the stats file is unreadable.
   std::optional<bool> peer_direct_supported;
-  std::optional<bool> io_stats_enabled;  ///< Per-I/O statistics are being collected.
+  std::optional<bool> io_stats_enabled;   ///< Per-I/O statistics are being collected.
   std::vector<nvidia_fs_gpu_stats> gpus;  ///< Per-GPU registration and cache usage.
 };
 
@@ -146,8 +146,8 @@ struct gds_setup_info {
   /// @c nv_peer_mem) is live.  RDMA filesystem clients need it, or nvidia-fs's
   /// PeerDirect support, to DMA into GPU memory.
   bool peer_memory_loaded{false};
-  bool rdma_core_loaded{false};    ///< @c ib_core is live (an RDMA stack is loaded).
-  bool gpfs_client_loaded{false};  ///< IBM Storage Scale (@c mmfs26 / @c mmfslinux) is live.
+  bool rdma_core_loaded{false};      ///< @c ib_core is live (an RDMA stack is loaded).
+  bool gpfs_client_loaded{false};    ///< IBM Storage Scale (@c mmfs26 / @c mmfslinux) is live.
   bool lustre_client_loaded{false};  ///< The Lustre client (@c lustre) is live.
   bool beegfs_client_loaded{false};  ///< The BeeGFS client (@c beegfs) is live.
   bool wekafs_client_loaded{false};  ///< The WekaFS client (@c wekafsio) is live.
@@ -175,7 +175,7 @@ struct gds_setup_info {
  * @param cufile_json_path The configuration file to read; empty resolves it the
  *        way cuFile does (@c $CUFILE_ENV_PATH_JSON, else @c /etc/cufile.json).
  */
-[[nodiscard]] gds_setup_info discover_gds_setup(discovery_roots const& roots    = {},
+[[nodiscard]] gds_setup_info discover_gds_setup(discovery_roots const& roots      = {},
                                                 std::string_view cufile_json_path = {});
 
 /**

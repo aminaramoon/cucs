@@ -136,8 +136,8 @@ struct NetworkDeviceWithTopology {
   std::string name;
   int numa_node;
   std::string pci_bus_id;
-  std::string net_interface;  ///< Backing network interface; empty if none.
-  int mtu{0};                 ///< MTU of net_interface; 0 if unknown or none.
+  std::string net_interface;     ///< Backing network interface; empty if none.
+  int mtu{0};                    ///< MTU of net_interface; 0 if unknown or none.
   unsigned int active_ports{0};  ///< Ports in the ACTIVE state.
   std::string link_layer;        ///< Link layer of the fastest active port.
   unsigned int rate_gbps{0};     ///< Rate of the fastest active port, Gb/s.

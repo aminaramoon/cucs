@@ -114,7 +114,7 @@ staging_slot staging_pool::acquire(int device,
       try_register = _devices[device].registration_failed_for != api;
     }
     CUfileError_t status{};
-    status.err = CU_FILE_SUCCESS;
+    status.err     = CU_FILE_SUCCESS;
     bool attempted = false;
     if (try_register && api != nullptr && api->buf_register != nullptr &&
         cufile_api::open_driver()) {
@@ -185,7 +185,8 @@ std::size_t staging_pool::release_free(int device) noexcept
       // test's substitute while it is still installed (a removed one is gone).
       if (slot.registered) {
         cufile_api const* owner = nullptr;
-        if (auto const* real = cufile_api::loaded(); real != nullptr && real == slot.registered_by) {
+        if (auto const* real = cufile_api::loaded();
+            real != nullptr && real == slot.registered_by) {
           owner = real;
         } else if (auto const* current = cufile_api::get(); current == slot.registered_by) {
           owner = current;

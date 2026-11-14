@@ -1436,14 +1436,14 @@ TEST_CASE("cufile throughput probe", "[.cufile-bench]")
 
   if (which == "both" || which == "cufile") {
     config cfg{};
-    cfg.gds_threshold = env_size("CUCASCADE_IO_BENCH_GDS_THRESHOLD", cfg.gds_threshold);
+    cfg.gds_threshold       = env_size("CUCASCADE_IO_BENCH_GDS_THRESHOLD", cfg.gds_threshold);
     cfg.reactors_per_device = env_size("CUCASCADE_IO_BENCH_REACTORS_PER_GPU", 0);
     cfg.storage_hint_path   = path;
     if (char const* mode = std::getenv("CUCASCADE_IO_BENCH_STAGING"); mode != nullptr) {
       std::string const value{mode};
-      cfg.staging_mode = value == "always"   ? cucascade::io::cufile::staging::always
-                         : value == "never"  ? cucascade::io::cufile::staging::never
-                                             : cucascade::io::cufile::staging::automatic;
+      cfg.staging_mode = value == "always"  ? cucascade::io::cufile::staging::always
+                         : value == "never" ? cucascade::io::cufile::staging::never
+                                            : cucascade::io::cufile::staging::automatic;
     }
     // CUCASCADE_IO_BENCH_REACTORS=0 plans a per-GPU pool from the topology, as
     // the datasource factory does by default.

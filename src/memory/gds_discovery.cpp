@@ -109,8 +109,8 @@ class json_reader {
           ++col;
         }
       }
-      _error = std::string{what} + " at line " + std::to_string(line) + ", column " +
-               std::to_string(col);
+      _error =
+        std::string{what} + " at line " + std::to_string(line) + ", column " + std::to_string(col);
     }
     return false;
   }
@@ -152,8 +152,14 @@ class json_reader {
       case '{': return object(out, depth);
       case '[': return array(out, depth);
       case '"': out.type = json_value::kind::string; return string(out.text);
-      case 't': out.type = json_value::kind::boolean; out.boolean = true; return word("true");
-      case 'f': out.type = json_value::kind::boolean; out.boolean = false; return word("false");
+      case 't':
+        out.type    = json_value::kind::boolean;
+        out.boolean = true;
+        return word("true");
+      case 'f':
+        out.type    = json_value::kind::boolean;
+        out.boolean = false;
+        return word("false");
       case 'n': out.type = json_value::kind::null; return word("null");
       case '\0':
         if (_pos >= _text.size()) { return fail("unexpected end of text"); }
@@ -272,8 +278,8 @@ class json_reader {
         case 't': out += '\t'; break;
         case 'u': {
           if (_text.size() - _pos < 4) { return fail("truncated \\u escape"); }
-          unsigned code    = 0;
-          auto const* first = _text.data() + _pos;
+          unsigned code        = 0;
+          auto const* first    = _text.data() + _pos;
           auto const [end, ec] = std::from_chars(first, first + 4, code, 16);
           if (ec != std::errc{} || end != first + 4) { return fail("invalid \\u escape"); }
           _pos += 4;
@@ -309,9 +315,9 @@ class json_reader {
       if (peek() == '+' || peek() == '-') { ++_pos; }
       if (digits() == 0) { return fail("invalid number"); }
     }
-    double parsed      = 0.0;
-    auto const* first  = _text.data() + start;
-    auto const* last   = _text.data() + _pos;
+    double parsed        = 0.0;
+    auto const* first    = _text.data() + start;
+    auto const* last     = _text.data() + _pos;
     auto const [end, ec] = std::from_chars(first, last, parsed);
     if (ec != std::errc{} || end != last) { return fail("number out of range"); }
     out.type   = json_value::kind::number;
@@ -372,7 +378,7 @@ class json_reader {
 
 void extract_settings(json_value const& root, cufile_json_settings& out)
 {
-  auto const* properties          = member(&root, "properties");
+  auto const* properties            = member(&root, "properties");
   out.max_direct_io_size_kb         = as_size(member(properties, "max_direct_io_size_kb"));
   out.max_device_cache_size_kb      = as_size(member(properties, "max_device_cache_size_kb"));
   out.per_buffer_cache_size_kb      = as_size(member(properties, "per_buffer_cache_size_kb"));
@@ -382,8 +388,8 @@ void extract_settings(json_value const& root, cufile_json_settings& out)
   out.allow_compat_mode             = as_bool(member(properties, "allow_compat_mode"));
   out.use_pci_p2pdma                = as_bool(member(properties, "use_pci_p2pdma"));
   out.rdma_dev_addr_list            = as_strings(member(properties, "rdma_dev_addr_list"));
-  out.rdma_load_balancing_policy = as_string(member(properties, "rdma_load_balancing_policy"));
-  out.rdma_dynamic_routing       = as_bool(member(properties, "rdma_dynamic_routing"));
+  out.rdma_load_balancing_policy    = as_string(member(properties, "rdma_load_balancing_policy"));
+  out.rdma_dynamic_routing          = as_bool(member(properties, "rdma_dynamic_routing"));
 
   auto const* execution        = member(&root, "execution");
   out.parallel_io              = as_bool(member(execution, "parallel_io"));
@@ -431,9 +437,9 @@ void extract_settings(json_value const& root, cufile_json_settings& out)
 
 [[nodiscard]] std::optional<std::size_t> parse_size_value(std::string_view text) noexcept
 {
-  std::size_t value = 0;
-  auto const* first = text.data();
-  auto const* last  = text.data() + text.size();
+  std::size_t value    = 0;
+  auto const* first    = text.data();
+  auto const* last     = text.data() + text.size();
   auto const [end, ec] = std::from_chars(first, last, value);
   if (ec != std::errc{} || end == first) { return std::nullopt; }
   return value;
@@ -443,7 +449,9 @@ void extract_settings(json_value const& root, cufile_json_settings& out)
 
 namespace detail {
 
-bool parse_cufile_json(std::string_view text, cufile_json_settings& out, std::string& error) noexcept
+bool parse_cufile_json(std::string_view text,
+                       cufile_json_settings& out,
+                       std::string& error) noexcept
 {
   try {
     json_value root;
@@ -606,7 +614,7 @@ gds_setup_info discover_gds_setup(discovery_roots const& roots, std::string_view
     std::string text;
     if (read_small_file(roots.procfs_root / "proc" / "modules", text)) {
       auto const modules = detail::live_modules(text);
-      auto live = [&modules](std::initializer_list<std::string_view> names) {
+      auto live          = [&modules](std::initializer_list<std::string_view> names) {
         return std::any_of(modules.begin(), modules.end(), [&names](std::string const& module) {
           return std::find(names.begin(), names.end(), module) != names.end();
         });

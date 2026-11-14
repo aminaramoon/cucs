@@ -455,15 +455,14 @@ TEST_CASE("cufile staged reads ask cuFile only for aligned ranges within the fil
     std::size_t size;
     std::size_t misalign;  // of the destination
   };
-  auto const s =
-    GENERATE(sample{0, block, 0},
-             sample{1, 1, 13},
-             sample{block - 1, 2, 255},
-             sample{12345, (1UL << 20) + 3, 13},
-             sample{block, 64UL << 10, 0},
-             sample{(3UL << 20) + 1234 - 5000, 5000, 7},          // the last bytes
-             sample{(3UL << 20) + 1000, 234, 1},                  // inside the tail block
-             sample{(3UL << 20) - 3 * block + 9, 9000, 4093});   // body and tail
+  auto const s = GENERATE(sample{0, block, 0},
+                          sample{1, 1, 13},
+                          sample{block - 1, 2, 255},
+                          sample{12345, (1UL << 20) + 3, 13},
+                          sample{block, 64UL << 10, 0},
+                          sample{(3UL << 20) + 1234 - 5000, 5000, 7},  // the last bytes
+                          sample{(3UL << 20) + 1000, 234, 1},          // inside the tail block
+                          sample{(3UL << 20) - 3 * block + 9, 9000, 4093});  // body and tail
   INFO("offset " << s.offset << " size " << s.size << " misalign " << s.misalign);
 
   rmm::cuda_stream stream;
@@ -471,14 +470,15 @@ TEST_CASE("cufile staged reads ask cuFile only for aligned ranges within the fil
   rmm::device_buffer dst(s.size + s.misalign + 2 * guard, ::cuda::stream_ref{stream.value()});
   REQUIRE(cudaMemsetAsync(dst.data(), 0xEE, dst.size(), stream.value()) == cudaSuccess);
   auto* const target = static_cast<std::uint8_t*>(dst.data()) + guard + s.misalign;
-  REQUIRE(ioctx.get()
-            .device_read_async_io(*object, s.offset, s.size, target, ::cuda::stream_ref{stream.value()})
-            .get(60s) == s.size);
+  REQUIRE(
+    ioctx.get()
+      .device_read_async_io(*object, s.offset, s.size, target, ::cuda::stream_ref{stream.value()})
+      .get(60s) == s.size);
 
   auto const all = bytes_at(dst.data(), dst.size());
-  std::vector<std::uint8_t> const got(all.begin() + static_cast<std::ptrdiff_t>(guard + s.misalign),
-                                      all.begin() +
-                                        static_cast<std::ptrdiff_t>(guard + s.misalign + s.size));
+  std::vector<std::uint8_t> const got(
+    all.begin() + static_cast<std::ptrdiff_t>(guard + s.misalign),
+    all.begin() + static_cast<std::ptrdiff_t>(guard + s.misalign + s.size));
   CHECK(matches_file(got, s.offset));
   for (std::size_t i = 0; i < guard + s.misalign; ++i) {
     REQUIRE(all[i] == 0xEE);  // nothing before the destination
@@ -510,8 +510,11 @@ TEST_CASE("cufile splits a large device read into pieces several reactors stage"
   constexpr std::size_t size   = (2UL << 20) + 99;
   rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
   REQUIRE(ioctx.get()
-            .device_read_async_io(
-              *object, offset, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
+            .device_read_async_io(*object,
+                                  offset,
+                                  size,
+                                  static_cast<std::uint8_t*>(dst.data()),
+                                  ::cuda::stream_ref{stream.value()})
             .get(60s) == size);
   CHECK(matches_file(bytes_at(dst.data(), size), offset));
 
@@ -539,8 +542,11 @@ TEST_CASE("cufile staged read that cuFile fails is served by POSIX instead",
   constexpr std::size_t size   = 100000;
   rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
   REQUIRE(ioctx.get()
-            .device_read_async_io(
-              *object, offset, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
+            .device_read_async_io(*object,
+                                  offset,
+                                  size,
+                                  static_cast<std::uint8_t*>(dst.data()),
+                                  ::cuda::stream_ref{stream.value()})
             .get(60s) == size);
   CHECK(matches_file(bytes_at(dst.data(), size), offset));
   auto const stats = ioctx.get().stats();
@@ -563,8 +569,11 @@ TEST_CASE("cufile staged reads continue after short cuFile returns", "[io][cufil
   std::size_t const size       = file.size() - offset;
   rmm::device_buffer dst(size, ::cuda::stream_ref{stream.value()});
   REQUIRE(ioctx.get()
-            .device_read_async_io(
-              *object, offset, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()})
+            .device_read_async_io(*object,
+                                  offset,
+                                  size,
+                                  static_cast<std::uint8_t*>(dst.data()),
+                                  ::cuda::stream_ref{stream.value()})
             .get(60s) == size);
   CHECK(matches_file(bytes_at(dst.data(), size), offset));
   CHECK(ioctx.get().stats().cufile_failures == 0);
@@ -590,8 +599,11 @@ TEST_CASE("cufile reads a staged piece before its busy stream is ready; only the
   stream_latch latch;
   latch.hold(stream.value());
 
-  auto future = ioctx.get().device_read_async_io(
-    *object, offset, size, static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()});
+  auto future = ioctx.get().device_read_async_io(*object,
+                                                 offset,
+                                                 size,
+                                                 static_cast<std::uint8_t*>(dst.data()),
+                                                 ::cuda::stream_ref{stream.value()});
   // The storage read happens while the stream is held...
   auto const deadline = std::chrono::steady_clock::now() + 10s;
   while (cufile.calls().empty() && std::chrono::steady_clock::now() < deadline) {
@@ -670,8 +682,11 @@ TEST_CASE("cufile refuses a device read on a stream being captured, leaving the 
   rmm::device_buffer dst(file.size(), ::cuda::stream_ref{stream.value()});
   stream.synchronize();
   REQUIRE(cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeRelaxed) == cudaSuccess);
-  auto future = ioctx.get().device_read_async_io(
-    *object, 0, file.size(), static_cast<std::uint8_t*>(dst.data()), ::cuda::stream_ref{stream.value()});
+  auto future = ioctx.get().device_read_async_io(*object,
+                                                 0,
+                                                 file.size(),
+                                                 static_cast<std::uint8_t*>(dst.data()),
+                                                 ::cuda::stream_ref{stream.value()});
   cudaGraph_t graph{};
   // The capture was not invalidated by the refused read.
   CHECK(cudaStreamEndCapture(stream.value(), &graph) == cudaSuccess);
@@ -702,7 +717,8 @@ TEST_CASE("cufile parked device slices do not hold up other requests on the reac
   for (std::size_t i = 0; i < slices; ++i) {
     ranges.emplace_back(i * piece, piece, static_cast<std::uint8_t*>(dst.data()) + i * piece);
   }
-  auto parked = ioctx.get().device_readv_async_io(*object, ranges, ::cuda::stream_ref{busy.value()});
+  auto parked =
+    ioctx.get().device_readv_async_io(*object, ranges, ::cuda::stream_ref{busy.value()});
 
   // More slices are parked than the in-flight window holds, yet a host read on the
   // same (only) reactor is served while the stream stays busy.
@@ -739,8 +755,11 @@ TEST_CASE("cufile reads a destination on another GPU than the calling thread's",
   rmm::cuda_set_device_raii const on_zero{rmm::cuda_device_id{0}};
   stream_latch latch;
   latch.hold(stream->value());  // busy, so the gate is a real event on GPU 1
-  auto future = ioctx.get().device_read_async_io(
-    *object, offset, size, static_cast<std::uint8_t*>(dst->data()), ::cuda::stream_ref{stream->value()});
+  auto future = ioctx.get().device_read_async_io(*object,
+                                                 offset,
+                                                 size,
+                                                 static_cast<std::uint8_t*>(dst->data()),
+                                                 ::cuda::stream_ref{stream->value()});
   latch.release();
   REQUIRE(std::move(future).get(60s) == size);
   rmm::cuda_set_device_raii const back_on_one{rmm::cuda_device_id{1}};
@@ -751,7 +770,7 @@ TEST_CASE("cufile reserves staging once per device and reuses it", "[io][cufile]
 {
   if (device_count() == 0) SKIP("no CUDA device");
   scripted_cufile cufile;
-  auto cfg  = staging_config(slot_class(9));
+  auto cfg          = staging_config(slot_class(9));
   auto const before = cucascade::io::cufile::staging_usage_of(0);
   CHECK(cucascade::io::cufile::reserve_staging(0, 3, cfg) == 3);
   auto const after = cucascade::io::cufile::staging_usage_of(0);
@@ -778,8 +797,8 @@ TEST_CASE("cufile pool plan gives each GPU its own pinned reactor group",
   config cfg;
   cfg.reactors_per_device = 3;
   cfg.staging_mode        = staging::never;
-  auto const plan =
-    cucascade::io::cufile::plan_cufile_pool(cfg, &topology, cucascade::io::cufile::probe_platform());
+  auto const plan         = cucascade::io::cufile::plan_cufile_pool(
+    cfg, &topology, cucascade::io::cufile::probe_platform());
   INFO(cucascade::io::cufile::describe(plan));
   REQUIRE(plan.groups.size() == static_cast<std::size_t>(devices));
   CHECK(plan.total_reactors() == 3 * static_cast<std::size_t>(devices));
@@ -795,8 +814,8 @@ TEST_CASE("cufile pool plan gives each GPU its own pinned reactor group",
   auto object       = ioctx.open_io_object(file.path());
   auto const& typed = dynamic_cast<cucascade::io::cufile::cufile_io_object const&>(*object);
   for (int device = 0; device < devices; ++device) {
-    for (auto const type : {cufile_ioctx::io_op_type::host_vector_async,
-                            cufile_ioctx::io_op_type::device_async}) {
+    for (auto const type :
+         {cufile_ioctx::io_op_type::host_vector_async, cufile_ioctx::io_op_type::device_async}) {
       auto const picked = ioctx.next_reactor(typed, 8, type, device);
       REQUIRE_FALSE(picked.empty());
       for (auto const* reactor : picked) {

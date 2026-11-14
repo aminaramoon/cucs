@@ -354,7 +354,7 @@ TEST_CASE("cufile ioctx reports the capability of the object it opened", "[io][c
 TEST_CASE("cufile path capability: Storage Scale needs its class bit and RDMA addresses",
           "[io][cufile]")
 {
-  constexpr unsigned gpfs_bit = status_bit(CU_FILE_GPFS_SUPPORTED);
+  constexpr unsigned gpfs_bit  = status_bit(CU_FILE_GPFS_SUPPORTED);
   auto gpfs                    = passing();
   gpfs.platform.dstatusflags   = gpfs_bit;
   gpfs.storage.kind            = storage_kind::network;
@@ -370,15 +370,15 @@ TEST_CASE("cufile path capability: Storage Scale needs its class bit and RDMA ad
   no_rdma.gds.cufile_json.path   = "/etc/cufile.json";
   CHECK(decided(no_rdma).capability == path_capability::compatibility_only);
   CHECK(decided(no_rdma).reason.find("rdma_dev_addr_list") != std::string::npos);
-  auto with_rdma = no_rdma;
+  auto with_rdma                                        = no_rdma;
   with_rdma.gds.cufile_json.settings.rdma_dev_addr_list = {"10.0.0.11"};
   CHECK(decided(with_rdma).capability == path_capability::direct_candidate);
 
   // A denylisted mount or filesystem is never served by GDS.
-  auto denied_mount                                     = with_rdma;
+  auto denied_mount                                   = with_rdma;
   denied_mount.gds.cufile_json.settings.denied_mounts = {"/gpfs/fs1"};
   CHECK(decided(denied_mount).capability == path_capability::compatibility_only);
-  auto denied_fs                                         = with_rdma;
+  auto denied_fs                                        = with_rdma;
   denied_fs.gds.cufile_json.settings.denied_filesystems = {"gpfs"};
   CHECK(decided(denied_fs).capability == path_capability::compatibility_only);
 
