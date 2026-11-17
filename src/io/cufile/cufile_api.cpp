@@ -36,9 +36,12 @@ using get_version_fn = decltype(&cuFileGetVersion);
 
 /// Resolve @p name from @p library into @p out; whether it resolved.
 template <class Fn>
-bool resolve(Fn& out, void* library, char const* name) noexcept
+bool resolve(Fn& out,
+             cufile_api::symbol_resolver resolver,
+             void* context,
+             char const* name) noexcept
 {
-  void* const symbol = ::dlsym(library, name);
+  void* const symbol = resolver(context, name);
   // POSIX guarantees the object-pointer to function-pointer conversion of a dlsym result.
   out = reinterpret_cast<Fn>(symbol);  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
   return symbol != nullptr;
@@ -61,10 +64,28 @@ struct loaded_library {
     return loaded;
   }
 
+  loaded.api = cufile_api::resolve_symbols(::dlsym, library);
+  if (!loaded.api.has_value()) { return loaded; }
+  std::ignore = resolve(loaded.get_version, ::dlsym, library, "cuFileGetVersion");
+  return loaded;
+}
+
+[[nodiscard]] loaded_library const& library() noexcept
+{
+  static loaded_library const loaded = load();
+  return loaded;
+}
+
+}  // namespace
+
+std::optional<cufile_api> cufile_api::resolve_symbols(symbol_resolver resolver,
+                                                      void* context) noexcept
+{
+  if (resolver == nullptr) { return std::nullopt; }
   cufile_api api{};
   bool complete = true;
   auto need     = [&](auto& member, char const* name) noexcept {
-    if (!resolve(member, library, name)) {
+    if (!resolve(member, resolver, context, name)) {
       complete = false;
       CUCASCADE_LOG_INFO("cufile: required symbol {} not found; cuFile unavailable", name);
     }
@@ -77,20 +98,90 @@ struct loaded_library {
   need(api.buf_deregister, "cuFileBufDeregister");
   need(api.read, "cuFileRead");
   need(api.write, "cuFileWrite");
-  if (!complete) { return loaded; }
+  if (!complete) { return std::nullopt; }
 
-  loaded.api  = api;
-  std::ignore = resolve(loaded.get_version, library, "cuFileGetVersion");
-  return loaded;
+  auto resolve_optional = [&](auto& member, char const* name) noexcept {
+    return resolve(member, resolver, context, name);
+  };
+  api.has_async_read  = resolve_optional(api.read_async, "cuFileReadAsync");
+  api.has_async_write = resolve_optional(api.write_async, "cuFileWriteAsync");
+
+  api.has_stream_register = resolve_optional(api.stream_register, "cuFileStreamRegister");
+  api.has_stream_register &= resolve_optional(api.stream_deregister, "cuFileStreamDeregister");
+  if (!api.has_stream_register) {
+    api.stream_register   = nullptr;
+    api.stream_deregister = nullptr;
+  }
+
+  api.has_batch = resolve_optional(api.batch_setup, "cuFileBatchIOSetUp");
+  api.has_batch &= resolve_optional(api.batch_submit, "cuFileBatchIOSubmit");
+  api.has_batch &= resolve_optional(api.batch_get_status, "cuFileBatchIOGetStatus");
+  api.has_batch &= resolve_optional(api.batch_cancel, "cuFileBatchIOCancel");
+  api.has_batch &= resolve_optional(api.batch_destroy, "cuFileBatchIODestroy");
+  if (!api.has_batch) {
+    api.batch_setup      = nullptr;
+    api.batch_submit     = nullptr;
+    api.batch_get_status = nullptr;
+    api.batch_cancel     = nullptr;
+    api.batch_destroy    = nullptr;
+  }
+
+  // Keep individual parameter adapters available, but report the group complete only if every
+  // parameter function declared by the build-time header resolved. Never guess enum values.
+  api.has_parameters = true;
+  bool any_parameter = false;
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERSIZET
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_size_t, "cuFileSetParameterSizeT");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERBOOL
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_bool, "cuFileSetParameterBool");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERSTRING
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_string, "cuFileSetParameterString");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERSIZET
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_size_t, "cuFileGetParameterSizeT");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERBOOL
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_bool, "cuFileGetParameterBool");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERSTRING
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_string, "cuFileGetParameterString");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERMINMAXVALUE
+  any_parameter = true;
+  api.has_parameters &=
+    resolve_optional(api.get_parameter_min_max_value, "cuFileGetParameterMinMaxValue");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERPOSIXPOOLSLABARRAY
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_posix_pool_slab_array,
+                                         "cuFileSetParameterPosixPoolSlabArray");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERPOSIXPOOLSLABARRAY
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_posix_pool_slab_array,
+                                         "cuFileGetParameterPosixPoolSlabArray");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERGPUBOUNCEBUFFERSLABARRAY
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.set_parameter_gpu_bounce_buffer_slab_array,
+                                         "cuFileSetParameterGpuBounceBufferSlabArray");
+#endif
+#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERGPUBOUNCEBUFFERSLABARRAY
+  any_parameter = true;
+  api.has_parameters &= resolve_optional(api.get_parameter_gpu_bounce_buffer_slab_array,
+                                         "cuFileGetParameterGpuBounceBufferSlabArray");
+#endif
+  api.has_parameters &= any_parameter;
+  return api;
 }
-
-[[nodiscard]] loaded_library const& library() noexcept
-{
-  static loaded_library const loaded = load();
-  return loaded;
-}
-
-}  // namespace
 
 cufile_api const* cufile_api::get() noexcept
 {

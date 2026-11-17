@@ -356,18 +356,6 @@ struct io_slot {
   }
 };
 
-[[nodiscard]] range staged_physical_range(range logical,
-                                          std::size_t file_size,
-                                          bool use_odirect) noexcept
-{
-  if (!use_odirect) return logical;
-
-  auto const start = align_down(logical.offset, IO_BLOCK_SIZE);
-  auto const end =
-    std::min(align_up(logical.end(), IO_BLOCK_SIZE), align_up(file_size, IO_BLOCK_SIZE));
-  return end > start ? range{start, end - start} : range{start, 0};
-}
-
 void attach_common(uring_io_op& op,
                    std::shared_ptr<const io_object> const& object,
                    prepared_io_slice const& slice,
@@ -517,7 +505,7 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
     }
   };
 
-  for (auto const& piece : detail::split_write_range(slice.rng, granule)) {
+  for (auto const& piece : range_plan::split_write_range(slice.rng, granule)) {
     if (piece.empty()) continue;
     bool const body = is_granule_aligned(piece, granule);
     if (device) {
@@ -568,7 +556,9 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
 
     bool const direct = detail::odirect_available(cfg.use_odirect, file->odirect_handle()) &&
                         block_size % IO_BLOCK_SIZE == 0;
-    auto const physical = staged_physical_range(slice.rng, file->size(), direct);
+    auto const physical =
+      direct ? range_plan::staged_physical_range(slice.rng, IO_BLOCK_SIZE, file->size())
+             : slice.rng;
     if (physical.empty()) {
       throw std::out_of_range("uring_reactor: staged range is outside the object");
     }
@@ -961,7 +951,7 @@ std::size_t uring_reactor::host_write(local_io_object const& file,
 
   bool const direct_fd = detail::odirect_available(_config.use_odirect, file.odirect_handle());
   auto const granule   = write_granule();
-  for (auto const& piece : detail::split_write_range(range{offset, bytes}, granule)) {
+  for (auto const& piece : range_plan::split_write_range(range{offset, bytes}, granule)) {
     if (piece.empty()) continue;
     auto const* src   = source + (piece.offset - offset);
     bool const direct = direct_fd && is_granule_aligned(piece, granule) && is_block_aligned(src);

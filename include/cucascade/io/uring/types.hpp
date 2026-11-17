@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/range_plan.hpp>
 
 #include <sys/uio.h>
 
@@ -112,15 +113,10 @@ namespace detail {
  *         inside a single granule is all head.  Concatenated in order they are
  *         exactly @p rng.
  */
-[[nodiscard]] inline std::array<range, 3> split_write_range(range rng, std::size_t granule) noexcept
+[[deprecated("Use range_plan::split_write_range")]] [[nodiscard]] inline std::array<range, 3>
+split_write_range(range rng, std::size_t granule) noexcept
 {
-  auto const begin = rng.offset;
-  auto const end   = rng.end();
-  if (granule == 0 || rng.empty()) return {rng, range{end, 0}, range{end, 0}};
-  auto const first = begin % granule == 0 ? begin : begin - begin % granule + granule;
-  auto const last  = end - end % granule;
-  if (first >= end || last <= first) { return {rng, range{end, 0}, range{end, 0}}; }
-  return {range{begin, first - begin}, range{first, last - first}, range{last, end - last}};
+  return range_plan::split_write_range(rng, granule);
 }
 
 /** Rebuild an iovec list after @p skip bytes have already completed. */

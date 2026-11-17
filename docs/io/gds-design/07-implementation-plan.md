@@ -45,7 +45,7 @@ lead: build cucascade_io_tests + full io test run + pre-commit on changed files 
    `legacy`), the sub-flags, `submitters_per_device`, `arena_bytes` (0 = auto),
    `mount_overrides`, `probe`, `demotion`, and `poll`. The config only parses
    and validates at this stage.
-4. **P0 harness `benchmark/cufile_async_qd/` (standalone, no cudf).**
+4. **P0 harness `tools/gds/cufile_async_qd.cpp` (standalone, no cudf).**
    - Persistent registered buffers, one op per stream, QD 1–128, ops of
      1/2/4/8 MiB.
    - Reports throughput, submit-call latency, and `bytes_done` timing.

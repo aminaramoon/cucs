@@ -269,8 +269,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     # the layout of io_config. libcufile itself is never linked (see
     # src/io/cufile/cufile_api).
     if(CUCASCADE_CUFILE_INCLUDE_DIR)
-      target_compile_definitions(cucascade_io_thirdparty
-                                 INTERFACE CUCASCADE_HAS_CUFILE)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ConfigureCuFile.cmake)
+      target_compile_definitions(
+        cucascade_io_thirdparty
+        INTERFACE CUCASCADE_HAS_CUFILE ${CUCASCADE_CUFILE_FEATURE_DEFINITIONS})
       target_include_directories(
         cucascade_io_thirdparty
         INTERFACE $<BUILD_INTERFACE:${CUCASCADE_CUFILE_INCLUDE_DIR}>)
@@ -646,6 +648,26 @@ elseif(CUCASCADE_BUILD_STATIC_LIBS)
 endif()
 
 # =============================================================================
+# Standalone GDS diagnostics (no cuDF or benchmark-framework dependency)
+# =============================================================================
+if(CUCASCADE_BUILD_IO AND CUCASCADE_CUFILE_INCLUDE_DIR)
+  # Reuse the loader without pulling in the reactor or the core's dependencies.
+  add_executable(cucascade_cufile_async_qd EXCLUDE_FROM_ALL
+                 tools/gds/cufile_async_qd.cpp src/io/cufile/cufile_api.cpp)
+  target_include_directories(
+    cucascade_cufile_async_qd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                      ${CUCASCADE_CUFILE_INCLUDE_DIR})
+  target_link_libraries(cucascade_cufile_async_qd
+                        PRIVATE CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+  target_compile_features(cucascade_cufile_async_qd PRIVATE cxx_std_20)
+  target_compile_definitions(cucascade_cufile_async_qd
+                             PRIVATE ${CUCASCADE_CUFILE_FEATURE_DEFINITIONS})
+  target_compile_options(cucascade_cufile_async_qd
+                         PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
+  set_target_properties(cucascade_cufile_async_qd PROPERTIES CXX_EXTENSIONS OFF)
+endif()
+
+# =============================================================================
 # Installation
 # =============================================================================
 include(GNUInstallDirs)
@@ -769,6 +791,10 @@ endif()
 if(CUCASCADE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(test)
+  # The standalone loader consumer must keep compiling with the I/O test build.
+  if(TARGET cucascade_io_tests AND TARGET cucascade_cufile_async_qd)
+    add_dependencies(cucascade_io_tests cucascade_cufile_async_qd)
+  endif()
 endif()
 
 # =============================================================================

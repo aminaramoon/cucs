@@ -28,9 +28,9 @@
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/object_identity.hpp>
+#include <cucascade/io/range_plan.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
-#include <cucascade/io/uring/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 #include <cucascade/log/logging.hpp>
 
@@ -1503,7 +1503,7 @@ std::size_t cufile_reactor::host_write(cufile_io_object const& file,
 
   bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
   auto const granule   = write_granule();
-  for (auto const& piece : uring::detail::split_write_range(range{offset, size}, granule)) {
+  for (auto const& piece : range_plan::split_write_range(range{offset, size}, granule)) {
     if (piece.empty()) continue;
     auto const* src = source + (piece.offset - offset);
     write_host_piece(
@@ -1532,7 +1532,7 @@ void cufile_reactor::dispatch_write(cufile_io_object const& file,
   request.kind       = io_op_kind::write;
   request.io_rng     = slice.rng;  // writes are never clamped: they may extend the file
   auto const granule = write_granule();
-  auto const pieces  = uring::detail::split_write_range(slice.rng, granule);
+  auto const pieces  = range_plan::split_write_range(slice.rng, granule);
 
   if (!slice.has_device_request()) {
     auto* const source = std::get<std::uint8_t*>(slice.h_buffer.buffer);

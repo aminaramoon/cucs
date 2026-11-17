@@ -107,7 +107,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   target_sources(
     cucascade_io_tests
     PRIVATE io/rest/test_rest_reactor.cpp io/rest/test_rest_ioctx_contracts.cpp
-            io/test_io_request.cpp)
+            io/test_io_request.cpp io/test_range_plan.cpp)
   # A PTDS-built caller must still get legacy null-stream I/O ordering.
   set_source_files_properties(
     io/test_null_stream_ptds.cpp PROPERTIES COMPILE_DEFINITIONS
@@ -127,8 +127,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     target_sources(
       cucascade_io_tests
       PRIVATE io/cufile/test_cufile_platform.cpp
-              io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp
-              io/cufile/test_cufile_write.cpp)
+              io/cufile/test_cufile_probe.cpp
+              io/cufile/test_cufile_reactor.cpp
+              io/cufile/test_cufile_write.cpp
+              io/cufile/test_cufile_api_optional.cpp
+              io/cufile/test_async_engine_config.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

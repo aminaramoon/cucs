@@ -154,4 +154,70 @@ Promotes open question §9.15 into the plan.
   `./build/release/test/cucascade_io_tests`.
 - The full `pixi run build` fails for the pre-existing cudf reason above.
 - The P0 harness is a standalone executable that does **not** depend on the
-  cudf layer.
+  cudf layer. Building `cucascade_io_tests` also compiles it when cuFile headers
+  are available, so loader changes cannot silently break the diagnostic.
+
+## AM-9: Registration granularity is a qualification dimension (Phase 1 review P1-R1)
+
+- Phase 1 review observed on the development host (ext4, compat-mode libcufile
+  1.17, no nvidia-fs) concurrent `cuFileReadAsync` calls into disjoint offsets of
+  **one registered arena** completing with `bytes_done = -1` at QD ≥ 2. The libcufile log reports
+  POSIX async read `Input/output error` and I/O verification failures. QD 1,
+  synchronous reads, unregistered slots, and separately registered slots with
+  `buffer_offset = 0` work. Changing stream-registration flags does not fix it.
+  This is a reported compat limitation, not a conclusion about real GDS.
+  Follow-up with the revised harness on devices 0 and 1 at QD 2/8/32, 1/2 MiB,
+  passed with no mismatches in arena mode both with `--warmup-ops 0` and with
+  default warmup. The discrepancy remains unexplained; do not attribute the
+  successful rerun to warmup or assume shared-registration safety from it.
+- The P0 harness exposes `--register 0|arena|slot` (`1` aliases `arena`) and
+  defaults to `slot`. CSV rows identify the selected registration mode. Compat
+  smoke tests use `slot` and `0`; `arena` intentionally remains available to
+  investigate the failure. Each lane performs a validated untimed I/O warmup
+  before measured cases, so cold cuFile initialization does not bias submit p99.
+  `--warmup-ops 0` disables this for cold-start comparisons; the follow-up cold
+  run saw a first-submit maximum of about 15 ms, versus sub-100 µs with warmup.
+- **Phase 2:** `device_arena` must parameterize arena/slab/slot registration
+  granularity and retain the registered base plus offset appropriate to that
+  choice. The compat-libcufile integration test must cover concurrent disjoint
+  slots with per-slot registration (and retain an arena-mode reproducer).
+  Compat testing must not depend on the failing shared-registration layout.
+- **Phase 7 / G-1 through G-8:** compare arena/slab registration against per-slot
+  registration on real GDS, including concurrent correctness, registration cost,
+  BAR1 usage, and throughput. Slab registration cannot become the qualified
+  default until these comparisons pass. The engine remains legacy by default.
+
+## AM-10: Phase 1 configuration surface and policy contracts (P1-R7, R11, R16)
+
+- Phase 1 exposes only the implementation-plan subset of §6.2. `poll` currently
+  uses scalar `io_cap_us` and `copy_cap_us`, not the base spec's explicit backoff
+  ladders. These are maximum delays, **not constant polling periods**. Phase 3
+  must implement and test bounded adaptive backoff beneath those caps before
+  the scheduler is enabled; exact ladders are not a frozen configuration API.
+- Durations currently use unit-suffixed unsigned scalars, not `std::chrono`.
+  The runtime phases must use checked conversions to chrono durations.
+- Deferred to the resource/scheduler implementation (Phases 2–3): `retry`,
+  `blocking_workers`, `recovery_workers`, `max_pending_slices_per_device`,
+  `max_join_streams_per_device`, `registration_first_step`, `bar1_fraction`,
+  `bar1_headroom`, `max_submitters_process`, and `submitter_idle_retire`.
+  Add each with its validation and consumer rather than unused placeholders.
+- Deferred to Phase 6 parameter/affinity work: `process_params`,
+  `strict_parameters`, and mount override `nic` / `cpus`. `event_api` remains
+  removed by AM-1.
+- Override precedence for Phase 2 policy is fsid, then longest matching mount
+  prefix, then filesystem type; earlier list entries break equal-priority ties.
+  Mount prefixes match normalized absolute paths at component boundaries, not
+  arbitrary string prefixes (`/mnt/a` does not match `/mnt/abc`). Validation
+  rejects duplicate `{match, value}` pairs, non-normalized prefixes, and
+  filesystem types containing whitespace. Overlapping normalized prefixes are
+  allowed because longest-prefix precedence is defined.
+
+## AM-10: Compat-mode async submission does not block on libcufile 1.17 (lead observation, Phase 1 smoke)
+
+- The P0 harness ran on the development host (libcufile 1170, compat, ext4, page-cached 256 MiB file, slot registration).
+  - `cuFileReadAsync` submit p50 was about 6 µs at 1 MiB and about 17 µs at 4 MiB, against completion p50 of 0.44–9.3 ms.
+  - QD 16 reached about 4× the throughput of QD 1 (1.66 → 6.72 GiB/s at 1 MiB).
+- So the statement "async cuFile runs synchronously in the submitting thread in compat mode" (`cufile_reactor.hpp:168-171`, brief §4) does **not** hold for this version. It may hold for older ones.
+- Consequences:
+  - The FR-9 slow-submit breaker will not demote compat mounts on 1.17. The `known_compat` decision must come from `gds_available()` and the per-mount probe evidence, not from submit latency alone.
+  - Compat async may be a legitimate QD lever on non-GDS hosts. B-9/B-10 must measure it against the legacy sync path before the compat default is reconsidered. The default stays legacy (NFR-2).

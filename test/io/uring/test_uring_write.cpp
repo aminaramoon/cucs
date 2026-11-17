@@ -75,10 +75,10 @@ using cucascade::io::range;
 using cucascade::io::write_mode;
 using cucascade::io::write_open_options;
 using cucascade::io::write_slice;
+using cucascade::io::range_plan::split_write_range;
 using cucascade::io::uring::local_io_object;
 using cucascade::io::uring::uring_ioctx;
 using cucascade::io::uring::uring_reactor;
-using cucascade::io::uring::detail::split_write_range;
 
 namespace {
 

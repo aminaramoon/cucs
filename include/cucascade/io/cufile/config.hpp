@@ -24,6 +24,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace cucascade::io::cufile {
 
@@ -34,6 +37,179 @@ enum class compat : std::uint8_t {
   automatic,  ///< try cuFile; a file that cannot be registered falls back to POSIX I/O
   on,         ///< never use cuFile: every transfer of the file goes through POSIX I/O
   off,        ///< enforce cuFile: opening a file that cannot be registered throws
+};
+
+/** @brief Opt-in transport mode; legacy remains the default until hardware qualification. */
+enum class engine_mode : std::uint8_t { legacy, async_auto, async_simulated_for_testing };
+
+/** @brief Which mount identity an operator override matches. */
+enum class mount_match : std::uint8_t { fsid, mount_prefix, fs_type };
+
+/** @brief An operator's routing decision, never evidence of verified direct I/O. */
+enum class mount_override_state : std::uint8_t { operator_qualified, known_compat, legacy };
+
+/**
+ * @brief Mount routing and optional preferred profile, interpreted by the future policy layer.
+ *
+ * The fsid is an opaque string, keeping the configuration independent of platform fsid types.
+ * A mount prefix must already be a normalized absolute path: root is allowed, but trailing
+ * slashes, repeated slashes, and @c . or @c .. components are not. Filesystem types must contain
+ * no whitespace. Profile values are preferences: capacity fitting may reduce QD and choose a
+ * smaller supported staging class than @c op_bytes.
+ */
+struct mount_override {
+  mount_match match{mount_match::mount_prefix};
+  std::string value;
+  mount_override_state state{mount_override_state::legacy};
+  std::optional<unsigned> qd;
+  std::optional<std::size_t> op_bytes;
+};
+
+/**
+ * @brief Configuration for the opt-in per-device async engine.
+ *
+ * This is a configuration-only interface: construction and validation perform no probing,
+ * CUDA work, or runtime initialization. The legacy reactor does not consult it yet.
+ */
+struct async_engine_config {
+  engine_mode mode{engine_mode::legacy};
+  bool async_reads{true};
+  bool async_writes{false};
+  bool unregistered_device_tier{true};
+  bool direct_registered_io{false};
+  bool stream_register{true};
+  bool affinity{true};
+
+  /// Mounts are assigned round-robin to 1..8 submitters on each device.
+  unsigned submitters_per_device{1};
+
+  /// Per-device allocation target. Zero means auto, not disabled: round down to 16 MiB
+  /// the minimum of 1 GiB, 5% of device memory, and reservable memory. Explicit nonzero
+  /// targets are accepted as given; actual allocation/registration is a resource concern.
+  std::size_t arena_bytes{0};
+  unsigned device_lane_cap{160};
+
+  /// Routing precedence: fsid, then longest matching mount_prefix, then fs_type. Prefixes
+  /// match whole path components of normalized absolute paths; the first entry in list order
+  /// wins any tie. Exact duplicate {match, value} selectors are invalid, regardless of state.
+  std::vector<mount_override> mount_overrides;
+
+  struct probe_config {
+    unsigned submit_max_us{100};
+    /// False permits non-blocking-submit-only qualification for simulator/compat tests.
+    bool require_direct_evidence{true};
+    std::size_t bytes{16UL << 20};
+  } probe;
+
+  struct demotion_config {
+    unsigned slow_floor_us{100};
+    unsigned p99_multiple{4};
+    unsigned slow_of_last_eight{3};
+    unsigned stuck_ms{2};
+    unsigned cooldown_s{30};
+    unsigned cooldown_cap_s{960};
+  } demotion;
+
+  struct poll_config {
+    unsigned io_cap_us{100};
+    unsigned copy_cap_us{10};
+    unsigned fence_hint_us{100};
+    unsigned due_events_per_round{16};
+    unsigned idle_health_ms{20};
+  } poll;
+
+  /**
+   * @brief Check syntactic ranges without consulting device or filesystem capabilities.
+   *
+   * Flags are independently selectable, including in legacy mode. An override's QD need
+   * not fit the lane cap: effective capacity is determined later by resource fitting.
+   * Byte counts used for direct-I/O probes/profile preferences must be positive multiples
+   * of @c io::IO_BLOCK_SIZE; device-specific granules are checked by the future policy layer.
+   *
+   * @throws std::invalid_argument naming the first invalid field.
+   */
+  void validate() const
+  {
+    auto const positive = [](auto value, char const* field) {
+      if (value == 0) { throw std::invalid_argument(std::string{field} + " must be positive"); }
+    };
+    auto const aligned_bytes = [](std::size_t value, char const* field) {
+      if (value == 0 || value % io::IO_BLOCK_SIZE != 0) {
+        throw std::invalid_argument(std::string{field} +
+                                    " must be a positive multiple of IO_BLOCK_SIZE");
+      }
+    };
+
+    switch (mode) {
+      case engine_mode::legacy:
+      case engine_mode::async_auto:
+      case engine_mode::async_simulated_for_testing: break;
+      default: throw std::invalid_argument("mode is invalid");
+    }
+    if (submitters_per_device < 1 || submitters_per_device > 8) {
+      throw std::invalid_argument("submitters_per_device must be in [1, 8]");
+    }
+    positive(device_lane_cap, "device_lane_cap");
+    positive(probe.submit_max_us, "probe.submit_max_us");
+    aligned_bytes(probe.bytes, "probe.bytes");
+    positive(demotion.slow_floor_us, "demotion.slow_floor_us");
+    positive(demotion.p99_multiple, "demotion.p99_multiple");
+    if (demotion.slow_of_last_eight < 1 || demotion.slow_of_last_eight > 8) {
+      throw std::invalid_argument("demotion.slow_of_last_eight must be in [1, 8]");
+    }
+    positive(demotion.stuck_ms, "demotion.stuck_ms");
+    positive(demotion.cooldown_s, "demotion.cooldown_s");
+    if (demotion.cooldown_cap_s < demotion.cooldown_s) {
+      throw std::invalid_argument("demotion.cooldown_cap_s must be >= demotion.cooldown_s");
+    }
+    positive(poll.io_cap_us, "poll.io_cap_us");
+    positive(poll.copy_cap_us, "poll.copy_cap_us");
+    positive(poll.fence_hint_us, "poll.fence_hint_us");
+    positive(poll.due_events_per_round, "poll.due_events_per_round");
+    positive(poll.idle_health_ms, "poll.idle_health_ms");
+
+    for (std::size_t index = 0; index < mount_overrides.size(); ++index) {
+      auto const& entry = mount_overrides[index];
+      switch (entry.match) {
+        case mount_match::fsid: break;
+        case mount_match::fs_type:
+          if (entry.value.find_first_of(" \t\n\r\f\v") != std::string::npos) {
+            throw std::invalid_argument("mount_overrides.value fs_type must contain no whitespace");
+          }
+          break;
+        case mount_match::mount_prefix:
+          if (entry.value.empty() || entry.value.front() != '/' ||
+              (entry.value.size() > 1 && entry.value.back() == '/') ||
+              entry.value.find("//") != std::string::npos ||
+              entry.value.find("/./") != std::string::npos ||
+              entry.value.find("/../") != std::string::npos || entry.value.ends_with("/.") ||
+              entry.value.ends_with("/..")) {
+            throw std::invalid_argument(
+              "mount_overrides.value must be a normalized absolute mount_prefix");
+          }
+          break;
+        default: throw std::invalid_argument("mount_overrides.match is invalid");
+      }
+      if (entry.value.empty() || entry.value.find('\0') != std::string::npos) {
+        throw std::invalid_argument("mount_overrides.value must be nonempty and contain no NUL");
+      }
+      switch (entry.state) {
+        case mount_override_state::operator_qualified:
+        case mount_override_state::known_compat:
+        case mount_override_state::legacy: break;
+        default: throw std::invalid_argument("mount_overrides.state is invalid");
+      }
+      if (entry.qd) { positive(*entry.qd, "mount_overrides.qd"); }
+      if (entry.op_bytes) { aligned_bytes(*entry.op_bytes, "mount_overrides.op_bytes"); }
+      for (std::size_t earlier = 0; earlier < index; ++earlier) {
+        if (mount_overrides[earlier].match == entry.match &&
+            mount_overrides[earlier].value == entry.value) {
+          throw std::invalid_argument(
+            "mount_overrides contains duplicate {match, value} selectors");
+        }
+      }
+    }
+  }
 };
 
 /**
@@ -168,6 +344,9 @@ struct config {
   /// turn (at least @c max_inflight slices) even though high work is waiting.
   /// 0 restores strict priority.
   std::size_t low_service_interval{4};
+
+  /// Configuration-only opt-in surface; no runtime path consults this field yet.
+  async_engine_config async_engine;
 
   /// cuFile can only DMA whole pages, so a read is widened to a page boundary
   /// either way -- reporting it lets the caller align once, up front, instead of
