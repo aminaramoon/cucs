@@ -77,6 +77,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/test_thread_pool_construction.cpp
     io/test_tiered_queue.cpp
     io/test_uri_parser.cpp
+    io/cufile/transport_simulator.cpp
+    io/cufile/transport_simulator_kernels.cu
+    io/cufile/test_transport_simulator.cpp
     io/cache/test_buffer_pool.cpp
     io/cache/test_chunk_state.cpp
     io/cache/test_metadata_store.cpp
@@ -131,7 +134,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_cufile_reactor.cpp
               io/cufile/test_cufile_write.cpp
               io/cufile/test_cufile_api_optional.cpp
-              io/cufile/test_async_engine_config.cpp)
+              io/cufile/test_async_engine_config.cpp
+              io/cufile/test_device_arena.cpp
+              io/cufile/test_capacity.cpp
+              io/cufile/test_runtime_params.cpp
+              io/cufile/test_lane_pool.cpp
+              io/cufile/test_operation.cpp
+              io/cufile/test_mount_policy.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

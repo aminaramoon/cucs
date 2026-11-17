@@ -46,6 +46,9 @@
 
 namespace cucascade::io::cufile {
 
+struct mount_identity;
+struct mount_policy_key;
+
 // ---------------------------------------------------------------------------
 // cufile_io_object
 // ---------------------------------------------------------------------------
@@ -115,6 +118,12 @@ class cufile_io_object final : public io_object {
 
   [[nodiscard]] bool cufile_registered() const noexcept { return _cufile_handle != nullptr; }
 
+  /// Resolve descriptor-derived mount metadata once, only when engine routing requests it.
+  /// Legacy opens never inspect mountinfo. This does not initialize CUDA or cuFile.
+  [[nodiscard]] mount_identity const& mount_identity_info() const;
+  [[nodiscard]] mount_policy_key policy_key(std::string device_uuid,
+                                            std::uint64_t generation) const;
+
  private:
   std::string _path;
   file_descriptor _buffered_fd;
@@ -123,6 +132,8 @@ class cufile_io_object final : public io_object {
   mutable std::atomic<std::size_t> _file_size{0};
   io_access _access{io_access::read_only};
   std::optional<object_identity> _identity;
+  mutable std::once_flag _mount_identity_once;
+  mutable std::unique_ptr<mount_identity> _mount_identity;
 };
 
 // ---------------------------------------------------------------------------
@@ -165,10 +176,10 @@ class cufile_io_object final : public io_object {
  * and its 1 MiB writes measured about half as fast as the staged path when they
  * extend a file.
  *
- * The synchronous API is deliberate (it is what NVIDIA's own consumers use):
- * @c cuFileReadAsync serialises a stream's operations, runs synchronously in
- * the submitting thread in compatibility mode, and keeps per-stream state keyed
- * by caller stream handles the reactor neither registers nor deregisters.
+ * This legacy reactor deliberately uses the synchronous API. Async cuFile keeps
+ * per-stream state that this reactor does not own. Compat behaviour is version-dependent:
+ * libcufile 1.17 submits asynchronously on the development host (AM-10), so compat mode
+ * alone must not be interpreted as evidence of blocking async submission.
  *
  * The worker takes a high-priority request before a low one and parks an active
  * low request at a slice boundary while high requests wait.  Priority is bounded

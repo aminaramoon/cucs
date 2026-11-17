@@ -4,7 +4,8 @@
 
 Phase 1 / P0 (B-0 and initial B-1 components), per
 `docs/io/gds-design/{05-final-design,06-design-amendments,07-implementation-plan}.md`.
-The read-only harness uses the shared cuFile loader, not the reactor or cuDF.
+The read harness uses the shared cuFile loader, not the reactor or cuDF.
+An explicit `--prepare-file` option creates a NEW deterministic pattern file.
 The target requires `CUCASCADE_BUILD_IO=ON` and `cufile.h`. It is excluded from
 `all`, but built with `cucascade_io_tests` to guard against loader/API bit-rot;
 it compiles the repository's cuFile loader and links CUDA/dl/threads only, not
@@ -14,12 +15,15 @@ A cudf-free configuration can use `-DCUCASCADE_BUILD_CUDF=OFF`.
 ```sh
 pixi run cmake --preset release
 pixi run cmake --build build/release --target cucascade_cufile_async_qd
-# Materialize a scratch file; never use sparse/truncated files for baselines.
-dd if=/dev/zero of=/mnt/disk_2/cufile-qd.bin bs=1M count=4096 oflag=direct status=progress
+# Correctness smoke: create a NEW pattern file (refuses overwrite).
+pixi run ./build/release/cucascade_cufile_async_qd \
+  --file /mnt/disk_2/cufile-qd.bin --prepare-file --size-mib 4096 \
+  --qd 1,4 --op-mib 1,4 --seconds 0.25 --verify 1
+# Throughput run only after the content-validated smoke succeeds:
 pixi run ./build/release/cucascade_cufile_async_qd \
   --file /mnt/disk_2/cufile-qd.bin --size-mib 4096 \
   --qd 1,2,4,8,16,32,64,128 --op-mib 1,2,4,8 \
-  --seconds 5 --device 0 --register slot --mode async
+  --seconds 5 --device 0 --register slot --mode async --verify 0
 # CUDA-only microbench; no file or functioning libcufile required:
 pixi run ./build/release/cucascade_cufile_async_qd --microbench --device 0
 ```
@@ -27,7 +31,10 @@ pixi run ./build/release/cucascade_cufile_async_qd --microbench --device 0
 `--help` lists defaults. `--seconds` is per QD/size pair. The existing regular
 file is opened `O_RDONLY | O_DIRECT` and must be at least `--size-mib` MiB.
 Reads wrap through that prefix in operation-sized windows (a short remainder is
-unused). The tool never creates, truncates, or writes the file.
+unused). Without `--prepare-file`, the tool never creates, truncates, or writes
+the file. `--prepare-file` uses `O_EXCL` and an offset-dependent nonuniform
+pattern; existing files are never overwritten. Zero-filled files cannot expose
+wrong-offset/cross-lane corruption and must not be used for correctness gates.
 
 One `cudaMalloc` arena, sized `max(qd) * max(op-mib)` MiB, persists across
 the sweep. Registrations are persistent and outside timing:
@@ -50,10 +57,14 @@ Admission stops at the deadline; outstanding operations drain.
 
 CSV `result` rows report successful-byte GiB/s (including final drain), submit
 p50/p99/max and host-observed completion p50/p99 in microseconds, the
-`registration` mode (`0`, `arena`, or `slot`), and `bytes_done_mismatches`.
-Any short/error/unset result after event completion counts as a mismatch and
-causes nonzero exit. This is completion accounting,
-not content-integrity verification. Submit latency measures only the cuFile
+`registration` mode (`0`, `arena`, or `slot`), `bytes_done_mismatches`, and
+`data_mismatches`. Any short/error/unset result after event completion counts as
+a mismatch and causes nonzero exit. `--verify 1` (default) additionally copies
+each completed slot to the host and compares every byte with a buffered
+reference read of the file at that operation's offset. A data mismatch also
+causes nonzero exit, with lane/file/buffer offsets printed. Verification adds
+D2H and reference-read overhead to elapsed time and reduces throughput; use
+`--verify 0` only for performance measurements after a verified smoke run. Submit latency measures only the cuFile
 call; completion includes that call, event record, other submissions, and
 polling. Percentiles use nearest rank over all measured operations.
 `blocking_indicator=1` means **median submit >= 50% of median completion**;
@@ -83,9 +94,9 @@ do not yet measure validate-then-copy residence, timer overshoot, or QD loss.
 Development smoke tests (both async variants pass on the compat host):
 
 ```sh
-dd if=/dev/zero of=/tmp/cufile-qd-smoke.bin bs=1M count=256 oflag=direct status=progress
+# Choose a new filename: --prepare-file refuses to overwrite an existing file.
 pixi run ./build/release/cucascade_cufile_async_qd \
-  --file /tmp/cufile-qd-smoke.bin --size-mib 256 --qd 1,4 --op-mib 1,2 \
+  --file /tmp/cufile-qd-smoke.bin --prepare-file --size-mib 256 --qd 1,4 --op-mib 1,2 \
   --seconds 0.25 --device 0 --register slot --mode async --microbench
 pixi run ./build/release/cucascade_cufile_async_qd \
   --file /tmp/cufile-qd-smoke.bin --size-mib 256 --qd 1,4 --op-mib 1,2 \
@@ -97,13 +108,14 @@ pixi run ./build/release/cucascade_cufile_async_qd \
 ext4, no nvidia-fs returning `bytes_done = -1` (POSIX I/O verification errors)
 for async `--register arena` (or `1`) at QD >= 2, despite disjoint slots. QD 1,
 per-slot registration, unregistered async reads, and the sync arena baseline
-passed; disabling stream registration did not fix it. Follow-up runs of the
-revised harness on devices 0 and 1 at QD 2/8/32, 1/2 MiB, completed without
-mismatches in arena mode, both with and without warmup. The discrepancy remains
-unexplained: neither warmup nor this local pass proves shared-registration
-safety. Real-GDS arena behaviour is unverified; see AM-9 for Phase 2 tests and
-hardware gates. The harness preserves arena mode to measure
-this distinction and exits nonzero on failed completion validation.
+passed; disabling stream registration did not fix it. Earlier follow-up runs
+checked only `bytes_done`, not contents, so their claimed correctness pass is
+void. Phase 2 reproduced **silent corruption with full successful `bytes_done`**
+at QD 4 on libcufile 1170. The revised harness with `--verify 1` reproduces it:
+QD 1 passes, QD 4 reports data mismatches and exits nonzero. Shared arena AND
+slab registrations remain unqualified. Use slot registration for compat tests;
+see AM-9 for content-validated real-GDS gates. The harness retains arena mode
+only for deliberate reproduction and qualification, not as a safe default.
 
 Small cached/compat-mode results are **not** GDS qualification. Use `/mnt/disk_2`
 for NVMe comparisons and capture matched `gdsio` and attributable direct-path

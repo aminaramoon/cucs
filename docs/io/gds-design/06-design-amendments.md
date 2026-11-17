@@ -166,12 +166,28 @@ Promotes open question §9.15 into the plan.
   synchronous reads, unregistered slots, and separately registered slots with
   `buffer_offset = 0` work. Changing stream-registration flags does not fix it.
   This is a reported compat limitation, not a conclusion about real GDS.
-  Follow-up with the revised harness on devices 0 and 1 at QD 2/8/32, 1/2 MiB,
-  passed with no mismatches in arena mode both with `--warmup-ops 0` and with
-  default warmup. The discrepancy remains unexplained; do not attribute the
-  successful rerun to warmup or assume shared-registration safety from it.
+  The earlier follow-up on devices 0 and 1 at QD 2/8/32, 1/2 MiB checked
+  **only `bytes_done`, never contents**. Its reported pass is void as evidence
+  of correctness. Phase 2 review reproduced deterministic **silent corruption**
+  on libcufile 1170, compat, ext4, QD 4: all `bytes_done` values reported the
+  full size while concurrent slots contained the wrong bytes. The revised
+  content-validating harness reproduced it again (QD 1: no mismatches;
+  QD 4: 350 data mismatches / 361 completions, zero `bytes_done` mismatches).
+  The hidden, slot-poisoning integration reproducer also fails for both arena
+  and slab layouts at QD 4, with lane/offset/first-byte diagnostics.
+  Shared arena and slab registrations are unqualified. Production must use
+  `slot` unless the mount is `verified_direct` **and** content-validated G-gate
+  evidence qualifies that particular shared granularity. An explicit unsafe
+  opt-in exists only for qualification/reproduction; it is not qualification.
 - The P0 harness exposes `--register 0|arena|slot` (`1` aliases `arena`) and
-  defaults to `slot`. CSV rows identify the selected registration mode. Compat
+  defaults to `slot`. `--verify 1` (the default) performs a full D2H/reference
+  comparison after every completion and reports `data_mismatches`; any mismatch
+  fails the run. `--prepare-file` creates a new offset-dependent deterministic
+  pattern file and refuses to overwrite an existing file. Use nonuniform
+  patterned files for correctness; zero files hide cross-lane corruption.
+  `--verify 0` is for throughput measurement only after a verified smoke run;
+  verification overhead is included in elapsed time, not cuFile submit latency.
+  CSV rows identify the selected registration mode. Compat
   smoke tests use `slot` and `0`; `arena` intentionally remains available to
   investigate the failure. Each lane performs a validated untimed I/O warmup
   before measured cases, so cold cuFile initialization does not bias submit p99.
@@ -180,7 +196,7 @@ Promotes open question §9.15 into the plan.
 - **Phase 2:** `device_arena` must parameterize arena/slab/slot registration
   granularity and retain the registered base plus offset appropriate to that
   choice. The compat-libcufile integration test must cover concurrent disjoint
-  slots with per-slot registration (and retain an arena-mode reproducer).
+  slots with per-slot registration (and retain hidden arena/slab reproducers).
   Compat testing must not depend on the failing shared-registration layout.
 - **Phase 7 / G-1 through G-8:** compare arena/slab registration against per-slot
   registration on real GDS, including concurrent correctness, registration cost,
@@ -221,3 +237,47 @@ Promotes open question §9.15 into the plan.
 - Consequences:
   - The FR-9 slow-submit breaker will not demote compat mounts on 1.17. The `known_compat` decision must come from `gds_available()` and the per-mount probe evidence, not from submit latency alone.
   - Compat async may be a legitimate QD lever on non-GDS hosts. B-9/B-10 must measure it against the legacy sync path before the compat default is reconsidered. The default stays legacy (NFR-2).
+
+## AM-11: Phase 2 resource and qualification corrections
+
+- **FR-16 / §4.7 / §6.9 (P2-R13).** Fit the lane constraint first:
+  `Q_lane = max{q <= Q : lanes(q) <= C_m}`. At that QD choose the largest
+  available prewarmed class `S <= S_pref` with `lanes(Q_lane) * S <= B_m`.
+  Only if no class fits may bytes reduce QD further, using the smallest
+  available class (normally 1 MiB). Lane contention must not force 1 MiB
+  operations when the byte grant supports larger ones. Empty class sets force
+  fallback. Scheduler integration in Phase 3 must pass the arena's registered
+  class mask to capacity fitting; immutable slot geometry must never result in
+  issuing requests for classes the arena cannot supply (P2-R9).
+- **Slot-mode geometry (P2-R9).** `slab_classes` is the control-plane input for
+  the expected profile set. Slot registrations cannot be reformatted in place;
+  adding an unprepared class requires maintenance and re-registration. The
+  default 1 MiB arena is safe when fitting is capped by `available_classes()`;
+  it does not promise 4 MiB pieces just because a filesystem prefers them.
+- **Registration budget (P2-R12).** Default warm-up samples live free BAR1 via
+  optional dynamically loaded NVML (matched by CUDA PCI address) and caps by
+  the runtime's cuFile pin limit minus default arena registrations. No NVML
+  availability is assumed: unknown BAR1 stops at `registration_first_step`
+  (default 64 MiB), not at the first registration failure. A failed shared bulk
+  registration may step down to independent slab groups; that does not waive
+  AM-9's explicit shared-registration qualification guard.
+- **Direct evidence (P2-R7).** Automatic `nvidia_fs_evidence` qualification is
+  deliberately unavailable in Phase 2. The former parser recognized invented
+  byte counters, not real `Reads ... readMiB` / `Writes ... writeMiB` output.
+  Real counters are coarse and process-global, and cannot prove attribution
+  without the isolated interval deferred by AM-4. Implement a captured-host
+  format parser, MiB rounding tolerance and isolated attribution together in
+  Phase 7 / network qualification before enabling this evidence source. Neither
+  its existence nor an unvalidated counter delta may imply `verified_direct`.
+  `cufile_stats_evidence` is likewise unavailable. Explicit operator
+  qualification and test-only overrides remain distinct.
+- **Registration policy placement (P2-R20).** `registration_first_step`,
+  `bar1_fraction`, and `bar1_headroom` are validated `device_arena_options`
+  rather than fields of `async_engine_config`. They are consumed at warm-up,
+  not transfer admission; the bootstrap owns and freezes these options.
+- **Reaper cleanup (P2-R19, Phase 3 integration).** Operation retirement and
+  the final lane-state reference may synchronously deregister/close/destroy
+  external resources. Before releasing an operation on the reaper, transfer
+  final file, lane-pool, input and scratch owners to the blocking cleanup pool.
+  Phase 2's standalone resource APIs are not themselves nonblocking final-owner
+  destructors. Test this handoff before enabling the Phase 3 scheduler (FR-5).

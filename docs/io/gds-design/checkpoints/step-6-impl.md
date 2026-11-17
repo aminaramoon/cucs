@@ -18,4 +18,12 @@
   | Reviewer | `anthropic/claude-opus-5-5` @ high |
   | Mechanical agents | `anthropic/claude-sonnet-5-5` |
 - Phase log:
-  - Phase 1 (foundations): running
+  - **Phase 1 (foundations): DONE**, commit `32767a1`.
+    - Review: CHANGES-REQUIRED (1 blocking, 17 SHOULD/NIT findings), all resolved; see `reviews/phase-1.md`.
+    - Tests: 647 cases, 646 passed, 1 skipped (lead verified independently).
+    - Pre-commit clean.
+    - New findings:
+      - AM-9: concurrent async reads into one shared arena registration failed in compat mode during review, then passed on rerun. The cause is unexplained, so registration granularity becomes a qualification dimension.
+      - AM-10: compat-mode async submission does not block on libcufile 1.17.
+    - Note: the `pre-commit` launcher has a stale `/mnt` shebang. Use `pixi run python -m pre_commit`.
+  - Phase 2 (resources and policy): running

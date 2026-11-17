@@ -20,6 +20,8 @@
 
 #include <cufile.h>
 
+#include <atomic>
+#include <mutex>
 #include <optional>
 
 namespace cucascade::io::cufile {
@@ -92,7 +94,8 @@ struct cufile_api {
    * Later calls return the first call's outcome.  The driver is never closed: cuFile releases it
    * at process exit.  Thread-safe; never throws.
    *
-   * @return Whether `cuFileDriverOpen` succeeded (false when the library is unavailable).
+   * @return Whether the driver is open, including an external already-open driver (false when
+   * the library is unavailable). An external driver's parameters remain unverified.
    */
   [[nodiscard]] static bool open_driver() noexcept;
 
@@ -141,6 +144,48 @@ struct cufile_api {
   decltype(&cuFileGetParameterGpuBounceBufferSlabArray) get_parameter_gpu_bounce_buffer_slab_array{
     nullptr};
 #endif
+};
+
+/**
+ * @brief Shared, single-attempt driver-open coordinator.
+ *
+ * Both legacy open_driver() and runtime initialization acquire this transaction. Keeping it
+ * alive across setters, open, properties and readback prevents legacy registration from racing
+ * pre-open configuration. Independent instances isolate injected runtimes in tests. Calls to
+ * cuFileDriverOpen outside cuCascade cannot be serialized here; its already-open status is
+ * retained, never treated as permission to close/reopen the driver.
+ */
+class driver_open_state {
+ public:
+  struct result {
+    bool attempted{false};
+    bool opened{false};
+    std::optional<CUfileError_t> status;
+  };
+
+  class transaction {
+   public:
+    ~transaction() noexcept;
+    [[nodiscard]] bool attempted() const noexcept { return _state._result.attempted; }
+    [[nodiscard]] result open(cufile_api const* api) noexcept;
+
+   private:
+    friend class driver_open_state;
+    explicit transaction(driver_open_state& state) : _state(state), _lock(state._mutex) {}
+    driver_open_state& _state;
+    std::unique_lock<std::mutex> _lock;
+  };
+
+  [[nodiscard]] transaction acquire() { return transaction{*this}; }
+  /// Lock-free after the first complete initialization transaction, including failed opens.
+  [[nodiscard]] bool open(cufile_api const* api) noexcept;
+  [[nodiscard]] static driver_open_state& process() noexcept;
+
+ private:
+  std::mutex _mutex;
+  result _result;
+  // Published only when the opening transaction ends, after properties and readback.
+  std::atomic<int> _outcome{-1};
 };
 
 }  // namespace cucascade::io::cufile

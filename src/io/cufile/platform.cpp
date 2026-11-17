@@ -20,6 +20,7 @@
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/io/cufile/runtime.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
@@ -63,7 +64,7 @@ namespace {
     info.library_available = api != nullptr;
     if (!info.library_available) return info;
     info.version = cufile_api::version();
-    if (!cufile_api::open_driver()) return info;
+    if (!runtime::instance().ensure_initialized().driver_opened) return info;
     info.driver_opened = true;
     CUfileDrvProps_t props{};
     if (api->driver_get_properties(&props).err != CU_FILE_SUCCESS) {

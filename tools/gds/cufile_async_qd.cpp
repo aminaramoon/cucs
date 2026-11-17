@@ -98,6 +98,8 @@ struct options {
   bool stream_register{true};
   bool async{true};
   bool microbench{false};
+  bool verify{true};
+  bool prepare_file{false};
 };
 
 void usage()
@@ -114,6 +116,8 @@ void usage()
                "  --poll-us N        Sleep between polling sweeps, 0..1000000 us (default 0)\n"
                "  --warmup-ops N     Untimed I/Os per lane per case, 0..1024 (default 1)\n"
                "  --mode async|sync  cuFileReadAsync or serial cuFileRead (default async)\n"
+               "  --verify 0|1       Full content check after every completion (default 1)\n"
+               "  --prepare-file     Create a NEW deterministic pattern file; refuses overwrite\n"
                "  --microbench       Run CUDA reaper-cost tests; --file is optional\n"
                "  --help             Show this help\n";
 }
@@ -165,10 +169,14 @@ options parse_options(int argc, char** argv)
       result.microbench = true;
       continue;
     }
+    if (key == "--prepare-file") {
+      result.prepare_file = true;
+      continue;
+    }
     if (key != "--file" && key != "--size-mib" && key != "--qd" && key != "--op-mib" &&
         key != "--seconds" && key != "--device" && key != "--register" &&
         key != "--stream-register" && key != "--poll-us" && key != "--warmup-ops" &&
-        key != "--mode") {
+        key != "--mode" && key != "--verify") {
       throw std::invalid_argument("Unknown option: " + std::string(key));
     }
     if (++i == argc) { throw std::invalid_argument("Missing value for " + std::string(key)); }
@@ -206,6 +214,9 @@ options parse_options(int argc, char** argv)
       } else {
         throw std::invalid_argument("--register requires 0|arena|slot (1 aliases arena)");
       }
+    } else if (key == "--verify") {
+      if (value != "0" && value != "1") { throw std::invalid_argument("--verify requires 0|1"); }
+      result.verify = value == "1";
     } else if (key == "--stream-register") {
       if (value != "0" && value != "1") {
         throw std::invalid_argument("--stream-register requires 0|1");
@@ -267,7 +278,8 @@ class buffer_registration {
 
 class file_descriptor {
  public:
-  explicit file_descriptor(std::string const& path) : _fd(::open(path.c_str(), O_RDONLY | O_DIRECT))
+  explicit file_descriptor(std::string const& path, int flags = O_RDONLY | O_DIRECT)
+    : _fd(::open(path.c_str(), flags, 0600))
   {
     if (_fd < 0) { throw std::runtime_error("open: " + std::string(std::strerror(errno))); }
   }
@@ -278,6 +290,73 @@ class file_descriptor {
 
  private:
   int _fd;
+};
+
+// Offset-dependent data makes wrong-offset and cross-lane writes observable. Never replace an
+// existing file: an operator must explicitly remove a disposable diagnostic file before reuse.
+void prepare_pattern_file(options const& config)
+{
+  file_descriptor output(config.file, O_WRONLY | O_CREAT | O_EXCL);
+  std::vector<std::uint64_t> words(mib / sizeof(std::uint64_t));
+  for (std::size_t offset = 0; offset < config.size_bytes; offset += mib) {
+    for (std::size_t i = 0; i < words.size(); ++i) {
+      auto value =
+        static_cast<std::uint64_t>(offset / sizeof(std::uint64_t) + i) + 0x9e3779b97f4a7c15ULL;
+      value    = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+      value    = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+      words[i] = value ^ (value >> 31);
+    }
+    auto const* bytes = reinterpret_cast<char const*>(words.data());
+    std::size_t written{};
+    while (written < mib) {
+      auto const count = ::write(output.get(), bytes + written, mib - written);
+      if (count < 0 && errno == EINTR) { continue; }
+      if (count <= 0) { throw std::runtime_error("writing pattern file failed"); }
+      written += static_cast<std::size_t>(count);
+    }
+  }
+  if (::fsync(output.get()) != 0) { throw std::runtime_error("fsync pattern file failed"); }
+}
+
+// Correctness mode intentionally includes D2H/reference-read overhead in throughput. Use
+// --verify 0 only for performance measurements AFTER a content-validated smoke run.
+class content_checker {
+ public:
+  content_checker(options const& config, std::size_t capacity)
+  {
+    if (!config.verify) { return; }
+    _file = std::make_unique<file_descriptor>(config.file, O_RDONLY);
+    _expected.resize(capacity);
+    cuda_check(cudaMallocHost(&_actual, capacity), "cudaMallocHost(verification)");
+  }
+  ~content_checker()
+  {
+    if (_actual != nullptr) { static_cast<void>(cudaFreeHost(_actual)); }
+  }
+  content_checker(content_checker const&)            = delete;
+  content_checker& operator=(content_checker const&) = delete;
+
+  bool check(void* device, std::size_t size, off_t offset, cudaStream_t stream)
+  {
+    if (_file == nullptr) { return true; }
+    std::size_t read{};
+    while (read < size) {
+      auto const count = ::pread(
+        _file->get(), _expected.data() + read, size - read, offset + static_cast<off_t>(read));
+      if (count < 0 && errno == EINTR) { continue; }
+      if (count <= 0) { throw std::runtime_error("verification reference pread failed"); }
+      read += static_cast<std::size_t>(count);
+    }
+    cuda_check(cudaMemcpyAsync(_actual, device, size, cudaMemcpyDeviceToHost, stream),
+               "cudaMemcpyAsync(verification)");
+    cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize(verification)");
+    return std::memcmp(_actual, _expected.data(), size) == 0;
+  }
+
+ private:
+  std::unique_ptr<file_descriptor> _file;
+  std::vector<std::byte> _expected;
+  void* _actual{};
 };
 
 class file_handle {
@@ -412,6 +491,7 @@ struct measurements {
   std::uint64_t bytes{};
   std::uint64_t completed{};
   std::uint64_t mismatches{};
+  std::uint64_t data_mismatches{};
   std::uint64_t queries{};
   std::uint64_t ready_first_poll{};
   std::uint64_t slow_submits{};
@@ -444,7 +524,8 @@ void warmup_io(cufile_api const& api,
                options const& config,
                std::size_t qd,
                std::size_t op_size,
-               std::size_t slot_stride)
+               std::size_t slot_stride,
+               content_checker& checker)
 {
   // Exercise cuFile's lazy per-stream initialization outside every measured case.
   for (std::size_t operation = 0; operation < qd * config.warmup_ops; ++operation) {
@@ -471,6 +552,13 @@ void warmup_io(cufile_api const& api,
                                " expected=" + std::to_string(op_size) +
                                " actual=" + std::to_string(args.bytes_done));
     }
+    if (!checker.check(static_cast<std::byte*>(arena) + i * slot_stride,
+                       op_size,
+                       args.file_offset,
+                       slot.stream.get())) {
+      throw std::runtime_error("I/O warmup data mismatch: lane=" + std::to_string(i) +
+                               " file_offset=" + std::to_string(args.file_offset));
+    }
   }
 }
 
@@ -481,9 +569,10 @@ bool run_case(cufile_api const& api,
               options const& config,
               std::size_t qd,
               std::size_t op_size,
-              std::size_t slot_stride)
+              std::size_t slot_stride,
+              content_checker& checker)
 {
-  warmup_io(api, file, arena, lanes, config, qd, op_size, slot_stride);
+  warmup_io(api, file, arena, lanes, config, qd, op_size, slot_stride, checker);
   measurements measured;
   std::size_t next_offset{};
   std::size_t inflight{};
@@ -547,6 +636,17 @@ bool run_case(cufile_api const& api,
         ++measured.mismatches;
       } else {
         measured.bytes += op_size;
+        if (!checker.check(static_cast<std::byte*>(arena) + i * slot_stride,
+                           op_size,
+                           slot.args.get().file_offset,
+                           slot.stream.get())) {
+          if (measured.data_mismatches < 5) {
+            std::cerr << "data mismatch after event: lane=" << i
+                      << " file_offset=" << slot.args.get().file_offset
+                      << " buffer_offset=" << slot.args.get().buffer_offset << '\n';
+          }
+          ++measured.data_mismatches;
+        }
       }
       slot.active = false;
       --inflight;
@@ -570,8 +670,8 @@ bool run_case(cufile_api const& api,
             << measured.submit.maximum() << ',' << measured.completion.percentile(0.5) << ','
             << measured.completion.percentile(0.99) << ',' << measured.mismatches << ',' << blocking
             << ',' << measured.slow_submits << ',' << measured.queries << ','
-            << measured.ready_first_poll << std::endl;
-  return measured.mismatches == 0;
+            << measured.ready_first_poll << ',' << measured.data_mismatches << std::endl;
+  return measured.mismatches == 0 && measured.data_mismatches == 0;
 }
 
 void micro_result(std::string_view name, distribution& measured, std::size_t heads = 1)
@@ -716,6 +816,7 @@ void run_microbench()
 
 bool run_io(options const& config)
 {
+  if (config.prepare_file) { prepare_pattern_file(config); }
   auto const* api = cufile_api::get();
   if (api == nullptr) {
     throw std::runtime_error("libcufile.so.0 or required symbols unavailable");
@@ -754,6 +855,7 @@ bool run_io(options const& config)
       registrations.push_back(std::make_unique<buffer_registration>(*api, base, stride));
     }
   }
+  content_checker checker(config, stride);
   std::vector<std::unique_ptr<lane>> lanes;
   for (std::size_t i = 0; i < max_qd; ++i) {
     lanes.push_back(std::make_unique<lane>(api, config.stream_register));
@@ -764,16 +866,19 @@ bool run_io(options const& config)
     << " registration=" << registration_name(config.registration)
     << " stream_registration=" << (config.stream_register && api->has_stream_register)
     << " poll_us=" << config.poll_us << " warmup_ops_per_lane_per_case=" << config.warmup_ops
+    << " verify=" << config.verify
     << " bytes_done_checked=after_event direct_path=unverified\n"
+       "# verification adds D2H and reference-read overhead; --verify 0 for throughput only\n"
        "# sync mode is a single-host-thread serial baseline, not QD concurrent I/O\n"
        "kind,mode,device,registration,qd,op_mib,elapsed_s,completed,gib_per_s,submit_p50_us,"
        "submit_p99_us,submit_max_us,completion_p50_us,completion_p99_us,bytes_done_mismatches,"
-       "blocking_indicator,submits_over_100us,queries,ready_first_poll\n";
+       "blocking_indicator,submits_over_100us,queries,ready_first_poll,data_mismatches\n";
   bool success = true;
   for (auto const op_size : config.op_bytes) {
     for (auto const qd : config.queue_depths) {
       success =
-        run_case(*api, file.get(), arena.get(), lanes, config, qd, op_size, stride) && success;
+        run_case(*api, file.get(), arena.get(), lanes, config, qd, op_size, stride, checker) &&
+        success;
     }
   }
   return success;

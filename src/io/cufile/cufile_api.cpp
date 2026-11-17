@@ -189,22 +189,47 @@ cufile_api const* cufile_api::get() noexcept
   return loaded.api.has_value() ? &*loaded.api : nullptr;
 }
 
-bool cufile_api::open_driver() noexcept
+driver_open_state& driver_open_state::process() noexcept
 {
-  static bool const opened = [] {
-    auto const* api = get();
-    if (api == nullptr) { return false; }
-    auto const status = api->driver_open();
-    if (status.err != CU_FILE_SUCCESS) {
-      CUCASCADE_LOG_WARN("cufile: cuFileDriverOpen failed: {} ({}); GDS fast path disabled",
-                         cufileop_status_error(status.err),
-                         static_cast<int>(status.err));
-      return false;
-    }
-    return true;
-  }();
-  return opened;
+  static auto* const state = new driver_open_state;
+  return *state;
 }
+
+driver_open_state::transaction::~transaction() noexcept
+{
+  if (_state._result.attempted) {
+    _state._outcome.store(_state._result.opened ? 1 : 0, std::memory_order_release);
+  }
+}
+
+bool driver_open_state::open(cufile_api const* api) noexcept
+{
+  auto const outcome = _outcome.load(std::memory_order_acquire);
+  if (outcome >= 0) { return outcome != 0; }
+  auto transaction = acquire();
+  return transaction.open(api).opened;
+}
+
+driver_open_state::result driver_open_state::transaction::open(cufile_api const* api) noexcept
+{
+  if (!_state._result.attempted) {
+    _state._result.attempted = true;
+    if (api != nullptr && api->driver_open != nullptr) {
+      auto const status     = api->driver_open();
+      _state._result.status = status;
+      _state._result.opened =
+        status.err == CU_FILE_SUCCESS || status.err == CU_FILE_DRIVER_ALREADY_OPEN;
+      if (!_state._result.opened) {
+        CUCASCADE_LOG_WARN("cufile: cuFileDriverOpen failed: {} ({}); GDS fast path disabled",
+                           cufileop_status_error(status.err),
+                           static_cast<int>(status.err));
+      }
+    }
+  }
+  return _state._result;
+}
+
+bool cufile_api::open_driver() noexcept { return driver_open_state::process().open(get()); }
 
 int cufile_api::version() noexcept
 {

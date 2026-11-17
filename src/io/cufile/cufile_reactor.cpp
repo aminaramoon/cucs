@@ -24,7 +24,9 @@
 #include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
+#include <cucascade/io/cufile/mount_policy.hpp>
 #include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/io/cufile/runtime.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/object_identity.hpp>
@@ -220,7 +222,8 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
   // Automatic mode registers only when the cuFile driver opened, so a host without
   // libcufile goes straight to POSIX instead of failing a registration per file.
   CUfileHandle_t handle{nullptr};
-  bool const driver_open  = direct && mode != compat::on && cufile_api::open_driver();
+  bool const driver_open =
+    direct && mode != compat::on && runtime::instance().ensure_initialized().driver_opened;
   bool const try_register = direct && (mode == compat::off || driver_open);
   if (try_register) {
     std::string failure;
@@ -773,6 +776,20 @@ cufile_io_object::cufile_io_object(std::string path,
 object_identity cufile_io_object::identity() const
 {
   return _identity ? *_identity : io_object::identity();
+}
+
+mount_identity const& cufile_io_object::mount_identity_info() const
+{
+  std::call_once(_mount_identity_once, [this] {
+    _mount_identity = std::make_unique<mount_identity>(compute_mount_identity(_buffered_fd.get()));
+  });
+  return *_mount_identity;
+}
+
+mount_policy_key cufile_io_object::policy_key(std::string device_uuid,
+                                              std::uint64_t generation) const
+{
+  return make_mount_policy_key(mount_identity_info(), std::move(device_uuid), generation);
 }
 
 cufile_io_object::~cufile_io_object()
