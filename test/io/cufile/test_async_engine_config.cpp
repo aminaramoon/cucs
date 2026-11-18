@@ -48,7 +48,7 @@ TEST_CASE("async engine configuration defaults preserve legacy routing", "[io][c
   CHECK(cfg.unregistered_device_tier);
   CHECK_FALSE(cfg.direct_registered_io);
   CHECK(cfg.stream_register);
-  CHECK(cfg.affinity);
+  CHECK_FALSE(cfg.affinity);
   CHECK(cfg.coalesce);
   CHECK(cfg.coalesce_max_targets == 64);
   CHECK(cfg.submitters_per_device == 1);

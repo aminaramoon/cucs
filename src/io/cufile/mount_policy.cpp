@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "lustre_layout.hpp"
+
 #include <cucascade/io/cufile/async_transport.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
@@ -27,6 +29,7 @@
 #include <rmm/cuda_device.hpp>
 
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <unistd.h>
@@ -107,6 +110,88 @@ bool active(mount_state state)
 }
 }  // namespace
 
+namespace {
+struct file_policy_registry {
+  std::recursive_mutex mutex;
+  struct entry {
+    std::weak_ptr<file_async_policy> weak;
+    file_async_policy* identity{};
+  };
+  std::map<std::pair<std::uint64_t, std::uint64_t>, entry> files;
+};
+file_policy_registry& file_policies()
+{
+  static auto* table = new file_policy_registry;
+  return *table;
+}
+}  // namespace
+
+file_async_policy::~file_async_policy()
+{
+  auto& table = file_policies();
+  std::lock_guard lock(table.mutex);
+  auto found = table.files.find(_identity);
+  if (found != table.files.end() && found->second.identity == this) table.files.erase(found);
+}
+std::shared_ptr<file_async_policy> file_async_policy::get(int fd)
+{
+  struct stat st{};
+  if (::fstat(fd, &st) != 0)
+    throw std::system_error(errno, std::generic_category(), "file async identity");
+  auto const key =
+    std::pair{static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino)};
+  auto& table = file_policies();
+  std::lock_guard lock(table.mutex);
+  auto found = table.files.find(key);
+  if (found != table.files.end())
+    if (auto value = found->second.weak.lock()) return value;
+  auto value       = std::make_shared<file_async_policy>();
+  value->_identity = key;
+  table.files.insert_or_assign(key, file_policy_registry::entry{value, value.get()});
+  return value;
+}
+
+file_geometry discover_file_geometry(int fd,
+                                     std::string const& type,
+                                     file_geometry_hooks const& hooks)
+{
+  file_geometry result;
+  auto const page = hooks.page_size ? hooks.page_size() : ::sysconf(_SC_PAGESIZE);
+  if (page > 0) result.granule = std::max(result.granule, static_cast<std::size_t>(page));
+  struct statfs fs{};
+  auto const rc = hooks.statfs ? hooks.statfs(fd, &fs) : ::fstatfs(fd, &fs);
+  std::optional<std::size_t> alignment;
+  if (hooks.dio_alignment) alignment = hooks.dio_alignment(fd);
+#ifdef STATX_DIOALIGN
+  else {
+    struct statx sx{};
+    if (::statx(fd, "", AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT, STATX_DIOALIGN, &sx) == 0 &&
+        (sx.stx_mask & STATX_DIOALIGN))
+      alignment = std::max(sx.stx_dio_mem_align, sx.stx_dio_offset_align);
+  }
+#endif
+  // f_bsize is preferred transfer geometry, not an O_DIRECT alignment (notably on NFS/GPFS).
+  result.direct_capable = !alignment || *alignment != 0;
+  result.granule        = std::max(result.granule, alignment.value_or(0));
+  if (type == "gpfs" && rc == 0 && fs.f_type == 0x47504653 && fs.f_bsize > 0)
+    result.geometry_bytes = static_cast<std::size_t>(fs.f_bsize);
+  else if (type == "lustre") {
+    result.geometry_bytes = hooks.lustre_stripe ? hooks.lustre_stripe(fd) : 0;
+#ifdef CUCASCADE_HAS_LUSTRE_LAYOUT
+    if (!hooks.lustre_stripe) {
+      result.geometry_bytes = detail::discover_lustre_stripe(
+        fd, result.granule, [](int descriptor, unsigned long request, void* buffer) {
+          return ::ioctl(descriptor, request, buffer);
+        });
+    }
+#endif
+    if (!result.geometry_bytes || result.geometry_bytes % result.granule != 0)
+      result.geometry_bytes = 1UL << 20;
+  } else if (type == "beegfs")
+    result.geometry_bytes = 2UL << 20;
+  return result;
+}
+
 mount_identity compute_mount_identity(int fd) noexcept
 {
   mount_identity result;
@@ -153,7 +238,8 @@ mount_identity compute_mount_identity(int fd) noexcept
       }
       break;
     }
-    result.valid = result.namespace_inode != 0 && result.mount_id != 0;
+    result.geometry = discover_file_geometry(fd, result.fs_type);
+    result.valid    = result.namespace_inode != 0 && result.mount_id != 0;
   } catch (...) {
     result.valid = false;
   }
@@ -187,17 +273,33 @@ std::size_t mount_policy_key_hash::operator()(mount_policy_key const& key) const
 mount_profile profile_for_filesystem(std::string const& type, std::size_t block)
 {
   constexpr std::size_t mib = 1UL << 20;
-  if (type == "ext4" || type == "xfs")
-    return {filesystem_class::local_nvme, {32, 4 * mib}, 0, true};
-  if (type == "gpfs")
-    return {filesystem_class::gpfs, {64, std::clamp(block, mib, 8 * mib)}, block, false};
-  if (type == "wekafs") return {filesystem_class::weka, {64, 2 * mib}, 0, false};
-  // A filesystem name alone cannot distinguish TCP NFS from a qualified RDMA client.
-  // nfs/nfs4/vastnfs keep the conservative unknown profile until transport discovery exists.
-  // TODO: discover Lustre composite layout and BeeGFS per-file chunk geometry via client APIs.
-  if (type == "lustre") return {filesystem_class::lustre, {64, mib}, 0, false};
-  if (type == "beegfs") return {filesystem_class::beegfs, {64, 2 * mib}, 0, false};
-  // Compat is a policy/platform outcome, not a filesystem type.
+  struct row {
+    std::string_view name;
+    mount_profile profile;
+  };
+  // Static starting preferences, NOT hardware-qualified defaults or transport evidence.
+  // Lanes derive from QD as q + ceil(q/4): local=40, network=80, compat=5.
+  static constexpr row profiles[]{
+    {"ext4", {filesystem_class::local_nvme, {32, 4 * mib}, 0, true}},
+    {"xfs", {filesystem_class::local_nvme, {32, 4 * mib}, 0, true}},
+    {"gpfs", {filesystem_class::gpfs, {64, mib}, 0, false}},
+    {"wekafs", {filesystem_class::weka, {64, 2 * mib}, 0, false}},
+    {"nfs", {filesystem_class::nfs_rdma, {64, mib}, 0, false}},
+    {"nfs4", {filesystem_class::nfs_rdma, {64, mib}, 0, false}},
+    {"vastnfs", {filesystem_class::nfs_rdma, {64, mib}, 0, false}},
+    {"nfs-rdma", {filesystem_class::nfs_rdma, {64, mib}, 0, false}},
+    {"lustre", {filesystem_class::lustre, {64, mib}, mib, false}},
+    {"beegfs", {filesystem_class::beegfs, {64, 2 * mib}, 2 * mib, false}},
+    {"compat", {filesystem_class::compat, {4, mib}, 0, false}}};
+  for (auto const& entry : profiles) {
+    if (entry.name != type) continue;
+    auto result = entry.profile;
+    if (result.filesystem == filesystem_class::gpfs) {
+      result.capacity.preferred_op_bytes = std::clamp(block, mib, 8 * mib);
+      result.geometry_bytes              = block;
+    }
+    return result;
+  }
   return {};
 }
 
@@ -232,6 +334,19 @@ mount_override const* select_mount_override(std::vector<mount_override> const& o
     }
   }
   return best;
+}
+
+std::size_t mount_affinity_plan_index(std::vector<mount_override> const& configured,
+                                      mount_override const* selected) noexcept
+{
+  if (!selected || (!selected->nic && selected->cpus.empty())) return 0;
+  std::size_t candidate{};
+  for (auto const& entry : configured) {
+    if (!entry.nic && entry.cpus.empty()) continue;
+    ++candidate;
+    if (entry.match == selected->match && entry.value == selected->value) return candidate;
+  }
+  return 0;
 }
 
 struct single_thread_control_executor::impl {
@@ -322,15 +437,30 @@ mount_policy::mount_policy(mount_policy_key key,
                            policy_now now)
   : _key(std::move(key)),
     _config(std::move(config)),
-    _profile(profile_for_filesystem(identity.fs_type, identity.block_bytes)),
+    _profile(profile_for_filesystem(
+      identity.fs_type,
+      identity.fs_type == "gpfs" ? identity.geometry.geometry_bytes : identity.block_bytes)),
     _executor(std::move(executor)),
     _now(std::move(now)),
     _device_probe_busy(device_probe_budget(_key.device_uuid))
 {
   _config.validate();
+  _profile.granule    = identity.geometry.granule;
+  _network_filesystem = identity.fs_type == "gpfs" || identity.fs_type == "lustre" ||
+                        identity.fs_type == "beegfs" || identity.fs_type == "wekafs" ||
+                        identity.fs_type == "nfs" || identity.fs_type == "nfs4" ||
+                        identity.fs_type == "vastnfs";
+  if (identity.fs_type == "gpfs" || identity.geometry.geometry_bytes)
+    _profile.geometry_bytes = identity.geometry.geometry_bytes;
+  if ((identity.fs_type == "lustre" || identity.fs_type == "beegfs") &&
+      identity.geometry.geometry_bytes)
+    _profile.capacity.preferred_op_bytes =
+      std::clamp(identity.geometry.geometry_bytes, 1UL << 20, 8UL << 20);
   if (!_executor || !_now) throw std::invalid_argument("mount policy: executor and clock required");
   _writes_qualified = _profile.async_write_qualified;
   if (auto const* entry = select_mount_override(_config.mount_overrides, identity)) {
+    if (entry->nic || !entry->cpus.empty()) _affinity_override = entry;
+    if (entry->lanes) _profile.capacity.lane_cap = *entry->lanes;
     if (entry->qd) _profile.capacity.qd = *entry->qd;
     if (entry->op_bytes) _profile.capacity.preferred_op_bytes = *entry->op_bytes;
     switch (entry->state) {
@@ -340,7 +470,14 @@ mount_policy::mount_policy(mount_policy_key key,
         _override_writes   = entry->allow_writes;
         _writes_qualified  = entry->allow_writes;
         break;
-      case mount_override_state::known_compat: _state = mount_state::known_compat; break;
+      case mount_override_state::known_compat:
+        _profile         = profile_for_filesystem("compat");
+        _profile.granule = identity.geometry.granule;
+        if (entry->qd) _profile.capacity.qd = *entry->qd;
+        if (entry->op_bytes) _profile.capacity.preferred_op_bytes = *entry->op_bytes;
+        if (entry->lanes) _profile.capacity.lane_cap = *entry->lanes;
+        _state = mount_state::known_compat;
+        break;
       case mount_override_state::legacy: _override_legacy = true; break;
     }
   }
@@ -841,6 +978,13 @@ mount_policy_registry& mount_policy_registry::instance()
   // Policies may retain quarantined probe resources; never tear them down after CUDA.
   static auto* const registry = new mount_policy_registry;
   return *registry;
+}
+
+std::shared_ptr<mount_policy> mount_policy_registry::find(mount_policy_key const& key) const
+{
+  std::lock_guard lock(_impl->mutex);
+  auto const found = _impl->policies.find(key);
+  return found == _impl->policies.end() ? nullptr : found->second;
 }
 
 std::shared_ptr<mount_policy> mount_policy_registry::get_or_create(

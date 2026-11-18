@@ -70,6 +70,47 @@ class grouped_coordinator final {
  public:
   using error_type = std::variant<std::exception_ptr, cudaError_t, std::error_code>;
 
+  /** Weak registration: retain this token while interested. Callback runs once on the
+   * failing/registering thread, outside coordinator locks; it must be noexcept, nonblocking
+   * and capture only weak backend ownership. Registration after failure fires immediately.
+   * Concurrent token destruction may race an already acquired callback, so weak-lock the
+   * target inside it. Neither the coordinator nor the token keeps a backend alive.
+   */
+  class failure_notification {
+   public:
+    explicit failure_notification(std::function<void()> callback) : _callback(std::move(callback))
+    {
+    }
+    void notify() noexcept
+    {
+      if (!_fired.exchange(true)) {
+        try {
+          _callback();
+        } catch (...) { /* Failure notification cannot throw. */
+        }
+      }
+    }
+
+   private:
+    std::atomic<bool> _fired{false};
+    std::function<void()> _callback;
+  };
+  void register_failure_notification(std::shared_ptr<failure_notification> const& token)
+  {
+    {
+      std::lock_guard lock(_state_mutex);
+      if (should_continue()) {
+        if (_failure_notifications.size() >= _failure_prune_at) {
+          std::erase_if(_failure_notifications, [](auto const& entry) { return entry.expired(); });
+          _failure_prune_at = std::max<std::size_t>(16, _failure_notifications.size() * 2);
+        }
+        _failure_notifications.emplace_back(token);
+        return;
+      }
+    }
+    token->notify();
+  }
+
   grouped_coordinator(std::size_t bytes_requested, std::size_t initial_tasks)
     : _bytes_requested(bytes_requested), _tasks_remaining(initial_tasks)
   {
@@ -143,9 +184,15 @@ class grouped_coordinator final {
         converted = std::current_exception();
       }
 
-      std::lock_guard lock(_state_mutex);
-      assert(_first_exception == nullptr);
-      _first_exception = std::move(converted);
+      std::vector<std::weak_ptr<failure_notification>> notifications;
+      {
+        std::lock_guard lock(_state_mutex);
+        assert(_first_exception == nullptr);
+        _first_exception = std::move(converted);
+        notifications.swap(_failure_notifications);
+      }
+      for (auto const& weak : notifications)
+        if (auto token = weak.lock()) token->notify();
     }
     settle_one();
   }
@@ -220,6 +267,8 @@ class grouped_coordinator final {
   std::atomic<std::size_t> _async_accessors{0};
 
   mutable std::mutex _state_mutex;
+  std::vector<std::weak_ptr<failure_notification>> _failure_notifications;
+  std::size_t _failure_prune_at{16};
   std::exception_ptr _first_exception;
   bool _future_taken{false};
   bool _fulfilled{false};

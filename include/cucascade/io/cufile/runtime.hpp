@@ -33,36 +33,23 @@
 
 namespace cucascade::io::cufile {
 
-/**
- * @brief Typed process requests, frozen even when the library is absent or a request is
- * unsupported.
- *
- * Size limits explicitly use KiB, not bytes. An unset field requests no change, including on
- * repeated calls: omitting a previously requested field is a differing request. This interface
- * does not accept raw cuFile parameter IDs. Production adapters are deliberately empty until
- * Phase 6 supplies compile-time probes for both setter declarations AND their parameter IDs.
- */
-struct process_cufile_parameters {
-  std::optional<bool> allow_compat_mode;
-  std::optional<bool> force_compat_mode;
-  std::optional<std::size_t> max_direct_io_size_kib;
-  std::optional<std::size_t> max_device_pinned_mem_size_kib;
-  std::optional<std::size_t> max_device_cache_size_kib;
-
-  bool operator==(process_cufile_parameters const&) const = default;
-};
-
 enum class process_parameter : std::uint8_t {
   allow_compat_mode,
   force_compat_mode,
   max_direct_io_size_kib,
   max_device_pinned_mem_size_kib,
-  max_device_cache_size_kib
+  max_device_cache_size_kib,
+  rdma_dev_addr_list,
+  rdma_load_balancing_policy,
+  gpu_bounce_buffer_slabs,
+  stats_level,
+  logging_level
 };
 
-using parameter_value = std::variant<bool, std::size_t>;
+using parameter_value =
+  std::variant<bool, std::size_t, std::string, std::vector<std::string>, gpu_bounce_slabs>;
 
-enum class parameter_status : std::uint8_t { applied, unapplied, unverified };
+enum class parameter_status : std::uint8_t { applied, unapplied, unsupported, unverified, differs };
 
 struct parameter_report {
   process_parameter parameter;
@@ -70,6 +57,10 @@ struct parameter_report {
   parameter_status status{parameter_status::unapplied};
   std::string_view reason;
 };
+
+struct parameter_adapter;
+/** @brief Header/ID-checked production adapters; also usable with an injected fake API. */
+[[nodiscard]] parameter_adapter production_parameter_adapter() noexcept;
 
 struct optional_group_report {
   bool async_read{false};
@@ -128,7 +119,7 @@ struct parameter_adapter {
  * Initialization loads/resolves, freezes requests, applies supported setters under the shared
  * driver transaction, opens once, then queries properties/readback before releasing that lock.
  * It never closes the driver and never calls cuFileDriverGetP2PFlags. The legacy entry point
- * joins the same transaction without freezing runtime parameters or enabling an engine.
+ * joins the same transaction, freezing defaults if called first, without enabling an engine.
  */
 class runtime {
  public:
@@ -154,9 +145,9 @@ class runtime {
   /**
    * @brief Initialize once; report every requested setting and retain the first result forever.
    * @throws configuration_error In strict mode, for unapplied settings or ANY differing request.
-   * Accepted setters without matching readback remain unverified, not falsely applied. Strict
-   * mode permits unverified settings, but never rejected/unsupported settings. Strict failure
-   * does not undo initialization, reopen the driver, or unfreeze the first request.
+   * Missing/failed getters leave accepted setters unverified. Contradicting readback is differs.
+   * Strict mode permits unverified, but rejects differs/rejected/unsupported settings. Strict
+   * failure does not undo initialization, reopen the driver, or unfreeze the first request.
    */
   [[nodiscard]] init_report ensure_initialized(process_cufile_parameters const& parameters,
                                                bool strict = false);

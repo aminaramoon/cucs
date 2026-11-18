@@ -94,7 +94,8 @@ struct piece_plan {
                                          std::size_t op_bytes,
                                          std::size_t granule,
                                          std::span<std::size_t const> geometry_boundaries,
-                                         std::size_t file_size)
+                                         std::size_t file_size,
+                                         std::size_t geometry_bytes = 0)
 {
   if (op_bytes == 0 || granule == 0 || op_bytes % granule != 0 || cursor_offset > slice_end ||
       slice_end > static_cast<std::size_t>(std::numeric_limits<off_t>::max())) {
@@ -109,6 +110,10 @@ struct piece_plan {
   auto const boundary =
     std::upper_bound(geometry_boundaries.begin(), geometry_boundaries.end(), cursor_offset);
   if (boundary != geometry_boundaries.end()) { end = std::min(end, *boundary); }
+  if (geometry_bytes)
+    end = std::min(
+      end,
+      io_utils::saturating_add(cursor_offset, geometry_bytes - cursor_offset % geometry_bytes));
   range const logical{cursor_offset, end - cursor_offset};
   return {logical, staged_physical_range(logical, granule, file_size), end == slice_end};
 }

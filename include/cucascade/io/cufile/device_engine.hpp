@@ -20,7 +20,9 @@
 #include <cucascade/io/cufile/file_write_state.hpp>
 #include <cucascade/io/cufile/mount_policy.hpp>
 #include <cucascade/io/cufile/operation.hpp>
+#include <cucascade/io/cufile/topology.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -34,6 +36,13 @@ namespace cucascade::io::cufile {
 
 /** @brief Caller-recorded event and its lifetime proof. Destruction is off the reaper. */
 using engine_fence = submit_fence;
+
+namespace detail {
+[[nodiscard]] inline unsigned io_poll_cap_us(std::chrono::nanoseconds p50, unsigned minimum)
+{
+  return static_cast<unsigned>(std::clamp<std::int64_t>(p50.count() / 8000, minimum, 1000));
+}
+}  // namespace detail
 
 /**
  * @brief One adopted slice credit. Streams MUST already be resolved on the caller thread.
@@ -68,8 +77,10 @@ struct engine_slice {
   io_priority priority{io_priority::high};
   std::shared_ptr<std::atomic<bool>> cancel;
   std::shared_ptr<mount_policy> policy;
+  std::shared_ptr<file_async_policy> file_policy;
   std::size_t granule{4096};
   std::vector<std::size_t> geometry_boundaries;
+  std::size_t geometry_bytes{};  ///< Repeating per-file geometry, without materializing offsets.
 };
 
 /** @brief Log2 nanosecond histogram; bucket 63 includes overflow. */
@@ -81,6 +92,7 @@ struct engine_mount_gauges {
   std::uint64_t mount_id{};
   effective_profile effective;
   std::size_t storage_qd{}, max_storage_qd{}, occupied_lanes{}, max_occupied_lanes{};
+  mount_profile profile;
 };
 struct engine_gauges {
   std::size_t storage_qd{}, max_storage_qd{}, outstanding_slices{}, live_operations{};
@@ -104,8 +116,14 @@ struct engine_gauges {
   std::size_t pinned_write_scratch_pool_bytes{};
   std::uint64_t flush_waits{};  ///< Process-wide inode flush waits, not additive across devices.
   std::uint64_t enqueued_logical_bytes{};  ///< Successful exact targets (writes host-complete).
+  /// Query counts and per-completed-physical-operation breakdown (includes fence hints).
+  std::uint64_t io_queries{}, copy_queries{}, stage_queries{}, fence_hint_queries{};
+  double queries_per_op{}, io_queries_per_op{}, copy_queries_per_op{}, stage_queries_per_op{},
+    fence_hint_queries_per_op{};
   engine_histogram submit, completion, residence, io_poll_delay, copy_poll_delay;
   std::vector<engine_mount_gauges> mounts;
+  affinity_decision reaper_affinity;
+  std::vector<affinity_decision> submitter_affinity;
 };
 
 /**
@@ -116,7 +134,13 @@ struct engine_gauges {
  * never execute inline, and may reject work transiently. Recovery synchronizes OWNED lanes only.
  */
 struct device_engine_options {
+  /// Non-owning facade MUST outlive the engine, including any incomplete drain/quarantine.
+  /// Deferred nonblocking lease returns require this owner to remain live through teardown.
   device_arena* arena{};
+  /// Control-plane discovery injection; defaults use CUDA BDF, /sys and calling cpuset.
+  std::string sysfs_root{"/sys"};
+  std::optional<std::string> gpu_bdf;
+  std::optional<std::vector<int>> permitted_cpus;
   std::shared_ptr<lane_pool> lanes;
   std::shared_ptr<cufile_transport> transport;
   std::shared_ptr<control_executor> control;
@@ -132,6 +156,8 @@ struct device_engine_options {
   std::function<int(io_object const&)> buffered_fd;
   std::function<int(io_object const&)> direct_fd;
   std::shared_ptr<evidence_source> write_evidence;
+  /// EIO is terminal unless a network-FS-specific classifier positively identifies transience.
+  std::function<bool(io_object const&)> transient_network_eio = [](auto const&) { return false; };
   /// Known-progress POSIX write seam (blocking executor only).
   std::function<ssize_t(int, void const*, std::size_t, off_t)> write_at = ::pwrite;
 };

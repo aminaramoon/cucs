@@ -729,7 +729,7 @@ class templated_ioctx : public ioctx {
           }
         }
         detail::resolve_default_streams(slices);
-        if (fence_enabled) _reactors.front()->record_submit_fences(slices);
+        if (fence_enabled) _reactors.front()->record_submit_fences(typed, slices);
       } else {
         detail::resolve_default_streams(slices);
       }

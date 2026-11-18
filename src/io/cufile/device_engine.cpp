@@ -225,6 +225,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     }
     engine_slice slice;
     std::shared_ptr<grouped_coordinator> group;
+    std::shared_ptr<grouped_coordinator::failure_notification> failure_wake;
     mount* owner{};
     std::size_t next{}, active{}, index{};
     std::size_t coalesce_index{std::numeric_limits<std::size_t>::max()};
@@ -232,7 +233,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     std::uint64_t group_id{};
     std::shared_ptr<request_budget> budget;
     bool finished{}, fence_ready{}, publication_visible{};
-    time_point fence_queried{};
+    time_point fence_query_due{};
     [[nodiscard]] bool cancelled() const noexcept
     {
       return (slice.cancel && slice.cancel->load()) || !group->should_continue();
@@ -246,12 +247,16 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     recorded_event event;
     std::uint64_t generation{};
     unsigned delay_us{};
-    time_point started{}, io_observed{};
+    time_point started{}, io_observed{}, retry_at{};
+    unsigned transient_attempts{};
+    int submit_error{};
     grouped_coordinator::error_type error{std::make_error_code(std::errc::io_error)};
     enum class work { none, retry, fallback, check_size, recovery, cleanup } pending{work::none};
     bool fallback{}, cleaning{}, gate_limited{}, retry_after_recovery{};
     bool staged{}, host_copy{}, host_ready{}, buffered_suffix{}, unknown_progress{};
     std::shared_ptr<file_write_state::interval> interval;
+    std::shared_ptr<const io_object> retired_file;
+    std::shared_ptr<void> retired_scratch;
     time_point interval_wait{};
     std::shared_ptr<std::atomic<bool>> interval_ready;
     void* scratch{};
@@ -271,7 +276,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     std::array<std::uint64_t, 2> last_group{}, current_group{};
     std::uint64_t next_group_id{};
     std::array<std::int64_t, 2> deficit{};
-    engine_histogram completion;
+    std::array<engine_histogram, 8> completion;  // read/write x 1/2/4/8 MiB classes.
     evidence_snapshot write_before;
     std::size_t write_completed{};
     std::atomic<bool> refuse{};
@@ -283,7 +288,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     explicit submitter(std::size_t capacity) : registrations(capacity) { mounts.reserve(capacity); }
     detail::engine_ring<mount*> registrations;
     std::vector<mount*> mounts;
-    std::size_t next{};
+    std::size_t next{}, affinity_index{}, active_affinity{static_cast<std::size_t>(-1)};
     notification wake;
     std::thread thread;
     std::atomic<mount*> calling{};
@@ -308,6 +313,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     nanoseconds elapsed{};
     cudaError_t status{cudaSuccess};
     std::shared_ptr<std::vector<mount_capacity_grant>> grants{};
+    int transport_error{};
   };
   struct deadline {
     time_point due;
@@ -356,6 +362,15 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   std::uint64_t backlog_ns{};
   std::shared_ptr<void> write_scratch;
   std::size_t scratch_cell_bytes{};
+  std::vector<lane_lease> lane_returns;
+  std::vector<staging_lease> slot_returns;
+  std::vector<operation*> op_returns;
+  affinity_topology topology;
+  std::vector<affinity_plan> affinity_plans;
+  std::shared_ptr<void> affinity_reservation;
+  mutable std::mutex affinity_mutex;
+  affinity_decision reaper_affinity;
+  std::vector<affinity_decision> submitter_affinity;
 
   impl(int d, async_engine_config cfg, device_engine_options opts)
     : device(d),
@@ -376,6 +391,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       scratch_cell_bytes = write_granule();
       write_scratch      = write_scratch_bank(scratch_cell_bytes * options.lanes->capacity());
     }
+    lane_returns.reserve(nodes.size());
+    slot_returns.reserve(nodes.size());
+    op_returns.reserve(nodes.size());
     free_nodes.reserve(nodes.size());
     active_nodes.reserve(nodes.size());
     target_scratch.reserve(std::max(1U, config.coalesce_max_targets));
@@ -410,8 +428,45 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     std::vector<deadline> heap_storage;
     heap_storage.reserve(nodes.size());
     deadlines = decltype(deadlines)(std::less<deadline>{}, std::move(heap_storage));
-    for (unsigned i = 0; i < config.submitters_per_device; ++i)
+    for (unsigned i = 0; i < config.submitters_per_device; ++i) {
       submitters.push_back(std::make_unique<submitter>(config.max_pending_slices_per_device));
+      submitters.back()->affinity_index = i;
+    }
+    submitter_affinity.resize(submitters.size());
+    reaper_affinity.reason = "affinity disabled";
+    for (auto& value : submitter_affinity)
+      value.reason = "affinity disabled";
+    if (config.affinity && config.mode != engine_mode::legacy) {
+      char bdf[32]{};
+      auto address = options.gpu_bdf;
+      if (!address && cudaDeviceGetPCIBusId(bdf, sizeof(bdf), device) == cudaSuccess) address = bdf;
+      topology = discover_affinity_topology(
+        address.value_or(""), options.sysfs_root, options.permitted_cpus);
+      // Control-plane only. Retired test/generation engines release their core reservations;
+      // incomplete engines retain their impl and therefore keep the reservation alive.
+      static std::mutex placement_mutex;
+      static std::vector<std::pair<std::weak_ptr<void>, std::vector<affinity_cpu>>> reservations;
+      std::lock_guard lock(placement_mutex);
+      std::erase_if(reservations, [](auto const& entry) { return entry.first.expired(); });
+      std::vector<affinity_cpu> used;
+      for (auto const& entry : reservations)
+        used.insert(used.end(), entry.second.begin(), entry.second.end());
+      auto const prior = used.size();
+      affinity_plans.push_back(
+        plan_affinity(topology, config.submitters_per_device, {}, {}, &used));
+      affinity_reservation = std::make_shared<int>(0);
+      reservations.emplace_back(
+        affinity_reservation,
+        std::vector<affinity_cpu>(used.begin() + static_cast<std::ptrdiff_t>(prior), used.end()));
+      reaper_affinity    = affinity_plans.front().reaper;
+      submitter_affinity = affinity_plans.front().submitters;
+      for (auto const& entry : config.mount_overrides) {
+        if (!entry.nic && entry.cpus.empty()) continue;
+        auto mount_used = used;
+        affinity_plans.push_back(plan_affinity(
+          topology, config.submitters_per_device, entry.nic, entry.cpus, &mount_used, false));
+      }
+    }
   }
 
   void start()
@@ -439,8 +494,31 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       std::this_thread::yield();
     wake.notify();
   }
+  void place_submitter(submitter& s, mount_override const* entry = nullptr) noexcept
+  {
+    if (affinity_plans.empty()) return;
+    auto const index = mount_affinity_plan_index(config.mount_overrides, entry);
+    if (s.active_affinity == index) return;
+    try {
+      auto decision = affinity_plans[index].submitters[s.affinity_index];
+      if (s.active_affinity < affinity_plans.size() &&
+          affinity_plans[s.active_affinity].submitters[s.affinity_index].cpu == decision.cpu) {
+        std::lock_guard lock(affinity_mutex);
+        decision.pinned                      = submitter_affinity[s.affinity_index].pinned;
+        submitter_affinity[s.affinity_index] = std::move(decision);
+        s.active_affinity                    = index;
+        return;
+      }
+      apply_thread_affinity(decision, topology.permitted_cpus);
+      std::lock_guard lock(affinity_mutex);
+      submitter_affinity[s.affinity_index] = std::move(decision);
+      s.active_affinity                    = index;
+    } catch (...) { /* Optional placement must never fail I/O. */
+    }
+  }
   void run_submitter(submitter& s) noexcept
   {
+    place_submitter(s);
     auto const device_status = cudaSetDevice(device);
     while (!stop_submitters.load()) {
       mount* m;
@@ -465,6 +543,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
           publish({result_kind::failed, n, n->generation, {}, device_status});
           continue;
         }
+        place_submitter(s, m->policy->affinity_override());
         auto& op = *n->op;
         s.calling.store(m);
         s.calling_node.store(n);
@@ -491,7 +570,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
                  n,
                  n->generation,
                  elapsed,
-                 status});
+                 status,
+                 {},
+                 rc.error});
       }
       if (drained == 8) continue;
       s.wake.wait(20ms);
@@ -536,6 +617,13 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   }
   void dispatch(node& n)
   {
+    auto const& policy = *n.request->slice.file_policy;
+    if (n.op->is_read() ? policy.read_demoted.load() : policy.write_demoted.load()) {
+      n.fallback   = true;
+      n.pending    = node::work::fallback;
+      retry_needed = true;
+      return;
+    }
     if (n.owner->in_io >= n.owner->effective.qd) {
       n.pending = node::work::retry;
       return;
@@ -555,12 +643,27 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     }
     submitters[n.owner->submitter]->wake.notify();
   }
+  engine_histogram& completion_history(node const& n)
+  {
+    auto const bytes = n.op->staging ? n.op->staging->capacity() : n.op->physical.size;
+    auto const cls   = std::min<std::size_t>(
+      3,
+      static_cast<std::size_t>(std::bit_width(std::max<std::size_t>(1, bytes / capacity_mib)) - 1));
+    return n.owner->completion[cls + (n.op->is_read() ? 0 : 4)];
+  }
   void poll_later(node& n, bool first)
   {
     bool const io  = n.event.phase == operation_phase::io_inflight;
-    auto const cap = io ? config.poll.io_cap_us : config.poll.copy_cap_us;
+    auto const p50 = ns(median(completion_history(n)));
+    // Copy events on a cuFile lane may remain pending behind transport work even after
+    // io_ev fires (not just behind the caller fence). Back off those long tails too;
+    // retain the 2-us first copy query and the configured floor for ordinary fast copies.
+    auto const adaptive_cap = detail::io_poll_cap_us(
+      median(completion_history(n)), io ? config.poll.io_cap_us : config.poll.copy_cap_us);
+    auto const cap =
+      io ? adaptive_cap : std::min(adaptive_cap, std::max(250U, config.poll.copy_cap_us));
     if (first) {
-      auto const prediction = ns(median(n.owner->completion)) / 2000;
+      auto const prediction = p50 / 2000;
       n.delay_us =
         io ? static_cast<unsigned>(std::min<std::uint64_t>(std::numeric_limits<unsigned>::max(),
                                                            std::max<std::uint64_t>(10, prediction)))
@@ -584,7 +687,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       ++stats.late_copy_failures;
     n.error = std::move(error);
     n.op->set_phase(operation_phase::draining_error);
-    n.op->lane->quarantine();
+    // The lease itself prevents reuse. Quarantine bookkeeping runs on recovery too.
     n.pending = node::work::recovery;
     ++stats.recoveries;
   }
@@ -665,8 +768,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       fail(n, std::make_error_code(std::errc::io_error));
       return;
     }
-    if (done < 0 && done != -ENOSPC && done != -EACCES && done != -EDQUOT)
-      n.owner->policy->revoke_writes();
+    if (done < 0 && !n.fallback) demote(n, done);
     // Unknown, zero and malformed progress is never replayed.
     if (done <= 0 || static_cast<std::size_t>(done) > op.args.size || n.unknown_progress) {
       n.error = std::make_error_code(std::errc::io_error);
@@ -774,6 +876,23 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     }
     return true;
   }
+  void demote(node& n, ssize_t error)
+  {
+    if (error == -ENOSPC || error == -EACCES || error == -EDQUOT) return;
+    auto& policy = *n.request->slice.file_policy;
+    (n.op->is_read() ? policy.read_demoted : policy.write_demoted).store(true);
+    // Only recognized file-local refusals preserve mount peers. Driver/CUDA codes,
+    // device EIO and unknown failures conservatively trip the mount circuit.
+    bool const file_local = error == -EINVAL || error == -EOPNOTSUPP ||
+                            error == CU_FILE_IO_NOT_SUPPORTED || error == -CU_FILE_IO_NOT_SUPPORTED;
+    if (!file_local) n.owner->policy->open_circuit();
+  }
+  bool transient_read_error(node const& n, ssize_t error) const
+  {
+    return error == -ESTALE || error == -EAGAIN || error == -ETIMEDOUT || error == -ENOTCONN ||
+           (error == -EIO && n.owner->policy->network_filesystem() &&
+            options.transient_network_eio(*n.op->file));
+  }
   void validate(node& n)
   {
     if (!n.op->is_read()) {
@@ -796,10 +915,29 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       return;
     }
     if (done < 0 || static_cast<std::size_t>(done) > op.args.size) {
-      // The I/O event proved quiescence. Retry recoverable backend errors once via sync.
-      // Never feed a negative sync result back into fallback (including pread EINVAL).
-      if (!n.fallback && done < 0 && done != -ENOSPC && done != -EACCES) {
-        n.owner->policy->open_circuit();
+      // Only completed reads may replay. Unknown-progress writes never enter this path.
+      bool const transient = transient_read_error(n, done);
+      if (transient) {
+        if (++n.transient_attempts < 3) {
+          // Bounded exponential backoff with per-operation/generation jitter, no sleep on reaper.
+          auto const base =
+            std::min<std::uint64_t>(1000000, 10000ULL << (n.transient_attempts - 1));
+          auto const jitter = (n.generation * 2654435761ULL + op.physical.offset +
+                               static_cast<std::uint64_t>(ns(n.started.time_since_epoch()))) %
+                              (base / 4 + 1);
+          n.retry_at = options.now() + std::chrono::microseconds(base + jitter);
+          ++stats.retries;
+          op.args.bytes_done = pending_sentinel;
+          n.pending          = n.fallback ? node::work::fallback : node::work::retry;
+          return;
+        }
+        n.error = std::make_error_code(std::errc::io_error);
+        finish(n, false, proof::io_observed);
+        return;
+      }
+      // File-specific refusal must not poison unrelated files on the same mount.
+      if (!n.fallback && done < 0 && done != -ENOSPC && done != -EACCES && done != -EDQUOT) {
+        demote(n, done);
         ++stats.unsupported_fallbacks;
         n.fallback = true;
         n.pending  = node::work::fallback;
@@ -844,7 +982,35 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   {
     auto& n = *d.item;
     if (!n.op || n.generation != d.generation || n.pending != node::work::none) return;
+    if (d.due > options.now()) {
+      deadlines.push(d);
+      return;
+    }
+    if (n.event.phase == operation_phase::copy_inflight && !n.request->fence_ready) {
+      auto& r             = *n.request;
+      auto const now      = options.now();
+      auto const hint_due = r.fence_query_due;
+      if (now < hint_due) {
+        deadlines.push({hint_due, &n, n.generation});
+        return;
+      }
+      r.fence_query_due = now + std::chrono::microseconds(config.poll.fence_hint_us);
+      ++stats.queries;
+      ++stats.fence_hint_queries;
+      r.fence_ready = options.query_event(r.slice.fence->event) != cudaErrorNotReady;
+      if (!r.fence_ready) {
+        deadlines.push(
+          {now + std::chrono::microseconds(config.poll.fence_hint_us), &n, n.generation});
+        return;
+      }
+    }
     ++stats.queries;
+    if (n.event.phase == operation_phase::io_inflight)
+      ++stats.io_queries;
+    else if (n.event.phase == operation_phase::staging_copy)
+      ++stats.stage_queries;
+    else
+      ++stats.copy_queries;
     auto const status = options.query_event(n.event.event);
     if (status == cudaErrorNotReady) {
       poll_later(n, false);
@@ -862,7 +1028,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       token(n, false);
       n.io_observed = options.now();
       sample(stats.completion, n.io_observed - n.started);
-      sample(n.owner->completion, n.io_observed - n.started);
+      sample(completion_history(n), n.io_observed - n.started);
       validate(n);
     } else {
       [[maybe_unused]] bool const observed = n.op->observe_final_event(n.event, status);
@@ -967,6 +1133,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     for (auto* item : active_nodes) {
       auto& n         = *item;
       auto const work = n.pending;
+      if ((work == node::work::retry || work == node::work::fallback) &&
+          n.retry_at > options.now() && !stop.load() && !n.request->cancelled())
+        continue;
       if (work == node::work::retry) {
         if (stop.load() || n.request->cancelled()) {
           n.error = std::make_error_code(std::errc::operation_canceled);
@@ -1006,21 +1175,41 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       bool accepted  = false;
       try {
         if (work == node::work::cleanup) {
+          if (n.op) {
+            // Metadata retirement stays on the reaper. Contention retains ownership and
+            // retries; final file/scratch/interval owners remain on the cleanup executor.
+            if ((n.op->staging && !n.op->staging->try_reset()) ||
+                (n.op->lane && !n.op->lane->try_reset())) {
+              retry_needed = true;
+              continue;
+            }
+            if (n.op->file) n.retired_file = std::move(n.op->file);
+            if (n.op->scratch) n.retired_scratch = std::move(n.op->scratch);
+            n.op->targets.clear();  // Settled credits; every group is still retained by cursors.
+            if (!operation_pool::try_release_empty(*n.op)) {
+              retry_needed = true;
+              continue;
+            }
+            n.op = nullptr;
+            if (n.gate_limited) --n.owner->gated;
+            --n.owner->occupied;
+          }
           accepted = executor->submit([self, p] {
             static_cast<void>(cudaSetDevice(self->device));
-            // P2-R19: ALL final file/input/request/scratch/lane-state releases are off reaper.
             p->interval.reset();
-            auto const index                     = (*p->op->lane)->index();
-            [[maybe_unused]] bool const released = operation_pool::try_release(*p->op);
-            assert(released);
-            static_cast<void>(self->options.lanes->release_quarantined_after_quiescence(index));
+            p->retired_file.reset();
+            p->retired_scratch.reset();
             self->publish({result_kind::cleaned, p, p->generation});
           });
         } else if (work == node::work::recovery) {
           accepted = executor->submit([self, p] {
+            p->op->lane->quarantine();
             auto status = cudaSetDevice(self->device);
             if (status == cudaSuccess)
               status = self->options.synchronize_lane((*p->op->lane)->stream());
+            if (status == cudaSuccess &&
+                !self->options.lanes->replace_after_quiescence(*p->op->lane))
+              status = cudaErrorUnknown;
             self->publish({result_kind::recovered, p, p->generation, {}, status});
           });
         } else if (work == node::work::check_size) {
@@ -1074,7 +1263,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       return;
     }
     auto& n = *value.item;
-    assert(n.op && value.generation == n.generation);
+    assert((n.op || value.kind == result_kind::cleaned) && value.generation == n.generation);
     switch (value.kind) {
       case result_kind::not_submitted:
         ++stats.not_submitted;
@@ -1090,10 +1279,13 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         break;
       case result_kind::submit_failed:
         n.retry_after_recovery = n.op->is_read();
-        n.owner->policy->open_circuit();
+        n.submit_error         = value.transport_error;
+        if (!n.op->is_read() || !transient_read_error(n, n.submit_error)) demote(n, n.submit_error);
         ++stats.unsupported_fallbacks;
         [[fallthrough]];
       case result_kind::failed:
+        // A CUDA device-selection/event-record failure is not an inode refusal.
+        if (value.kind == result_kind::failed) n.owner->policy->open_circuit();
         sample(stats.submit, value.elapsed);
         fail(n, value.status);
         break;
@@ -1132,8 +1324,14 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
           n.op->prove_recovery_quiescence();
           if (n.retry_after_recovery && !stop.load() && !n.request->cancelled()) {
             n.retry_after_recovery = false;
-            n.fallback             = true;
-            n.pending              = node::work::fallback;
+            if (transient_read_error(n, n.submit_error)) {
+              n.op->args.bytes_done = n.submit_error;
+              n.submit_error        = 0;
+              validate(n);
+            } else {
+              n.fallback = true;
+              n.pending  = node::work::fallback;
+            }
           } else
             finish(n, false, proof::lane_synchronized);
         } else {
@@ -1145,13 +1343,11 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
               "cuFile quarantined write pins inode interval: overlapping writes "
               "and flushes cannot complete until process restart");
           }
-          n.op->quarantine();
+          n.op->quarantine(true);
           // Deliberately no credit settlement and no cleanup. Drain must report incomplete.
         }
         break;
       case result_kind::cleaned:
-        if (n.gate_limited) --n.owner->gated;
-        --n.owner->occupied;
         for (auto* target : n.targets)
           --target->active;
         n.targets.clear();
@@ -1360,12 +1556,12 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   bool fence_admissible(cursor& r)
   {
     if (!r.publication_visible) return false;
-    if (!r.fence_ready &&
-        (r.fence_queried == time_point{} ||
-         options.now() - r.fence_queried >= std::chrono::microseconds(config.poll.fence_hint_us))) {
-      r.fence_queried = options.now();
+    if (!r.fence_ready && options.now() >= r.fence_query_due) {
+      r.fence_query_due = options.now() + std::chrono::microseconds(config.poll.fence_hint_us);
       // Hint only: the unconditional lane wait remains the correctness barrier.
-      r.fence_ready = cudaEventQuery(r.slice.fence->event) != cudaErrorNotReady;
+      ++stats.queries;
+      ++stats.fence_hint_queries;
+      r.fence_ready = options.query_event(r.slice.fence->event) != cudaErrorNotReady;
     }
     return r.fence_ready || ((!r.slice.write || r.active == 0) &&
                              r.owner->gated < (r.owner->effective.lanes + 7) / 8);
@@ -1411,7 +1607,14 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       if (r.next >= part.end() || part.empty()) continue;
       auto end = part.end();
       if (part.offset % r.slice.granule == 0 && part.size % r.slice.granule == 0)
-        end = std::min(end, r.next + (op_bytes - r.next % op_bytes));
+        end = range_plan::next_cut(r.next,
+                                   end,
+                                   op_bytes,
+                                   r.slice.granule,
+                                   r.slice.geometry_boundaries,
+                                   end,
+                                   r.slice.geometry_bytes)
+                .logical.end();
       else
         end = std::min(end, r.next + op_bytes);
       range const exact{r.next, end - r.next};
@@ -1424,8 +1627,23 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     admission(bool progress, bool started) : progress(progress), started(started) {}
     bool progress, started;
   };
+  void return_admission(std::optional<lane_lease>& lane,
+                        std::optional<staging_lease>& slot,
+                        operation* op = nullptr)
+  {
+    if (slot && !slot->try_reset()) slot_returns.push_back(std::move(*slot));
+    if (lane && !lane->try_reset()) lane_returns.push_back(std::move(*lane));
+    if (op && !operation_pool::try_release_empty(*op)) op_returns.push_back(op);
+    if (!lane_returns.empty() || !slot_returns.empty() || !op_returns.empty()) retry_needed = true;
+  }
   admission admit_one(mount& m, unsigned tier)
   {
+    // Deferred rollback storage is fixed at bootstrap, even if the arena has more
+    // slots than metadata nodes. Do not acquire another resource when a return queue is full.
+    if (lane_returns.size() == lane_returns.capacity() ||
+        slot_returns.size() == slot_returns.capacity() ||
+        op_returns.size() == op_returns.capacity())
+      return false;
     auto const effective         = m.effective;
     bool const capacity_fallback = effective.qd == 0 && effective.op_bytes != 0;
     if (effective.op_bytes == 0) return false;
@@ -1456,7 +1674,8 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
                                      effective.op_bytes,
                                      r->slice.granule,
                                      r->slice.geometry_boundaries,
-                                     r->slice.file->size());
+                                     r->slice.file->size(),
+                                     r->slice.geometry_bytes);
     } catch (...) {
       r->finished = true;
       static_cast<void>(r->slice.credit.finish_error(std::current_exception()));
@@ -1490,6 +1709,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         ++stats.slot_waits;
         m.slot_wait_since = options.now();
       }
+      return_admission(lane, slot);
       return false;
     }
     if (m.lane_wait_since != time_point{}) {
@@ -1501,7 +1721,10 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       m.slot_wait_since = {};
     }
     auto* op = operations.try_acquire();
-    if (!op) return false;
+    if (!op) {
+      return_admission(lane, slot);
+      return false;
+    }
     // Group only after resource/DRR admission. All target storage was reserved
     // at bootstrap; coalescing cannot allocate or fail unrelated requests.
     try {
@@ -1523,7 +1746,12 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
                  c.slice.merge_gap_bytes == r->slice.merge_gap_bytes &&
                  c.next == c.slice.logical.offset &&
                  c.slice.logical.size < effective.op_bytes / 2 &&
-                 c.slice.geometry_boundaries.empty();
+                 c.slice.geometry_boundaries.empty() &&
+                 c.slice.geometry_bytes == r->slice.geometry_bytes;
+        };
+        auto within_geometry = [&](range physical) {
+          auto const geometry = r->slice.geometry_bytes;
+          return !geometry || physical.offset / geometry == (physical.end() - 1) / geometry;
         };
         auto* primary = r;
         auto grouped  = piece;
@@ -1536,6 +1764,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
           if (!c || !matches(*c)) continue;
           // Same fence: reuse the primary's hint, never query per target.
           if (!seeded) {
+            auto const physical = range_plan::staged_physical_range(
+              c->slice.logical, c->slice.granule, c->slice.file->size());
+            if (!within_geometry(physical)) continue;
             primary          = c;
             targets[0]       = c;
             grouped.logical  = c->slice.logical;
@@ -1554,7 +1785,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
             {grouped.logical.offset, combined_end - grouped.logical.offset},
             r->slice.granule,
             r->slice.file->size());
-          if (physical.size > effective.op_bytes) break;
+          if (physical.size > effective.op_bytes || !within_geometry(physical)) break;
           grouped.physical = physical;
           end              = combined_end;
           gaps += gap;
@@ -1577,7 +1808,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       gaps = 0;
     }
     if (m.deficit[tier] < cost || r->budget->deficit[tier] < cost) {
-      static_cast<void>(operation_pool::try_release(*op));
+      return_admission(lane, slot, op);
       if (m.deficit[tier] < cost)
         m.deficit[tier] += static_cast<std::int64_t>(effective.op_bytes);
       else
@@ -1587,13 +1818,17 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     auto& n = *free;
     free_nodes.pop_back();
     active_nodes.push_back(&n);
-    n.op    = op;
+    n.op = op;
+    ++n.generation;
     n.owner = &m;
     // Caller slice stays owned until all node cleanups have returned.
     n.request              = requests[r->index];
     m.request_next[tier]   = r->index + 1;
     n.fallback             = capacity_fallback;
     n.retry_after_recovery = false;
+    n.retry_at             = {};
+    n.transient_attempts   = 0;
+    n.submit_error         = 0;
     n.staged = n.host_copy = n.host_ready = n.buffered_suffix = n.unknown_progress = false;
     n.interval_wait                                                                = {};
     n.interval_ready.reset();
@@ -1748,10 +1983,20 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     stats.backlog_storage_qd_ns = static_cast<std::uint64_t>(backlog_area);
     stats.backlog_mean_storage_qd =
       backlog_ns == 0 ? 0 : static_cast<double>(backlog_area / backlog_ns);
-    stats.flush_waits = flush_wait_count.load();
+    auto per_op = [&](std::uint64_t count) {
+      return stats.completed_ops
+               ? static_cast<double>(count) / static_cast<double>(stats.completed_ops)
+               : 0.;
+    };
+    stats.queries_per_op            = per_op(stats.queries);
+    stats.io_queries_per_op         = per_op(stats.io_queries);
+    stats.copy_queries_per_op       = per_op(stats.copy_queries);
+    stats.stage_queries_per_op      = per_op(stats.stage_queries);
+    stats.fence_hint_queries_per_op = per_op(stats.fence_hint_queries);
+    stats.flush_waits               = flush_wait_count.load();
     stats.lanes_by_phase.fill(0);
     for (auto const* n : active_nodes)
-      if (!n->cleaning) ++stats.lanes_by_phase[static_cast<std::size_t>(n->op->phase())];
+      if (n->op && !n->cleaning) ++stats.lanes_by_phase[static_cast<std::size_t>(n->op->phase())];
     std::unique_lock lock(snapshot_mutex, std::try_to_lock);
     if (lock.owns_lock()) {
       try {
@@ -1762,7 +2007,8 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
                                   m->in_io,
                                   m->max_io,
                                   m->occupied,
-                                  m->max_occupied});
+                                  m->max_occupied,
+                                  m->policy->base_profile()});
         snapshot = stats;
       } catch (...) { /* Diagnostics must not stop the reaper on host allocation failure. */
       }
@@ -1774,7 +2020,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     if (!m.refuse.load() && !stop.load()) {
       bool const cancellation =
         std::any_of(active_nodes.begin(), active_nodes.end(), [&](auto const* item) {
-          return !item->cleaning && item->owner == &m &&
+          return item->op && !item->cleaning && item->owner == &m &&
                  item->op->phase() == operation_phase::submission_queued &&
                  item->request->cancelled();
         });
@@ -1826,6 +2072,15 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   }
   void run() noexcept
   {
+    if (!affinity_plans.empty()) {
+      try {
+        auto decision = affinity_plans.front().reaper;
+        apply_thread_affinity(decision);
+        std::lock_guard lock(affinity_mutex);
+        reaper_affinity = std::move(decision);
+      } catch (...) { /* Optional placement must never fail I/O. */
+      }
+    }
     static_cast<void>(prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL));
     auto const status = cudaSetDevice(device);
     if (status != cudaSuccess) stop.store(true);
@@ -1834,6 +2089,11 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       retry_needed               = false;
       try {
         account(options.now());
+        std::erase_if(lane_returns, [](auto& lease) { return lease.try_reset(); });
+        std::erase_if(slot_returns, [](auto& lease) { return lease.try_reset(); });
+        std::erase_if(op_returns, [](auto* op) { return operation_pool::try_release_empty(*op); });
+        if (!lane_returns.empty() || !slot_returns.empty() || !op_returns.empty())
+          retry_needed = true;
         accept_requests();
         result value;
         while (completions.pop(value)) {
@@ -1898,12 +2158,17 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
           }
       }
       if (stop.load() && handoffs.load() == 0 && outstanding.load() == 0 && live == 0 &&
-          capacity_active.load() == 0)
+          capacity_active.load() == 0 && lane_returns.empty() && slot_returns.empty() &&
+          op_returns.empty())
         break;
       auto due = options.now() + std::chrono::milliseconds(config.poll.idle_health_ms);
       for (auto const& s : submitters)
         if (s->call_start.load() >= 0) due = std::min(due, options.now() + 1ms);
       if (!deadlines.empty()) due = std::min(due, deadlines.top().due);
+      for (auto const* n : active_nodes)
+        if ((n->pending == node::work::retry || n->pending == node::work::fallback) &&
+            n->retry_at > options.now())
+          due = std::min(due, n->retry_at);
       // Pending capacity/cleanup tasks may have been rejected transiently. Retry without spin.
       // Ordinary backlog waits for completion. Only rejected executor submits need 100 us.
       if (retry_needed) due = std::min(due, options.now() + 100us);
@@ -2039,8 +2304,17 @@ void device_engine::hand_off(engine_slice slice, bool reserved) noexcept
           static_cast<std::size_t>(std::numeric_limits<off_t>::max()) - slice.logical.offset ||
         !std::is_sorted(slice.geometry_boundaries.begin(), slice.geometry_boundaries.end()))
       throw std::invalid_argument("invalid engine_slice");
+    if (!slice.file_policy) {
+      auto const* native = dynamic_cast<cufile_io_object const*>(slice.file.get());
+      slice.file_policy  = native ? native->async_policy() : std::make_shared<file_async_policy>();
+    }
     if (slice.write) slice.write_ticket->state->activate();
-    auto r = std::make_shared<impl::cursor>(std::move(slice));
+    auto r                   = std::make_shared<impl::cursor>(std::move(slice));
+    std::weak_ptr<impl> weak = _impl;
+    r->failure_wake          = std::make_shared<grouped_coordinator::failure_notification>([weak] {
+      if (auto self = weak.lock()) self->wake.notify();
+    });
+    r->group->register_failure_notification(r->failure_wake);
     if (!e.control.push(std::move(r))) {
       e.rejected.fetch_add(1);
       static_cast<void>(
@@ -2081,6 +2355,11 @@ engine_gauges device_engine::gauges() const
   auto result                       = _impl->snapshot;
   result.pinned_write_scratch_bytes = _impl->scratch_cell_bytes * _impl->options.lanes->capacity();
   result.pinned_write_scratch_pool_bytes = write_scratch_allocated_bytes.load();
+  {
+    std::lock_guard affinity_lock(_impl->affinity_mutex);
+    result.reaper_affinity    = _impl->reaper_affinity;
+    result.submitter_affinity = _impl->submitter_affinity;
+  }
   return result;
 }
 device_engine* device_engine::try_get(int device) noexcept
@@ -2112,7 +2391,7 @@ device_engine& device_engine::for_device(int device, async_engine_config const& 
   if (config.mode == engine_mode::legacy)
     throw std::invalid_argument("device_engine bootstrap requires an enabled engine mode");
   auto& rt = runtime::instance();
-  static_cast<void>(rt.ensure_initialized());
+  static_cast<void>(rt.ensure_initialized(config.process_params, config.strict_parameters));
   if (!rt.engine_possible(config.mode) &&
       !(config.async_writes && rt.engine_possible(config.mode, true)))
     throw std::runtime_error("cuFile async engine unavailable");

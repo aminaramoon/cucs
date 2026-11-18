@@ -328,13 +328,47 @@ Promotes open question §9.15 into the plan.
   than repeatedly failing user reads. Terminal ENOSPC/EACCES, malformed counts,
   nonprogress, exhausted short-read retries and file shrink still fail. Negative
   fallback results are terminal; no EINVAL loop is allowed.
-- **Phase 6 error/lifecycle hardening.** Add bounded transient ESTALE-class
-  backoff and finer per-file demotion; Phase 3 uses a single sync fallback instead
-  of replaying async transient errors. Replace an errored CUDA lane rather than
-  reusing it after a successful owned-lane synchronization (§7 #42). Wire
-  per-file granules and geometry boundaries, currently the conservative 4096-byte
-  granule and no explicit geometry boundaries. Extend nonblocking lease-release
-  APIs before moving resource retirement onto the reaper (P3-R15).
+- **Phase 6a error/lifecycle hardening (implemented).** Completed transient reads
+  and read submit errors after owned-lane recovery get at most three attempts,
+  with 10/20 ms exponential backoff and up to 25% per-operation jitter. ESTALE,
+  EAGAIN, ETIMEDOUT and ENOTCONN qualify; EIO additionally requires a network
+  filesystem and a positive injected FS-specific classifier (default false).
+  No pathname reopen and no unknown-progress write replay. Recognized file
+  refusals (EINVAL/EOPNOTSUPP/CU_FILE_IO_NOT_SUPPORTED) demote that inode/direction
+  through a weak, live-handle registry. Other non-transient device/driver/CUDA
+  failures open the mount circuit, as do watchdog/slow-submit failures.
+  Transient matching currently requires negative POSIX errno; raw positive
+  CUfileOpError submits and negative CU_FILE_* completions are not mapped to
+  transient errno. Simulator/seam and errno-producing compat/POSIX coverage is
+  not proof of retry reachability for every real cuFile/client error encoding.
+  Recovery replaces the suspect stream and both events off-reaper before reuse;
+  failed synchronization/replacement retains quarantine. Per-file granules use
+  max(4096, page size, reported STATX_DIOALIGN), or max(4096, page size) when
+  unavailable. A reported zero alignment means no direct I/O (legacy); f_bsize
+  is preferred transfer geometry, never a direct-I/O alignment.
+  GPFS geometry needs validated magic 0x47504653; Lustre uses the optional
+  client ioctl with a maximum-stripe V3-sized buffer, accepting only V1/V3
+  positive granule-multiple stripes, or 1 MiB; BeeGFS uses 2 MiB. Repeating cuts avoid offset-vector growth.
+  Files whose granule cannot be served by every prewarmed slot class stay legacy;
+  so do writes whose granule exceeds the preallocated host cell.
+  Nonblocking metadata-return APIs retain ownership on contention. Acquisition
+  remains lane → slot → operation, with bounded deferred returns on misses.
+  Quiescent lane/slot/op metadata now retires on the reaper; final file, scratch,
+  interval and cursor owners still retire on the independent cleanup executor.
+- **Phase 6a caller fences and sibling failure (P3-R14/R18).** The caller hook
+  receives file identity and consults only already-cached metadata/policies before
+  touching the event pool; it never discovers mountinfo/statx/ioctl geometry or
+  creates a policy on the caller thread. File lookups are hoisted, mount policy
+  is looked up once per device, and exceptions skip the fence (safe legacy).
+  Cold files conservatively record a fence and fan out without coalescing;
+  workers discover metadata/create policy. Warm legacy, known-compat and
+  non-routable paths create/record no fences.
+  Coordinator failure registrations are weak tokens retained by engine cursors.
+  Each token fires at most once, immediately if registered after failure, outside
+  coordinator locks; callbacks must be nonblocking/noexcept and weak-lock their
+  target. An acquired callback may race token destruction. Engine callbacks hold
+  only a weak impl and notify its eventfd, so external sibling cancellation needs
+  no health polling and remains safe after engine retirement/destruction.
 - **Phase 7 CPU/performance qualification (P3-R2/R3).** Phase 3 now uses a free-node
   stack, active-node iteration, constant-time cursor lookup, merged submit results,
   throttled live snapshots, deadline/notification-driven backlog service, and
@@ -367,7 +401,8 @@ Extends AM-6; legacy remains the default. No hardware qualification is implied.
 - **Eligibility and geometry.** Targets must share mount, request, file, device,
   priority, caller stream, fence, PTDS origin, cancellation flag, granule and
   merge-gap setting. They must be unstarted, smaller than `S_eff/2`, and have no
-  explicit geometry boundaries. Offset-sorted targets may share a granule-aligned
+  explicit geometry boundary vectors. Repeating geometry must match; the
+  combined physical window must stay inside one geometry unit. Offset-sorted targets may share a granule-aligned
   window no larger than `S_eff`, with gaps no larger than `merge_gap_size()`,
   within EOF. Only a group of at least two skips the absolute striping grid;
   a singleton retains the ordinary `next_cut` plan. Gaps are read, never copied.
@@ -433,6 +468,17 @@ Extends AM-6; legacy remains the default. No hardware qualification is implied.
 - Required in Phase 6:
   - The I/O-event poll cap becomes `clamp(p50_completion(mount, class) / 8, poll.io_cap_us, 1 ms)`, instead of a fixed 100 µs.
   - A loop wake-up caused by an unrelated ring publication must not re-poll lane heads whose deadline has not arrived.
+  - **Phase 6a measured correction:** on this compat host, copy-event queries,
+    not I/O queries, dominate the old total (about 248 versus 1.7 per op).
+    Copy events can remain pending for milliseconds even with ready input fences.
+    Keep the 2 us first copy query, but apply the same completion-latency-scaled
+    ceiling using `copy_cap_us` as its floor to long-pending copy/stage tails,
+    further limited to max(250 us, configured copy floor) to protect lane residence.
+    This supersedes AM-10's fixed copy maximum; both configured floors validate
+    in [1, 1000] us. Fence hints keep independent absolute deadlines, including
+    clocks starting at epoch zero. Copy events behind an unready input hint wait
+    for its next hint deadline instead of querying the copy every 10 us.
+    Gauges and benchmark CSV split I/O, copy, stage and fence-hint queries.
   - B-1 and B-3 must report `queries_per_op` ≤ 70 on both compat and GDS hosts before the default flips (G-5).
 
 ## AM-16: Async write ordering, failure and pinned budget (Phase 5 review)
@@ -477,8 +523,10 @@ qualification or B-6 acceptance result is implied.
   override; read probes/test promotion never grant writes. Automatic production
   evidence remains unavailable (AM-11), so explicit write override is the only
   production route. Missing evidence revokes automatic writes only, not standing
-  overrides or reads. Independently, negative completions revoke writes even
-  with overrides, logging once; ENOSPC/EACCES/EDQUOT do not demote the mount.
+  overrides or reads. Recognized file-local refusals demote that live inode's
+  write direction even with overrides; ENOSPC/EACCES/EDQUOT do not demote it.
+  Other non-transient device/driver/CUDA failures open the mount circuit.
+  Mount-wide watchdog/evidence policy remains independent.
 - **Progress and completion.** Source reads wait for the caller fence; futures
   are host-complete, not durable. Unknown/zero/negative/oversized progress fails
   without replay and never advances `note_written`. A sentinel requires owned
@@ -510,3 +558,49 @@ qualification or B-6 acceptance result is implied.
   defaults to truncating to zero before each pass; `--flush 1` includes flush
   in timing. CSV records both. Recipes use `/mnt/disk_2` and advisory cache
   eviction. Compat smoke is not GDS evidence.
+
+## AM-17: Phase 6b process parameters, placement and operational profiles
+
+- **AM-10 deferrals consumed.** `process_params`, `strict_parameters` and mount
+  `nic` / `cpus` now have validation and consumers. Explicit process requests
+  initialize during context construction before file registration, including
+  in legacy mode; a default legacy context still does not initialize eagerly.
+  Pre-open setters and getters are individually gated by detected declarations
+  and parameter IDs. Missing RDMA setter IDs in libcufile 1.17 are reported as
+  unsupported, not guessed; versioned JSON examples provide the alternative.
+  Reports distinguish applied, unapplied, unsupported, unverified and differs.
+  Strict mode rejects unapplied/unsupported/conflicting requests and contradicting
+  readback (differs); missing/failed getters remain unverified and are permitted.
+  A no-argument initialization that runs first freezes defaults, so explicit
+  parameters must precede even legacy file opens and resource bootstrap.
+- **P1-R13 ABI.** Optional API function-pointer slots are opaque and unconditional.
+  cuFile config and top-level `io_config` layouts no longer depend on feature
+  detection macros or `CUCASCADE_HAS_CUFILE`. A consumer TU with detection macros
+  undefined statically checks slot layout and compares sizes/alignment with a
+  normally compiled TU/library. The loader still requires baseline CUDA/cuFile
+  SDK types, not optional parameter declarations in consumer headers.
+- **FR-29 placement.** Affinity is explicitly opt-in and now defaults **false**.
+  Control-time sysfs discovery plus the permitted CPU mask plans a GPU-local
+  reaper and NIC-local submitters, preferring same-NUMA NICs and distinct physical
+  cores before SMT. Missing NIC-local CPUs fall back to the GPU node; missing GPU
+  node/core information or an unusable explicit override leaves placement unset.
+  NIC name/BDF and explicit permitted submitter CPU candidates are supported.
+  Only nic/cpus overrides get separate plans; policies resolve selectors against
+  the engine's first configuration, never cross-context positional indices.
+  Retired engines release physical-core reservations; broken NIC symlinks are
+  skipped individually. Discovery uses the bootstrapping thread's permitted mask.
+  Shared submitters apply the selected mount plan on their own thread; the reaper
+  is never moved to a NIC node and application threads are untouched. Gauges
+  report the latest decisions, pin success and reasons. Sysfs root, GPU BDF and
+  permitted CPUs are injectable. Vendor NIC eligibility/reachability/routing,
+  hotplug replanning and shared blocking-scratch first-touch remain unimplemented;
+  CPU placement is not a claim of storage-network routing or GDS qualification.
+- **§4.6 profiles.** The static capacity table now includes NFS/VAST and compat.
+  NFS names select only a preference, not RDMA/direct qualification. Mount
+  overrides may cap lanes as well as QD/op size; fitted profiles remain exposed
+  in engine mount gauges. AM-5's real-GDS size comparison has not run: these are
+  operational starting preferences, not hardware-frozen tuning or G-gate evidence.
+- **Operations.** `docs/io/cufile-reactor.md` is the code-accurate configuration,
+  completion, gauge, troubleshooting and qualification guide. Commented,
+  versioned libcufile templates are under `docs/io/cufile-profiles/`. The default
+  remains legacy; no cuDF implementation or caller assumptions are changed here.

@@ -138,6 +138,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_device_arena.cpp
               io/cufile/test_capacity.cpp
               io/cufile/test_runtime_params.cpp
+              io/cufile/test_parameters_production.cpp
+              io/cufile/test_cufile_abi.cpp
+              io/cufile/test_cufile_abi_reference.cpp
+              io/cufile/test_topology.cpp
+              io/cufile/test_lustre_layout.cpp
               io/cufile/test_lane_pool.cpp
               io/cufile/test_operation.cpp
               io/cufile/test_mount_policy.cpp
@@ -146,7 +151,16 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_engine_write.cpp
               io/cufile/test_engine_failure.cpp
               io/cufile/test_engine_sched.cpp
+              io/cufile/test_engine_hardening.cpp
+              io/cufile/test_phase6_review.cpp
               io/cufile/test_engine_ioctx.cpp)
+    # Compile and exercise the optional Lustre client branch on every cuFile
+    # test build. Only this TU sees the external-UAPI shim; production uses
+    # installed client headers.
+    set_source_files_properties(
+      io/cufile/test_lustre_layout.cpp
+      PROPERTIES INCLUDE_DIRECTORIES
+                 "${CMAKE_CURRENT_SOURCE_DIR}/io/cufile/lustre_shim")
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

@@ -21,14 +21,19 @@
 #include <cucascade/exec/config.hpp>
 #include <cucascade/io/types.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace cucascade::io::cufile {
+
+/// Config/API ABI diagnostic compiled into the cuFile library, not the consumer TU.
+[[nodiscard]] std::array<std::size_t, 6> cufile_config_library_abi_reference() noexcept;
 
 /**
  * @brief Per-file policy for using cuFile.
@@ -48,8 +53,56 @@ enum class mount_match : std::uint8_t { fsid, mount_prefix, fs_type };
 /** @brief An operator's routing decision, never evidence of verified direct I/O. */
 enum class mount_override_state : std::uint8_t { operator_qualified, known_compat, legacy };
 
+/** @brief GPU bounce pool sizes (KiB, ascending multiples of 4) and matching counts. */
+struct gpu_bounce_slabs {
+  std::vector<std::size_t> sizes_kib;
+  std::vector<std::size_t> counts;
+  bool operator==(gpu_bounce_slabs const&) const = default;
+};
+
+/** @brief Typed pre-driver-open process allowlist. Unset means no requested change. */
+struct process_cufile_parameters {
+  std::optional<bool> allow_compat_mode;
+  std::optional<bool> force_compat_mode;
+  std::optional<std::size_t> max_direct_io_size_kib;
+  std::optional<std::size_t> max_device_pinned_mem_size_kib;
+  std::optional<std::size_t> max_device_cache_size_kib;
+  std::optional<std::vector<std::string>> rdma_dev_addr_list;
+  std::optional<std::string> rdma_load_balancing_policy;
+  std::optional<gpu_bounce_slabs> gpu_bounce_buffer_slabs;
+  std::optional<std::size_t> stats_level;
+  std::optional<std::string> logging_level;
+  bool operator==(process_cufile_parameters const&) const = default;
+  void validate() const
+  {
+    auto positive = [](auto const& v) { return !v || *v > 0; };
+    if (!positive(max_direct_io_size_kib) || !positive(max_device_pinned_mem_size_kib) ||
+        !positive(max_device_cache_size_kib))
+      throw std::invalid_argument("cuFile size limits must be positive KiB");
+    for (auto const* text : {&logging_level, &rdma_load_balancing_policy})
+      if (*text && ((*text)->empty() || (*text)->find('\0') != std::string::npos))
+        throw std::invalid_argument("cuFile parameter string must be nonempty and contain no NUL");
+    if (rdma_dev_addr_list) {
+      if (rdma_dev_addr_list->empty()) throw std::invalid_argument("RDMA address list is empty");
+      for (auto const& addr : *rdma_dev_addr_list)
+        if (addr.empty() || addr.find('\0') != std::string::npos)
+          throw std::invalid_argument("RDMA address is empty or contains NUL");
+    }
+    if (gpu_bounce_buffer_slabs) {
+      auto const& v = *gpu_bounce_buffer_slabs;
+      if (v.sizes_kib.empty() || v.sizes_kib.size() != v.counts.size() ||
+          v.sizes_kib.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("GPU bounce slab arrays must have matching positive lengths");
+      for (std::size_t i = 0; i < v.sizes_kib.size(); ++i)
+        if (!v.sizes_kib[i] || v.sizes_kib[i] % 4 || !v.counts[i] ||
+            (i && v.sizes_kib[i] <= v.sizes_kib[i - 1]))
+          throw std::invalid_argument("GPU bounce slabs require ascending 4-KiB sizes and counts");
+    }
+  }
+};
+
 /**
- * @brief Mount routing and optional preferred profile, interpreted by the future policy layer.
+ * @brief Mount routing and optional preferred profile, interpreted by the policy layer.
  *
  * The fsid is an opaque string, keeping the configuration independent of platform fsid types.
  * A mount prefix must already be a normalized absolute path: root is allowed, but trailing
@@ -64,6 +117,9 @@ struct mount_override {
   std::optional<unsigned> qd;
   std::optional<std::size_t> op_bytes;
   bool allow_writes{false};  ///< Explicit write opt-in; qualification is reads-only by default.
+  std::optional<unsigned> lanes{};   ///< Mount lane ceiling, still limited by device capacity.
+  std::optional<std::string> nic{};  ///< RDMA device name or PCI BDF; placement only, not routing.
+  std::vector<int> cpus{};           ///< Permitted submitter CPUs, intersected with process cpuset.
   bool operator==(mount_override const&) const = default;
 };
 
@@ -80,7 +136,9 @@ struct async_engine_config {
   bool unregistered_device_tier{true};
   bool direct_registered_io{false};
   bool stream_register{true};
-  bool affinity{true};
+  bool affinity{false};
+  process_cufile_parameters process_params;
+  bool strict_parameters{false};
   bool coalesce{true};  ///< Engine-only small-slice grouping; legacy routing is unchanged.
   unsigned coalesce_max_targets{64};
 
@@ -120,6 +178,7 @@ struct async_engine_config {
   } demotion;
 
   struct poll_config {
+    /// Floors for latency-adaptive ceilings, bounded above by 1 ms (AM-15).
     unsigned io_cap_us{100};
     unsigned copy_cap_us{10};
     unsigned fence_hint_us{100};
@@ -152,6 +211,7 @@ struct async_engine_config {
       }
     };
 
+    process_params.validate();
     switch (mode) {
       case engine_mode::legacy:
       case engine_mode::async_auto:
@@ -185,8 +245,12 @@ struct async_engine_config {
       throw std::invalid_argument("demotion.cooldown_cap_s must be >= demotion.cooldown_s");
     }
     positive(poll.io_cap_us, "poll.io_cap_us");
+    if (poll.io_cap_us > 1000) throw std::invalid_argument("poll.io_cap_us must be <= 1000");
     positive(poll.copy_cap_us, "poll.copy_cap_us");
+    if (poll.copy_cap_us > 1000) throw std::invalid_argument("poll.copy_cap_us must be <= 1000");
     positive(poll.fence_hint_us, "poll.fence_hint_us");
+    if (poll.fence_hint_us > 1000)
+      throw std::invalid_argument("poll.fence_hint_us must be <= 1000");
     positive(poll.due_events_per_round, "poll.due_events_per_round");
     positive(poll.idle_health_ms, "poll.idle_health_ms");
 
@@ -223,6 +287,12 @@ struct async_engine_config {
       }
       if (entry.allow_writes && entry.state != mount_override_state::operator_qualified)
         throw std::invalid_argument("mount_overrides.allow_writes requires operator_qualified");
+      if (entry.nic && (entry.nic->empty() || entry.nic->find('\0') != std::string::npos ||
+                        entry.nic->find_first_of("/ \t\n\r\f\v") != std::string::npos))
+        throw std::invalid_argument("mount_overrides.nic must be a device name or PCI BDF");
+      for (auto cpu : entry.cpus)
+        if (cpu < 0) throw std::invalid_argument("mount_overrides.cpus must be nonnegative");
+      if (entry.lanes) positive(*entry.lanes, "mount_overrides.lanes");
       if (entry.qd) { positive(*entry.qd, "mount_overrides.qd"); }
       if (entry.op_bytes) { aligned_bytes(*entry.op_bytes, "mount_overrides.op_bytes"); }
       for (std::size_t earlier = 0; earlier < index; ++earlier) {

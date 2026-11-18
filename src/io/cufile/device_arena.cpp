@@ -887,6 +887,29 @@ staging_lease& staging_lease::operator=(staging_lease&& other) noexcept
   return *this;
 }
 
+bool staging_lease::try_reset() noexcept
+{
+  if (!_state) return true;
+  if (_state.use_count() == 1) return false;
+  std::unique_lock lock(_state->mutex, std::try_to_lock);
+  if (!lock) return false;
+  auto& slab       = _state->slabs[_slab];
+  slab.used[_slot] = false;
+  --slab.live;
+  if (slab.live == 0) {
+    slab.borrower.reset();
+    slab.probe = false;
+    if (_state->quota_dirty) _state->progress();
+  }
+  lock.unlock();
+  _state.reset();
+  _data = _base = nullptr;
+  _offset       = 0;
+  _capacity     = 0;
+  _registered   = false;
+  return true;
+}
+
 void staging_lease::reset() noexcept
 {
   if (!_state) { return; }

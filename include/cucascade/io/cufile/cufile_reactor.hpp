@@ -47,6 +47,7 @@
 namespace cucascade::io::cufile {
 
 struct mount_identity;
+struct file_async_policy;
 struct mount_policy_key;
 class mount_policy;
 class device_engine;
@@ -128,6 +129,12 @@ class cufile_io_object final : public io_object {
   /// Resolve descriptor-derived mount metadata once, only when engine routing requests it.
   /// Legacy opens never inspect mountinfo. This does not initialize CUDA or cuFile.
   [[nodiscard]] mount_identity const& mount_identity_info() const;
+  /// Caller-side snapshot only; never performs discovery or waits on call_once.
+  [[nodiscard]] mount_identity const* cached_mount_identity() const noexcept
+  {
+    return _mount_identity_ready.load(std::memory_order_acquire) ? _mount_identity.get() : nullptr;
+  }
+  [[nodiscard]] std::shared_ptr<file_async_policy> async_policy() const;
   [[nodiscard]] mount_policy_key policy_key(std::string device_uuid,
                                             std::uint64_t generation) const;
 
@@ -142,7 +149,9 @@ class cufile_io_object final : public io_object {
   mutable std::once_flag _write_state_once;
   mutable std::shared_ptr<file_write_state> _write_state;
   mutable std::once_flag _mount_identity_once;
+  mutable std::atomic<bool> _mount_identity_ready{false};
   mutable std::unique_ptr<mount_identity> _mount_identity;
+  mutable std::shared_ptr<file_async_policy> _async_policy;
 };
 
 // ---------------------------------------------------------------------------
@@ -304,7 +313,7 @@ class cufile_reactor {
   void start();
 
   [[nodiscard]] bool submit_fence_enabled() const noexcept;
-  void record_submit_fences(std::vector<prepared_io_slice>& slices);
+  void record_submit_fences(cufile_io_object const& file, std::vector<prepared_io_slice>& slices);
   /// Single-reactor batching is allowed only for currently eligible small device reads.
   [[nodiscard]] bool coalescing_candidate(cufile_io_object const& object,
                                           std::span<prepared_io_slice const> slices) const noexcept;

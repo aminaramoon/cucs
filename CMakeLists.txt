@@ -263,11 +263,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
                                  INTERFACE CUCASCADE_USE_ABSEIL_INVOCABLE)
     endif()
 
-    # Gates the cufile backend in io_config and the datasource registry. Carried
-    # on the same INTERFACE target as the definitions above so the io object
-    # library, its installable variants, and installed consumers all agree on
-    # the layout of io_config. libcufile itself is never linked (see
-    # src/io/cufile/cufile_api).
+    # Gates backend implementation/registry availability, not configuration or
+    # loader struct layout. Those layouts are macro-independent. Export detected
+    # capabilities for optional adapters/tests; libcufile itself is never linked
+    # (see src/io/cufile/cufile_api).
     if(CUCASCADE_CUFILE_INCLUDE_DIR)
       include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ConfigureCuFile.cmake)
       target_compile_definitions(

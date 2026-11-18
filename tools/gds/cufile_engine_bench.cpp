@@ -844,16 +844,20 @@ int run(options const& o)
                          : !o.require_direct     ? "test_only_compat"
                          : !o.overrides.empty()  ? "operator_override"
                                                  : "direct_policy";
-  auto cache           = o.drop_cache ? "dontneed_before_each_pass"
-                         : o.verify   ? "verified_warm_uncontrolled"
-                                      : "uncontrolled";
+  std::cerr << "residence_p50_us=" << percentile(subtract(after.residence, before.residence), 50)
+            << " residence_p99_us=" << percentile(subtract(after.residence, before.residence), 99)
+            << '\n';
+  auto cache = o.drop_cache ? "dontneed_before_each_pass"
+               : o.verify   ? "verified_warm_uncontrolled"
+                            : "uncontrolled";
   std::string header =
     "engine,workload,threads,tasks,verify,registration,logical_bytes,seconds,gib_s,mean_qd,backlog_"
     "mean_qd,peak_qd,Q_eff_max,S_eff_max,slot_waits,lane_waits,slot_wait_ns,lane_wait_ns,refill_"
     "gap_ns,"
     "coalesced_ops,coalesced_targets,gap_bytes,async_registered_bytes,async_unregistered_bytes,"
     "sync_bytes,engine_logical_bytes,legacy_bytes,submit_p50_us,submit_p99_us,completion_p50_us,"
-    "completion_p99_us,queries_per_op,open_register_ms,admission,transport,coalesce,qd,op_bytes,"
+    "completion_p99_us,queries_per_op,io_queries_per_op,copy_queries_per_op,stage_queries_per_op,"
+    "fence_hint_queries_per_op,open_register_ms,admission,transport,coalesce,qd,op_bytes,"
     "arena_bytes,pipeline,sync_each,columns,col_dist,cache_state,reactors,passes,min_seconds,"
     "repetitions,chunk_min_bytes,chunk_max_bytes,task_bytes,single_bytes,file_bytes,file,"
     "overrides,libcufile_version,gds_available,compat_only,forced_compat,Q_eff_min,S_eff_min,"
@@ -880,6 +884,21 @@ int run(options const& o)
       << percentile(submit, 50) << ',' << percentile(submit, 99) << ','
       << percentile(completion, 50) << ',' << percentile(completion, 99) << ','
       << (ops ? static_cast<double>(after.queries - before.queries) / static_cast<double>(ops) : 0)
+      << ','
+      << (ops ? static_cast<double>(after.io_queries - before.io_queries) / static_cast<double>(ops)
+              : 0)
+      << ','
+      << (ops ? static_cast<double>(after.copy_queries - before.copy_queries) /
+                  static_cast<double>(ops)
+              : 0)
+      << ','
+      << (ops ? static_cast<double>(after.stage_queries - before.stage_queries) /
+                  static_cast<double>(ops)
+              : 0)
+      << ','
+      << (ops ? static_cast<double>(after.fence_hint_queries - before.fence_hint_queries) /
+                  static_cast<double>(ops)
+              : 0)
       << ',' << open_ms << ',' << admission << ','
       << (o.engine == "simulated" ? "simulator"
           : o.engine == "legacy"  ? "legacy"

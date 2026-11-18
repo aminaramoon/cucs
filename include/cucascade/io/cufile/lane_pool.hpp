@@ -85,6 +85,8 @@ class lane_lease {
 
   void quarantine() noexcept;
   void reset() noexcept;
+  /// Metadata-only try-lock return. A miss leaves this lease intact. Pool facade must be retained.
+  [[nodiscard]] bool try_reset() noexcept;
 
  private:
   friend class lane_pool;
@@ -128,6 +130,9 @@ class lane_pool {
    *       beyond facade destruction rather than deregistering potentially live CUDA work.
    */
   [[nodiscard]] bool release_quarantined_after_quiescence(std::size_t index) noexcept;
+  /// Recovery/control executor only, after synchronization. Replaces a still-leased suspect lane.
+  /// Failure leaves the old quarantine intact; never makes it reusable.
+  [[nodiscard]] bool replace_after_quiescence(lane_lease& lease) noexcept;
 
  private:
   std::shared_ptr<detail::lane_pool_state> _state;

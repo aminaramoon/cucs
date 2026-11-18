@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include <cucascade/io/config.hpp>
 #include <cucascade/io/cufile/runtime.hpp>
 #include <cucascade/log/logging.hpp>
 
@@ -24,6 +25,17 @@
 #include <utility>
 
 namespace cucascade::io::cufile {
+
+std::array<std::size_t, 6> cufile_config_library_abi_reference() noexcept
+{
+  return {sizeof(config),
+          alignof(config),
+          sizeof(async_engine_config),
+          alignof(async_engine_config),
+          sizeof(cucascade::io::io_config),
+          alignof(cucascade::io::io_config)};
+}
+
 namespace {
 
 bool forced_compat_environment() noexcept
@@ -47,6 +59,11 @@ std::string_view parameter_name(process_parameter parameter) noexcept
     case process_parameter::max_direct_io_size_kib: return "max_direct_io_size_kib";
     case process_parameter::max_device_pinned_mem_size_kib: return "max_device_pinned_mem_size_kib";
     case process_parameter::max_device_cache_size_kib: return "max_device_cache_size_kib";
+    case process_parameter::rdma_dev_addr_list: return "rdma_dev_addr_list";
+    case process_parameter::rdma_load_balancing_policy: return "rdma_load_balancing_policy";
+    case process_parameter::gpu_bounce_buffer_slabs: return "gpu_bounce_buffer_slabs";
+    case process_parameter::stats_level: return "stats_level";
+    case process_parameter::logging_level: return "logging_level";
   }
   return "unknown";
 }
@@ -54,7 +71,7 @@ std::string_view parameter_name(process_parameter parameter) noexcept
 std::vector<parameter_report> requested_parameters(process_cufile_parameters const& parameters)
 {
   std::vector<parameter_report> result;
-  result.reserve(5);
+  result.reserve(10);
   auto const add = [&](process_parameter id, auto const& value) {
     if (value.has_value()) {
       result.push_back({id, parameter_value{*value}, parameter_status::unapplied, {}});
@@ -65,6 +82,11 @@ std::vector<parameter_report> requested_parameters(process_cufile_parameters con
   add(process_parameter::max_direct_io_size_kib, parameters.max_direct_io_size_kib);
   add(process_parameter::max_device_pinned_mem_size_kib, parameters.max_device_pinned_mem_size_kib);
   add(process_parameter::max_device_cache_size_kib, parameters.max_device_cache_size_kib);
+  add(process_parameter::rdma_dev_addr_list, parameters.rdma_dev_addr_list);
+  add(process_parameter::rdma_load_balancing_policy, parameters.rdma_load_balancing_policy);
+  add(process_parameter::gpu_bounce_buffer_slabs, parameters.gpu_bounce_buffer_slabs);
+  add(process_parameter::stats_level, parameters.stats_level);
+  add(process_parameter::logging_level, parameters.logging_level);
   return result;
 }
 
@@ -73,7 +95,9 @@ std::vector<parameter_report> requested_parameters(process_cufile_parameters con
 bool init_report::has_unapplied_parameters() const noexcept
 {
   return std::any_of(parameters.begin(), parameters.end(), [](parameter_report const& entry) {
-    return entry.status == parameter_status::unapplied;
+    return entry.status == parameter_status::unapplied ||
+           entry.status == parameter_status::unsupported ||
+           entry.status == parameter_status::differs;
   });
 }
 
@@ -90,7 +114,7 @@ runtime::runtime()
   : _process(true),
     _injected_api(nullptr),
     _driver(driver_open_state::process()),
-    _adapter{},
+    _adapter(production_parameter_adapter()),
     _forced_compat(false)
 {
 }
@@ -130,6 +154,7 @@ runtime& runtime::instance()
 
 void runtime::initialize(process_cufile_parameters const& parameters)
 {
+  parameters.validate();
   // Resolve all optional groups before freezing. Allocate reports before the first setter so
   // an allocation failure cannot partially apply the request and then retry initialization.
   auto const* api           = _provider != nullptr ? _provider(_provider_context)
@@ -151,14 +176,17 @@ void runtime::initialize(process_cufile_parameters const& parameters)
   _report.driver_attempted_before_init = transaction.attempted();
   for (auto& entry : _report.parameters) {
     if (api == nullptr) {
+      entry.status = parameter_status::unsupported;
       entry.reason = "library unavailable";
     } else if (_report.driver_attempted_before_init) {
       entry.reason = "driver opening already attempted; pre-open setting not applied";
     } else if (_adapter.set == nullptr) {
+      entry.status = parameter_status::unsupported;
       entry.reason = "no validated pre-open adapter compiled for this parameter";
     } else {
       switch (_adapter.set(_adapter.context, *api, entry.parameter, entry.requested)) {
         case parameter_adapter::set_result::unsupported:
+          entry.status = parameter_status::unsupported;
           entry.reason = "parameter setter unsupported";
           break;
         case parameter_adapter::set_result::rejected:
@@ -198,7 +226,8 @@ void runtime::initialize(process_cufile_parameters const& parameters)
       switch (_adapter.verify(_adapter.context, *api, entry.parameter, entry.requested)) {
         case parameter_adapter::verification::unavailable: break;
         case parameter_adapter::verification::differs:
-          entry.reason = "setter accepted but readback differs; effective value unverified";
+          entry.status = parameter_status::differs;
+          entry.reason = "setter accepted but readback differs from the requested value";
           break;
         case parameter_adapter::verification::matches:
           entry.status = parameter_status::applied;

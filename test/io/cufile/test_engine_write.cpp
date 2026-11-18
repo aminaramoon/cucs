@@ -267,7 +267,13 @@ TEST_CASE("engine positive write suffix retries aligned or buffers exact remaind
 TEST_CASE("engine nonpositive and unknown write progress never replays", "[cufile][engine][write]")
 {
   if (!has_device()) SKIP("CUDA unavailable");
-  auto const done = GENERATE(ssize_t{0}, ssize_t{-EIO}, pending_sentinel);
+  auto const done = GENERATE(ssize_t{0},
+                             ssize_t{-EIO},
+                             ssize_t{-ESTALE},
+                             ssize_t{-EAGAIN},
+                             ssize_t{-ETIMEDOUT},
+                             ssize_t{-ENOTCONN},
+                             pending_sentinel);
   write_fixture w(mib);
   transport_simulator::fault f;
   f.index = 0;
@@ -671,7 +677,8 @@ TEST_CASE("engine negative write completion revokes even an operator override",
   w.r.start();
   CHECK_THROWS(w.write({0, mib}).get(5s));
   REQUIRE(w.r.engine->drain(5s));
-  CHECK(w.r.policy->write_eligible() == (result != -EOPNOTSUPP));
+  CHECK(w.r.policy->write_eligible());  // File refusal no longer revokes unrelated mount peers.
+  CHECK(w.native->async_policy()->write_demoted.load() == (result == -EOPNOTSUPP));
   CHECK(w.write({0, mib}).get(5s) == mib);
   REQUIRE(w.r.engine->drain(5s));
   CHECK(w.disk(mib) == w.r.image);

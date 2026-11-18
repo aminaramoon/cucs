@@ -53,7 +53,17 @@
     - Tests: 893 cases, 892 passed, 1 skipped. Zero warnings.
     - Lead race loop: 12 of 12 passed.
     - `types.hpp` gained a typed `backend_owner` ticket on slices, so inode write sequencing survives slice splitting.
-  - Phase 6 (polling, deferred hardening, affinity, params, profiles, docs): next
+  - **Phase 6 (polling, hardening, params, affinity, profiles, docs): DONE** (commit follows).
+    - Review: CHANGES REQUESTED (1 BLOCKING, 6 SHOULD, plus NITs). R1-R16 resolved.
+    - Tests: 929 cases, 928 passed, 1 skipped. Zero warnings.
+    - Lead race loop: 10 of 10 passed.
+    - AM-15 polling, compat B-3: `queries_per_op` dropped from 400 to 19.6 (ceiling 70, aspiration 8) at 6.57 GiB/s, mean QD 28.3 (was 24.1).
+    - Added:
+      - process cuFile parameters (typed allowlist, pre-open, strict mode)
+      - opt-in affinity
+      - filesystem profiles and `docs/io/cufile-profiles`
+      - macro-independent ABI
+      - `docs/io/cufile-reactor.md`
   - Phase 7a (non-GDS qualification: runner/analysis tooling, B-10 compat regression, soak, sanitizers, B-1 here): after Phase 6
   - **Phase 4 (coalescing + engine benchmark): DONE**, commit `d11c9de`.
     - Review: no BLOCKING findings; P4-R1 to R18 all fixed.

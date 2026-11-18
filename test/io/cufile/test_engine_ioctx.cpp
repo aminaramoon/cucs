@@ -88,6 +88,15 @@ struct api_fixture {
     binding->generation  = generation.fetch_add(1);
     binding->device_uuid = "ioctx-simulator-0";
     shared->install_engine(0, std::move(binding));
+    // Most tests exercise warm routing. Cold-file discovery is covered separately below.
+    if (!legacy && !posix) {
+      auto const& file = static_cast<cufile_io_object const&>(*object);
+      auto installed   = shared->engine_for_device(0);
+      static_cast<void>(mount_policy_registry::instance().get_or_create(
+        file.policy_key(installed->device_uuid, installed->generation),
+        file.mount_identity_info(),
+        cfg.async_engine));
+    }
     context->start();
   }
   auto read(cudaStream_t stream,
@@ -146,6 +155,8 @@ TEST_CASE("ioctx tiny columns publish together across a multi-reactor context",
   cufile_ioctx context(4, f.shared);
   context.start();
   auto object = context.open_io_object(f.disk.path);
+  // Coalescing consults worker-populated metadata only; a cold file safely fans out.
+  static_cast<void>(static_cast<cufile_io_object const&>(*object).mount_identity_info());
   std::vector<slice> slices;
   auto expected = std::vector<std::byte>(r.bytes, std::byte{0xcc});
   for (std::size_t i = 100; i != 0; --i) {
@@ -494,6 +505,53 @@ TEST_CASE("ioctx engine errors wait for already-enqueued sibling destination cop
   CHECK(cudaStreamQuery(r.stream) == cudaSuccess);
 }
 
+TEST_CASE("cold caller fences do not discover file metadata or create policies",
+          "[cufile][engine][ioctx][hardening]")
+{
+  if (!has_device()) SKIP("CUDA unavailable");
+  api_fixture f;
+  auto cold        = f.context->open_io_object(f.disk.path);
+  auto const& file = static_cast<cufile_io_object const&>(*cold);
+  REQUIRE_FALSE(file.cached_mount_identity());
+  cufile_reactor recorder{f.shared};
+  std::vector<prepared_io_slice> slices;
+  slices.emplace_back(range{0, mib},
+                      device_buffer{static_cast<std::uint8_t*>(f.resources.destination),
+                                    ::cuda::stream_ref{f.resources.stream},
+                                    0});
+  CHECK_NOTHROW(recorder.record_submit_fences(file, slices));
+  CHECK(slices.front().d_buffer.fence);
+  CHECK_FALSE(file.cached_mount_identity());
+  CHECK_FALSE(recorder.coalescing_candidate(file, slices));
+  CHECK_FALSE(file.cached_mount_identity());
+}
+
+TEST_CASE("ioctx skips caller fence records for known compat legacy and non-routable files",
+          "[cufile][engine][ioctx][hardening]")
+{
+  if (!has_device()) SKIP("CUDA unavailable");
+  auto state = GENERATE(mount_override_state::known_compat,
+                        mount_override_state::legacy,
+                        mount_override_state::operator_qualified);
+  api_fixture f(false, false, state);
+  cufile_reactor recorder{f.shared};
+  auto const before = cufile_detail::submit_fence_records_for_testing();
+  std::vector<prepared_io_slice> slices;
+  slices.emplace_back(range{0, mib},
+                      device_buffer{static_cast<std::uint8_t*>(f.resources.destination),
+                                    ::cuda::stream_ref{f.resources.stream},
+                                    0});
+  recorder.record_submit_fences(static_cast<cufile_io_object const&>(*f.object), slices);
+  CHECK(cufile_detail::submit_fence_records_for_testing() - before ==
+        (state == mount_override_state::operator_qualified ? 1 : 0));
+  cufile_io_object unroutable("unregistered", file_descriptor{}, file_descriptor{}, nullptr, mib);
+  slices[0].d_buffer.fence.reset();
+  auto const previous = cufile_detail::submit_fence_records_for_testing();
+  recorder.record_submit_fences(unroutable, slices);
+  CHECK(cufile_detail::submit_fence_records_for_testing() == previous);
+  CHECK_FALSE(slices[0].d_buffer.fence);
+}
+
 TEST_CASE("ioctx engine shares one caller fence per device and resolved stream",
           "[cufile][engine][ioctx]")
 {
@@ -509,7 +567,7 @@ TEST_CASE("ioctx engine shares one caller fence per device and resolved stream",
       range{0, mib},
       device_buffer{static_cast<std::uint8_t*>(r.destination), ::cuda::stream_ref{stream}, 0});
   REQUIRE(recorder.submit_fence_enabled());
-  recorder.record_submit_fences(slices);
+  recorder.record_submit_fences(static_cast<cufile_io_object const&>(*f.object), slices);
   REQUIRE(slices[0].d_buffer.fence);
   CHECK(slices[0].d_buffer.fence == slices[1].d_buffer.fence);
   CHECK(slices[0].d_buffer.fence != slices[2].d_buffer.fence);
@@ -661,7 +719,7 @@ TEST_CASE("ioctx legacy dispatch publishes engine handoffs before blocking",
     range{mib, mib},
     device_buffer{
       static_cast<std::uint8_t*>(r.destination) + mib, ::cuda::stream_ref{cudaStreamLegacy}, 0});
-  worker.record_submit_fences(slices);
+  worker.record_submit_fences(static_cast<cufile_io_object const&>(*f.object), slices);
   slices[1].d_buffer.original_stream_was_null = true;  // Force synchronous legacy.
   REQUIRE(cudaStreamSynchronize(r.stream) == cudaSuccess);
   auto group  = std::make_shared<grouped_coordinator>(mib + 1024, 2);
@@ -696,7 +754,7 @@ TEST_CASE("ioctx coalescing routing preserves legacy mixed and large fan-out",
       range{i * mib, mib},
       device_buffer{
         static_cast<std::uint8_t*>(r.destination) + i * mib, ::cuda::stream_ref{r.stream}, 0});
-  recorder.record_submit_fences(slices);
+  recorder.record_submit_fences(static_cast<cufile_io_object const&>(*f.object), slices);
   auto const& object = static_cast<cufile_io_object const&>(*f.object);
   using io_op_type   = cufile_ioctx::io_op_type;
   CHECK(context.select_reactors(object, slices, io_op_type::host_vector_async, 0).size() == 4);

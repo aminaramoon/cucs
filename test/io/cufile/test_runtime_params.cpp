@@ -242,7 +242,7 @@ TEST_CASE("cuFile runtime diagnoses all unsupported typed requests", "[cufile][r
   REQUIRE(report.parameters.size() == 5);
   CHECK(report.has_unapplied_parameters());
   for (auto const& entry : report.parameters) {
-    CHECK(entry.status == parameter_status::unapplied);
+    CHECK(entry.status == parameter_status::unsupported);
     CHECK_FALSE(entry.reason.empty());
   }
   CHECK_THROWS_AS(context.ensure_initialized(parameters, true), configuration_error);
@@ -285,7 +285,7 @@ TEST_CASE("cuFile missing libraries freeze parameters and retain strict diagnost
     FAIL("strict unsupported request must fail");
   } catch (configuration_error const& error) {
     REQUIRE(error.report().parameters.size() == 1);
-    CHECK(error.report().parameters.front().status == parameter_status::unapplied);
+    CHECK(error.report().parameters.front().status == parameter_status::unsupported);
     CHECK_FALSE(error.report().library_available);
   }
   CHECK(context.generation() == 1);
@@ -309,12 +309,18 @@ TEST_CASE("cuFile accepted setters require matching readback to claim applied", 
   auto const api       = make_api();
   driver_open_state driver;
   runtime context(&api, driver, adapters(library));
-  auto const report = context.ensure_initialized(request(), true);
+  auto const report = context.ensure_initialized(request());
   REQUIRE(report.parameters.size() == 1);
+  auto const differs = verification == parameter_adapter::verification::differs;
   CHECK(report.parameters.front().status ==
         (verification == parameter_adapter::verification::matches ? parameter_status::applied
+         : differs                                                ? parameter_status::differs
                                                                   : parameter_status::unverified));
-  CHECK_FALSE(report.has_unapplied_parameters());
+  CHECK(report.has_unapplied_parameters() == differs);
+  if (differs)
+    CHECK_THROWS_AS(context.ensure_initialized(request(), true), configuration_error);
+  else
+    CHECK_NOTHROW(context.ensure_initialized(request(), true));
 }
 
 TEST_CASE("cuFile setter rejection and missing adapters remain unapplied", "[cufile][runtime]")

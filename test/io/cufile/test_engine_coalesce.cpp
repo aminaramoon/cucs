@@ -64,26 +64,33 @@ TEST_CASE("engine tiny columns coalesce sorted offsets with exact destinations",
           "[cufile][engine][coalesce]")
 {
   if (!has_device()) SKIP("CUDA unavailable");
-  auto const enabled = GENERATE(true, false);
-  auto cfg           = configuration();
-  cfg.coalesce       = enabled;
+  auto const enabled  = GENERATE(true, false);
+  auto const geometry = GENERATE(0UL, 64UL << 10, 8UL << 20);
+  auto cfg            = configuration();
+  cfg.coalesce        = enabled;
   fixture f(mib, cfg);
   f.start();
   auto ranges = columns(100);
   batch b(f, ranges);
+  for (auto& slice : b.slices)
+    slice.geometry_bytes = geometry;
   auto future = b.group->get_future();
   b.publish();
   CHECK(std::move(future).get(5s) == 100 * 1024);
   check_columns(f, ranges);
   REQUIRE(f.engine->drain(5s));
   CHECK(b.group->tasks_remaining() == 0);
-  CHECK(f.transport->snapshot().read_calls == (enabled ? 2 : 100));
+  auto const ops = enabled ? (geometry == 64UL << 10 ? 7 : 2) : 100;
+  CHECK(f.transport->snapshot().read_calls == ops);
+  if (geometry)
+    for (auto const& call : f.transport->submissions())
+      CHECK(call.file_offset / geometry == (call.file_offset + call.size - 1) / geometry);
   CHECK(f.transport->snapshot().copy_calls == 100);
-  REQUIRE(until([&] { return f.engine->gauges().completed_ops == (enabled ? 2 : 100); }));
+  REQUIRE(until([&] { return f.engine->gauges().completed_ops == ops; }));
   auto stats = f.engine->gauges();
-  CHECK(stats.coalesced_ops == (enabled ? 2 : 0));
+  CHECK(stats.coalesced_ops == (enabled ? ops : 0));
   CHECK(stats.coalesced_targets == (enabled ? 100 : 0));
-  CHECK(stats.gap_bytes == (enabled ? 98 * (4096 - 1024) : 0));
+  CHECK(stats.gap_bytes == (enabled ? (100 - ops) * (4096 - 1024) : 0));
 }
 
 TEST_CASE("engine coalescing respects target and physical window limits",

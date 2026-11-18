@@ -21,6 +21,7 @@
 #include <cufile.h>
 
 #include <atomic>
+#include <cstddef>
 #include <mutex>
 #include <optional>
 
@@ -106,44 +107,23 @@ struct cufile_api {
    */
   [[nodiscard]] static int version() noexcept;
 
-  // Keep header-dependent members last so the common entry-point and capability offsets stay
-  // stable. All TUs still need matching CUCASCADE_CUFILE_HAS_* definitions and compatible headers:
-  // a stable prefix does not make differently configured struct definitions ODR-safe.
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERSIZET
-  decltype(&cuFileSetParameterSizeT) set_parameter_size_t{nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERBOOL
-  decltype(&cuFileSetParameterBool) set_parameter_bool{nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERSTRING
-  decltype(&cuFileSetParameterString) set_parameter_string{nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERSIZET
-  decltype(&cuFileGetParameterSizeT) get_parameter_size_t{nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERBOOL
-  decltype(&cuFileGetParameterBool) get_parameter_bool{nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERSTRING
-  decltype(&cuFileGetParameterString) get_parameter_string{nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERMINMAXVALUE
-  decltype(&cuFileGetParameterMinMaxValue) get_parameter_min_max_value{nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERPOSIXPOOLSLABARRAY
-  decltype(&cuFileSetParameterPosixPoolSlabArray) set_parameter_posix_pool_slab_array{nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERPOSIXPOOLSLABARRAY
-  decltype(&cuFileGetParameterPosixPoolSlabArray) get_parameter_posix_pool_slab_array{nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILESETPARAMETERGPUBOUNCEBUFFERSLABARRAY
-  decltype(&cuFileSetParameterGpuBounceBufferSlabArray) set_parameter_gpu_bounce_buffer_slab_array{
-    nullptr};
-#endif
-#ifdef CUCASCADE_CUFILE_HAS_CUFILEGETPARAMETERGPUBOUNCEBUFFERSLABARRAY
-  decltype(&cuFileGetParameterGpuBounceBufferSlabArray) get_parameter_gpu_bounce_buffer_slab_array{
-    nullptr};
-#endif
+  // ABI slots are unconditional, even with no optional declarations/detection macros.
+  // Only implementation adapters cast these back to a header-validated exact signature.
+  using opaque_function = void (*)();
+  opaque_function set_parameter_size_t{nullptr};
+  opaque_function set_parameter_bool{nullptr};
+  opaque_function set_parameter_string{nullptr};
+  opaque_function get_parameter_size_t{nullptr};
+  opaque_function get_parameter_bool{nullptr};
+  opaque_function get_parameter_string{nullptr};
+  opaque_function get_parameter_min_max_value{nullptr};
+  opaque_function set_parameter_posix_pool_slab_array{nullptr};
+  opaque_function get_parameter_posix_pool_slab_array{nullptr};
+  opaque_function set_parameter_gpu_bounce_buffer_slab_array{nullptr};
+  opaque_function get_parameter_gpu_bounce_buffer_slab_array{nullptr};
+
+  /// Layout fingerprint from the compiled library, for cross-detection consumer tests.
+  [[nodiscard]] static std::size_t abi_size() noexcept;
 };
 
 /**

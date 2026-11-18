@@ -58,6 +58,9 @@ struct lane_pool_state {
   };
 
   lane_pool_state(int device, async_engine_config const& config, cufile_api const* api)
+    : device(device),
+      register_stream(config.stream_register),
+      api(api ? std::optional<cufile_api>(*api) : std::nullopt)
   {
     config.validate();
     if (config.mode == engine_mode::legacy) {
@@ -74,8 +77,16 @@ struct lane_pool_state {
     }
   }
 
+  int device;
+  bool register_stream;
+  std::optional<cufile_api> api;
   std::mutex mutex;
   std::vector<entry> lanes;
+
+  std::unique_ptr<lane> replacement(std::size_t index)
+  {
+    return std::unique_ptr<lane>(new lane(device, index, register_stream, api ? &*api : nullptr));
+  }
   std::vector<std::size_t> free;
   std::size_t quarantine_count{0};
   // A returned quarantine must not destroy or deregister resources during facade teardown.
@@ -178,6 +189,44 @@ void lane_lease::reset() noexcept
     entry.leased = false;
     if (!entry.quarantined) state->free.push_back(_lane->index());
     _lane = nullptr;
+  }
+}
+
+bool lane_lease::try_reset() noexcept
+{
+  if (!_lane) return true;
+  // Never destroy a final external owner on the reaper.
+  if (_state.use_count() == 1) return false;
+  std::unique_lock lock(_state->mutex, std::try_to_lock);
+  if (!lock) return false;
+  auto& entry = _state->lanes[_lane->index()];
+  assert(entry.leased);
+  entry.leased = false;
+  if (!entry.quarantined) _state->free.push_back(_lane->index());
+  _lane = nullptr;
+  lock.unlock();
+  _state.reset();
+  return true;
+}
+
+bool lane_pool::replace_after_quiescence(lane_lease& lease) noexcept
+{
+  if (!lease || lease._state != _state) return false;
+  try {
+    auto replacement = _state->replacement(lease->index());
+    {
+      std::lock_guard lock(_state->mutex);
+      auto& entry = _state->lanes[lease->index()];
+      if (!entry.leased || !entry.quarantined) return false;
+      entry.resource.swap(replacement);
+      lease._lane       = entry.resource.get();
+      entry.quarantined = false;
+      if (--_state->quarantine_count == 0) _state->quarantine_owner.reset();
+    }
+    // cuFile deregistration and all CUDA destruction are outside the pool mutex/reaper.
+    return true;
+  } catch (...) {
+    return false;
   }
 }
 

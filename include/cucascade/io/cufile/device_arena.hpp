@@ -153,6 +153,8 @@ class staging_lease {
   [[nodiscard]] std::size_t capacity() const noexcept { return _capacity; }
   [[nodiscard]] bool registered() const noexcept { return _registered; }
   void reset() noexcept;
+  /// Nonblocking metadata return. Miss leaves ownership intact; retain the arena facade.
+  [[nodiscard]] bool try_reset() noexcept;
 
  private:
   friend class device_arena;

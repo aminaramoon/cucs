@@ -792,9 +792,19 @@ object_identity cufile_io_object::identity() const
 mount_identity const& cufile_io_object::mount_identity_info() const
 {
   std::call_once(_mount_identity_once, [this] {
-    _mount_identity = std::make_unique<mount_identity>(compute_mount_identity(_buffered_fd.get()));
+    auto identity   = std::make_unique<mount_identity>(compute_mount_identity(_buffered_fd.get()));
+    auto policy     = file_async_policy::get(_buffered_fd.get());
+    _mount_identity = std::move(identity);
+    _async_policy   = std::move(policy);
+    _mount_identity_ready.store(true, std::memory_order_release);
   });
   return *_mount_identity;
+}
+
+std::shared_ptr<file_async_policy> cufile_io_object::async_policy() const
+{
+  static_cast<void>(mount_identity_info());
+  return _async_policy;
 }
 
 mount_policy_key cufile_io_object::policy_key(std::string device_uuid,
@@ -815,6 +825,16 @@ cufile_io_object::~cufile_io_object()
 
 // Caller-side event pool. Last users return metadata only; CUDA events live for the process.
 namespace {
+std::atomic<std::uint64_t> submit_fence_records{};
+
+bool supports_file_granule(device_arena const& arena, std::size_t granule)
+{
+  auto const mask = arena.available_class_mask();
+  for (unsigned i = 0; i < 4; ++i)
+    if ((mask & (1U << i)) && class_bytes(static_cast<slot_class>(i)) % granule != 0) return false;
+  return mask != 0;
+}
+
 class submit_event_pool {
  public:
   static submit_event_pool& instance()
@@ -844,6 +864,7 @@ class submit_event_pool {
       }
     });
     CUCASCADE_CUDA_TRY(cudaEventRecord(event, stream));
+    submit_fence_records.fetch_add(1, std::memory_order_relaxed);
     return std::make_shared<submit_fence>(submit_fence{event, std::move(owner)});
   }
 
@@ -852,6 +873,11 @@ class submit_event_pool {
   std::map<int, std::vector<cudaEvent_t>> free;
 };
 }  // namespace
+
+std::uint64_t detail::submit_fence_records_for_testing() noexcept
+{
+  return submit_fence_records.load(std::memory_order_relaxed);
+}
 
 void cufile_reactor::reactor_context::install_engine(int device,
                                                      std::shared_ptr<engine_binding> binding)
@@ -952,33 +978,78 @@ bool cufile_reactor::submit_fence_enabled() const noexcept
   return _ctx->has_simulated_engine();
 }
 
-void cufile_reactor::record_submit_fences(std::vector<prepared_io_slice>& slices)
+void cufile_reactor::record_submit_fences(cufile_io_object const& file,
+                                          std::vector<prepared_io_slice>& slices)
 {
+  if (_config.async_engine.mode == engine_mode::legacy || !file.cufile_registered() ||
+      file.direct_fd() < 0)
+    return;
   struct recorded {
     int device;
     cudaStream_t stream;
     std::shared_ptr<submit_fence> fence;
   };
   std::vector<recorded> events;
+  auto const* identity = file.cached_mount_identity();
+  std::shared_ptr<file_async_policy> file_policy;
+  try {
+    if (identity) file_policy = file.async_policy();
+  } catch (...) {
+    return;  // Optional routing metadata must never fail the user's I/O.
+  }
+  struct device_route {
+    int device;
+    bool allowed;
+  };
+  std::vector<device_route> routes;
   for (auto& slice : slices) {
     if (!slice.has_device_request() || slice.has_host_request() ||
         (slice.is_write() ? !_config.async_engine.async_writes
                           : !_config.async_engine.async_reads) ||
         slice.on_complete || (!slice.is_write() && slice.d_buffer.original_stream_was_null))
       continue;
-    _ctx->ensure_engine(slice.d_buffer.device_id);
-    if (!_ctx->engine_for_device(slice.d_buffer.device_id)) continue;
-    auto& buffer      = slice.d_buffer;
-    auto const stream = buffer.stream.get();
-    auto found        = std::find_if(events.begin(), events.end(), [&](auto const& event) {
-      return event.device == buffer.device_id && event.stream == stream;
-    });
-    if (found == events.end()) {
-      auto fence = submit_event_pool::instance().record(buffer.device_id, stream);
-      events.push_back({buffer.device_id, stream, fence});
-      buffer.fence = std::move(fence);
-    } else {
-      buffer.fence = found->fence;
+    try {
+      _ctx->ensure_engine(slice.d_buffer.device_id);
+      auto binding = _ctx->engine_for_device(slice.d_buffer.device_id);
+      if (!binding || !binding->engine->ready() ||
+          (slice.is_write() && !binding->engine->accepts_writes()))
+        continue;
+      if (identity) {
+        auto const granule = identity->geometry.granule;
+        if (!identity->geometry.direct_capable ||
+            !supports_file_granule(*binding->arena, granule) ||
+            (slice.is_write() && granule > write_granule()) ||
+            (slice.is_write() ? file_policy->write_demoted.load()
+                              : file_policy->read_demoted.load()))
+          continue;
+        auto found = std::find_if(routes.begin(), routes.end(), [&](auto const& route) {
+          return route.device == slice.d_buffer.device_id;
+        });
+        if (found == routes.end()) {
+          auto policy = mount_policy_registry::instance().find(
+            make_mount_policy_key(*identity, binding->device_uuid, binding->generation));
+          bool const allowed = policy ? policy->may_record_fence() : true;
+          routes.push_back({slice.d_buffer.device_id, allowed});
+          if (!allowed) continue;
+        } else if (!found->allowed)
+          continue;
+      }
+      // A cold file records conservatively. Only the reactor worker discovers mountinfo,
+      // statx/ioctl geometry and creates policies. A skipped fence can never route to the engine.
+      auto& buffer      = slice.d_buffer;
+      auto const stream = buffer.stream.get();
+      auto found        = std::find_if(events.begin(), events.end(), [&](auto const& event) {
+        return event.device == buffer.device_id && event.stream == stream;
+      });
+      if (found == events.end()) {
+        auto fence = submit_event_pool::instance().record(buffer.device_id, stream);
+        events.push_back({buffer.device_id, stream, fence});
+        buffer.fence = std::move(fence);
+      } else {
+        buffer.fence = found->fence;
+      }
+    } catch (...) {
+      continue;  // Skipping the fence safely forces legacy, including allocation failures.
     }
   }
 }
@@ -1004,11 +1075,11 @@ bool cufile_reactor::coalescing_candidate(cufile_io_object const& object,
   auto binding = _ctx->engine_for_device(device);
   if (!small || !binding || !binding->engine->ready()) return false;
   try {
-    auto policy = mount_policy_registry::instance().get_or_create(
-      object.policy_key(binding->device_uuid, binding->generation),
-      object.mount_identity_info(),
-      _config.async_engine);
-    return policy->read_eligible();
+    auto const* identity = object.cached_mount_identity();
+    if (!identity) return false;
+    auto policy = mount_policy_registry::instance().find(
+      make_mount_policy_key(*identity, binding->device_uuid, binding->generation));
+    return policy && policy->read_eligible();
   } catch (...) {
     return false;
   }
@@ -1046,6 +1117,12 @@ cufile_reactor::engine_route_result cufile_reactor::engine_route(
       (slice.is_write() && !binding->engine->accepts_writes()))
     return {};
   try {
+    auto file_policy = file->async_policy();
+    if (!file->mount_identity_info().geometry.direct_capable ||
+        !supports_file_granule(*binding->arena, file->mount_identity_info().geometry.granule) ||
+        (slice.is_write() ? file_policy->write_demoted.load() : file_policy->read_demoted.load()) ||
+        (slice.is_write() && file->mount_identity_info().geometry.granule > write_granule()))
+      return {};
     auto policy = mount_policy_registry::instance().get_or_create(
       file->policy_key(binding->device_uuid, binding->generation),
       file->mount_identity_info(),
@@ -1056,6 +1133,7 @@ cufile_reactor::engine_route_result cufile_reactor::engine_route(
     probe.transport = binding->transport;
     probe.device    = slice.d_buffer.device_id;
     probe.simulated = binding->simulated;
+    probe.granule   = file->mount_identity_info().geometry.granule;
     // A request that triggers qualification stays legacy even if the control task
     // finishes while this worker is preempted inside ensure_probe.
     if (slice.is_write() && !binding->simulated &&
@@ -1103,10 +1181,15 @@ cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx, std::string
     static_cast<void>(_requests.enqueue(nullptr, io_priority::high));
   };
   _config = _ctx->cfg();
-  if (_config.async_engine.mode != engine_mode::legacy) {
+  if (_config.async_engine.mode != engine_mode::legacy ||
+      _config.async_engine.process_params != process_cufile_parameters{} ||
+      _config.async_engine.strict_parameters) {
     _config.async_engine.validate();
-    _engine_outstanding = std::make_shared<engine_admission>();
+    std::ignore = runtime::instance().ensure_initialized(_config.async_engine.process_params,
+                                                         _config.async_engine.strict_parameters);
   }
+  if (_config.async_engine.mode != engine_mode::legacy)
+    _engine_outstanding = std::make_shared<engine_admission>();
   if (_config.max_inflight == 0) {
     throw std::invalid_argument("cufile_reactor: max_inflight must be non-zero");
   }
@@ -1412,7 +1495,9 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
       adopted.merge_gap_bytes          = _config.merge_gap_size();
       adopted.write                    = slice.is_write();
       adopted.write_ticket             = slice.backend_owner;
-      adopted.granule                  = slice.is_write() ? write_granule() : 4096;
+      adopted.granule                  = file->mount_identity_info().geometry.granule;
+      adopted.geometry_bytes           = file->mount_identity_info().geometry.geometry_bytes;
+      adopted.file_policy              = file->async_policy();
       adopted.logical                  = slice.rng;
       adopted.user_ptr                 = slice.d_buffer.data;
       adopted.device_id                = slice.d_buffer.device_id;

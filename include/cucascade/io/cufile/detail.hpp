@@ -36,6 +36,8 @@
 
 namespace cucascade::io::cufile::detail {
 
+[[nodiscard]] std::uint64_t submit_fence_records_for_testing() noexcept;
+
 /// Lease a portable 16 MiB scratch; return to the process pool, never cudaFreeHost.
 [[nodiscard]] std::shared_ptr<void> lease_pinned_scratch();
 

@@ -183,6 +183,8 @@ std::optional<cufile_api> cufile_api::resolve_symbols(symbol_resolver resolver,
   return api;
 }
 
+std::size_t cufile_api::abi_size() noexcept { return sizeof(cufile_api); }
+
 cufile_api const* cufile_api::get() noexcept
 {
   auto const& loaded = library();

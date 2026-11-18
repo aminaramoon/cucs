@@ -272,7 +272,8 @@ TEST_CASE("engine adaptive event polling backs off beneath configured caps",
   CHECK(stats.copy_poll_delay.buckets[14] > 0);  // 10 us cap.
   for (std::size_t i = 18; i < 64; ++i)
     CHECK(stats.io_poll_delay.buckets[i] == 0);
-  for (std::size_t i = 15; i < 64; ++i)
+  // Long-pending copy tails share the latency-scaled ceiling (AM-15 hardening).
+  for (std::size_t i = 21; i < 64; ++i)
     CHECK(stats.copy_poll_delay.buckets[i] == 0);
   CHECK(stats.queries >= 10);
 }

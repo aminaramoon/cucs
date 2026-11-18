@@ -307,11 +307,11 @@ class operation {
     _final_event = false;
   }
 
-  void quarantine() noexcept
+  void quarantine(bool lane_already_quarantined = false) noexcept
   {
     mark_work_started();
     _phase = operation_phase::quarantined;
-    if (lane) lane->quarantine();
+    if (lane && !lane_already_quarantined) lane->quarantine();
   }
 
   [[nodiscard]] bool can_retire() const noexcept { return _quiescent && !holds_qd_token; }
@@ -446,6 +446,30 @@ class operation_pool {
       state->free.push_back(index);
       if (--state->in_use == 0) state->live_owner.reset();
     }
+    return true;
+  }
+
+  /// Nonblocking recycle after final external owners/settled credits were detached.
+  /// A miss changes nothing. Pool facade must remain alive on the calling thread.
+  [[nodiscard]] static bool try_release_empty(operation& op) noexcept
+  {
+    auto state = op._pool.lock();
+    if (!state) return false;
+    std::unique_lock lock(state->mutex, std::try_to_lock);
+    if (!lock || !op._allocated || op._releasing || !op.can_retire() || op.file || op.input ||
+        op.request || op.direct || op.scratch || (op.lane && *op.lane) ||
+        (op.staging && *op.staging) || op.targets.size())
+      return false;
+    auto const index      = op._index;
+    auto const generation = op._event_generation;
+    operation_targets storage;
+    op.targets.swap_storage(storage);
+    std::destroy_at(&op);
+    std::construct_at(&op);
+    op.targets.swap_storage(storage);
+    op._event_generation = generation;
+    state->free.push_back(index);
+    if (--state->in_use == 0) state->live_owner.reset();
     return true;
   }
 

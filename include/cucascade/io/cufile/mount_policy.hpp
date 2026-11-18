@@ -21,6 +21,8 @@
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/device_arena.hpp>
 
+#include <sys/vfs.h>
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -37,6 +39,30 @@ class cufile_io_object;
 class cufile_transport;
 
 /** @brief Descriptor-derived identity; discovery never initializes CUDA/cuFile. */
+struct file_async_policy {
+  [[nodiscard]] static std::shared_ptr<file_async_policy> get(int fd);
+  ~file_async_policy();
+  std::atomic<bool> read_demoted{false}, write_demoted{false};
+
+ private:
+  std::pair<std::uint64_t, std::uint64_t> _identity{};
+};
+
+struct file_geometry {
+  std::size_t granule{4096}, geometry_bytes{};
+  bool direct_capable{true};
+};
+struct file_geometry_hooks {
+  std::function<long()> page_size;
+  std::function<int(int, struct statfs*)> statfs;
+  /// nullopt: unavailable; zero: reported no direct I/O; otherwise max(memory, offset alignment).
+  std::function<std::optional<std::size_t>(int)> dio_alignment;
+  std::function<std::size_t(int)> lustre_stripe;
+};
+[[nodiscard]] file_geometry discover_file_geometry(int fd,
+                                                   std::string const& fs_type,
+                                                   file_geometry_hooks const& hooks = {});
+
 struct mount_identity {
   std::uint64_t namespace_inode{};
   std::uint64_t mount_id{};
@@ -47,6 +73,7 @@ struct mount_identity {
   std::string fs_type;
   std::size_t block_bytes{};
   bool valid{false};
+  file_geometry geometry;
 };
 struct mount_policy_key {
   std::uint64_t namespace_inode{};
@@ -91,11 +118,16 @@ struct mount_profile {
   std::size_t geometry_bytes{};
   /// Network client/version qualification is deliberately false until externally qualified.
   bool async_write_qualified{false};
+  std::size_t granule{4096};
 };
 [[nodiscard]] mount_profile profile_for_filesystem(std::string const& type,
                                                    std::size_t block_bytes = 0);
 [[nodiscard]] mount_override const* select_mount_override(std::vector<mount_override> const&,
                                                           mount_identity const&) noexcept;
+
+/// Plan zero is shared by non-placement overrides; match selectors, never foreign list indices.
+[[nodiscard]] std::size_t mount_affinity_plan_index(std::vector<mount_override> const&,
+                                                    mount_override const*) noexcept;
 
 using policy_clock = std::chrono::steady_clock;
 using policy_now   = std::function<policy_clock::time_point()>;
@@ -208,8 +240,20 @@ class mount_policy : public std::enable_shared_from_this<mount_policy> {
     return _state.load(std::memory_order_acquire);
   }
   [[nodiscard]] bool read_eligible() const noexcept;
+  [[nodiscard]] bool may_record_fence() const noexcept
+  {
+    auto const value = state();
+    return !_override_legacy && (value == mount_state::unknown || value == mount_state::probing ||
+                                 read_eligible() || write_eligible());
+  }
   [[nodiscard]] bool write_eligible() const noexcept;
   [[nodiscard]] mount_profile base_profile() const noexcept;
+  /// Immutable selector, never an index into another context's configuration.
+  [[nodiscard]] mount_override const* affinity_override() const noexcept
+  {
+    return _affinity_override;
+  }
+  [[nodiscard]] bool network_filesystem() const noexcept { return _network_filesystem; }
   /// A concurrent control update may return fallback; retry next tick, never spin or block.
   [[nodiscard]] effective_profile effective() const noexcept;
   void set_effective(effective_profile);
@@ -245,6 +289,7 @@ class mount_policy : public std::enable_shared_from_this<mount_policy> {
   mount_policy_key _key;
   async_engine_config _config;
   mount_profile _profile;
+  mount_override const* _affinity_override{};
   // Seq-cst snapshot: readers make one bounded attempt and fall back on concurrent updates.
   std::atomic<std::uint64_t> _effective_epoch{};
   std::atomic<unsigned> _effective_qd{}, _effective_lanes{};
@@ -253,6 +298,7 @@ class mount_policy : public std::enable_shared_from_this<mount_policy> {
   policy_now _now;
   std::shared_ptr<std::atomic<bool>> _device_probe_busy;
   std::atomic<mount_state> _state{mount_state::unknown};
+  bool _network_filesystem{false};
   bool _override_legacy{false};
   bool _operator_override{false};
   bool _override_writes{false};
@@ -283,6 +329,8 @@ class mount_policy_registry {
  public:
   mount_policy_registry();
   [[nodiscard]] static mount_policy_registry& instance();
+  /// Lookup only: never discovers identity, creates policy, or schedules a probe.
+  [[nodiscard]] std::shared_ptr<mount_policy> find(mount_policy_key const& key) const;
   [[nodiscard]] std::shared_ptr<mount_policy> get_or_create(
     mount_policy_key key,
     mount_identity identity,

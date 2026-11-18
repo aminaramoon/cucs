@@ -40,6 +40,7 @@ inline constexpr std::size_t capacity_slab_bytes = 16 * capacity_mib;
 struct capacity_profile {
   unsigned qd{0};
   std::size_t preferred_op_bytes{capacity_mib};
+  unsigned lane_cap{std::numeric_limits<unsigned>::max()};
 };
 
 struct effective_profile {
@@ -75,7 +76,7 @@ struct effective_profile {
     }
     return low;
   };
-  auto const qd = fit_qd(p.qd, lane_cap);
+  auto const qd = fit_qd(p.qd, std::min(lane_cap, p.lane_cap));
   if (qd == 0) return {};
   std::size_t smallest = 0;
   for (unsigned index = 4; index != 0; --index) {
@@ -192,7 +193,7 @@ struct mount_capacity_grant {
   lane_demands.reserve(mounts.size());
   slab_demands.reserve(mounts.size());
   for (auto const& mount : mounts) {
-    auto const need = lanes(mount.profile.qd);
+    auto const need = std::min<std::uint64_t>(lanes(mount.profile.qd), mount.profile.lane_cap);
     auto const size = std::clamp(mount.profile.preferred_op_bytes, capacity_mib, 8 * capacity_mib);
     auto const byte_need = need * size;
     auto const slabs     = byte_need / capacity_slab_bytes + (byte_need % capacity_slab_bytes != 0);

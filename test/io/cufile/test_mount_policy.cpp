@@ -472,12 +472,12 @@ TEST_CASE("mount policy filesystem profiles respect geometry provenance", "[cufi
   };
   for (auto const& [type, cls, qd, bytes] :
        {profile_case{"wekafs", filesystem_class::weka, 64, 2 * mib},
-        profile_case{"nfs", filesystem_class::unknown, 4, mib},
-        profile_case{"nfs4", filesystem_class::unknown, 4, mib},
-        profile_case{"vastnfs", filesystem_class::unknown, 4, mib},
+        profile_case{"nfs", filesystem_class::nfs_rdma, 64, mib},
+        profile_case{"nfs4", filesystem_class::nfs_rdma, 64, mib},
+        profile_case{"vastnfs", filesystem_class::nfs_rdma, 64, mib},
         profile_case{"lustre", filesystem_class::lustre, 64, mib},
         profile_case{"beegfs", filesystem_class::beegfs, 64, 2 * mib},
-        profile_case{"compat", filesystem_class::unknown, 4, mib},
+        profile_case{"compat", filesystem_class::compat, 4, mib},
         profile_case{"unrecognized", filesystem_class::unknown, 4, mib}}) {
     CAPTURE(type);
     auto const p = profile_for_filesystem(type, 8 * mib);
@@ -485,9 +485,9 @@ TEST_CASE("mount policy filesystem profiles respect geometry provenance", "[cufi
     CHECK(p.capacity.qd == qd);
     CHECK(p.capacity.preferred_op_bytes == bytes);
     CHECK_FALSE(p.async_write_qualified);
-    // statfs block size is not Lustre stripe or BeeGFS chunk layout evidence.
+    // statfs block size is not stripe/chunk evidence: use explicit conservative defaults.
     if (cls == filesystem_class::lustre || cls == filesystem_class::beegfs) {
-      CHECK(p.geometry_bytes == 0);
+      CHECK(p.geometry_bytes == bytes);
     }
   }
 }
