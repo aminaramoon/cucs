@@ -31,7 +31,7 @@ if ((SMOKE)); then
   [[ -n $CONFIG ]] || MOUNTS=("smoke|compat|$(findmnt -T "$ROOT" -n -o TARGET)|$ROOT/results/smoke-scratch")
   FILE_MIB=32; QD_LIST=(1 2); OP_LIST=(1 2); GDSIO_SIZES=(1 2); GDSIO_THREADS=(1 2)
   REGISTRATIONS=(slot 0); SECONDS_PER_CASE=1; SOAK_MINUTES=0.1
-  RECREATE_EVERY_S=2; SAMPLE_EVERY_S=1; ENGINE_THREADS=(1); ENGINE_QD=2; ENGINE_OP_MIB=1; ARENA_MIB=32
+  RECREATE_EVERY_S=2; SAMPLE_EVERY_S=1; ENGINE_THREADS=(1); ENGINE_QD=2; ENGINE_OP_MIB=1; ARENA_MIB=32; ARENA_CLASSES=1
 fi
 case $ONLY in all|topology|B-0|B-1|B-2|B-3|B-4|B-5|B-6|B-8|B-9|G-7) ;; *) echo 'Unknown step' >&2; exit 2 ;; esac
 if ((!SMOKE && !OPERATOR_OVERRIDE && !ALLOW_LEGACY)); then
@@ -205,7 +205,7 @@ for entry in "${MOUNTS[@]}"; do
     fi
     policy=(); ((SMOKE)) && policy+=(--require-direct-evidence 0)
     if ((OPERATOR_OVERRIDE || SMOKE)); then policy+=(--override "mount_prefix:$mountpoint"); fi
-    common=(--size-mib "$FILE_MIB" --device "$dev" --tasks 4 --task-mib 2048 --single-mib 1024 --drop-cache --verify 1 --min-seconds "$SECONDS_PER_CASE" --repetitions 3 --qd "$ENGINE_QD" --op-mib "$ENGINE_OP_MIB" --arena-mib "$ARENA_MIB")
+    common=(--size-mib "$FILE_MIB" --device "$dev" --tasks 4 --task-mib 2048 --single-mib 1024 --drop-cache --verify 1 --min-seconds "$SECONDS_PER_CASE" --repetitions 3 --qd "$ENGINE_QD" --op-mib "$ENGINE_OP_MIB" --arena-mib "$ARENA_MIB" --arena-classes "${ARENA_CLASSES:-4}")
     ((SMOKE)) && common+=(--tasks 2 --task-mib 8 --single-mib 8 --columns 8 --chunk-max-mib 2)
     for step in B-3 B-4 B-5 B-6 B-9 G-7; do
       wanted "$step" || continue
@@ -249,7 +249,7 @@ if wanted B-8 && ((${#MOUNTS[@]} >= 2)); then
   pids=()
   for entry in "${MOUNTS[@]}"; do
     IFS='|' read -r label fs mountpoint scratch <<<"$entry"
-    args=("$ENGINE_BIN" --file "$scratch/$STAMP/B-8.bin" --create-file --engine async --size-mib "$FILE_MIB" --task-mib "$FILE_MIB" --single-mib "$FILE_MIB" --device "${DEVICES[0]}" --threads 1 --qd "$ENGINE_QD" --op-mib "$ENGINE_OP_MIB" --arena-mib "$ARENA_MIB" --min-seconds "$SECONDS_PER_CASE" --csv "$OUT/$label-B-8.csv")
+    args=("$ENGINE_BIN" --file "$scratch/$STAMP/B-8.bin" --create-file --engine async --size-mib "$FILE_MIB" --task-mib "$FILE_MIB" --single-mib "$FILE_MIB" --device "${DEVICES[0]}" --threads 1 --qd "$ENGINE_QD" --op-mib "$ENGINE_OP_MIB" --arena-mib "$ARENA_MIB" --arena-classes "${ARENA_CLASSES:-4}" --min-seconds "$SECONDS_PER_CASE" --csv "$OUT/$label-B-8.csv")
     ((SMOKE)) && args+=(--require-direct-evidence 0)
     if ((OPERATOR_OVERRIDE || SMOKE)); then args+=(--override "mount_prefix:$mountpoint"); fi
     if ((DRY)); then run B-8 "$label" "$fs" "${DEVICES[0]}" "$ENGINE_QD" "$ENGINE_OP_MIB" read contention "$label-B-8.log" "${args[@]}"; echo '&';
