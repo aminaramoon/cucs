@@ -257,6 +257,36 @@ struct probe_fixture {
 };
 }  // namespace
 
+TEST_CASE("verified mounts revoke async writes at the 16 MiB evidence boundary",
+          "[cufile][mount_policy]")
+{
+  require_cuda();
+  auto const direct = GENERATE(false, true);
+  probe_fixture p;
+  auto cfg                = policy_config();
+  cfg.async_writes        = true;
+  cfg.probe.bytes         = 2 * mib;
+  cfg.probe.submit_max_us = 100000;
+  auto identity           = synthetic_identity();
+  p.f.policy =
+    std::make_shared<mount_policy>(make_mount_policy_key(identity, "write-evidence-test", 91),
+                                   identity,
+                                   cfg,
+                                   p.f.executor,
+                                   [clock = p.f.clock] { return clock->now; });
+  p.f.policy->ensure_probe(p.context());
+  p.run();
+  REQUIRE(p.f.policy->state() == mount_state::verified_direct);
+  REQUIRE(p.f.policy->write_eligible());
+  p.f.policy->observe_write_evidence(8 * mib, direct);
+  CHECK(p.f.policy->write_eligible());
+  p.f.policy->observe_write_evidence(8 * mib, false);
+  CHECK(p.f.policy->write_eligible() == direct);
+  CHECK(p.f.policy->read_eligible());
+  p.f.policy->observe_write_evidence(16 * mib, true);  // No second chance or second diagnostic.
+  CHECK(p.f.policy->write_eligible() == direct);
+}
+
 TEST_CASE("mount policy identity comes from a real descriptor", "[cufile][mount_policy]")
 {
   temporary_file file;
@@ -467,6 +497,9 @@ TEST_CASE("mount policy write qualification needs config reads and early evidenc
 {
   auto config         = policy_config(true);
   config.async_writes = true;
+  policy_fixture reads_only(config);
+  CHECK_FALSE(reads_only.policy->write_eligible());
+  config.mount_overrides.front().allow_writes = true;
   policy_fixture f(config);
   CHECK(f.policy->write_eligible());  // Local profile is qualified; network profiles are not.
   f.policy->qualify_writes(false);
@@ -476,9 +509,9 @@ TEST_CASE("mount policy write qualification needs config reads and early evidenc
   f.policy->observe_write_evidence(8 * mib, false);
   CHECK(f.policy->write_eligible());
   f.policy->observe_write_evidence(8 * mib, false);
-  CHECK_FALSE(f.policy->write_eligible());
+  CHECK(f.policy->write_eligible());  // Standing write-enabled override is evidence-exempt.
   f.policy->qualify_writes(true);
-  CHECK_FALSE(f.policy->write_eligible());
+  CHECK(f.policy->write_eligible());
 
   policy_fixture direct(config);
   direct.policy->qualify_writes(true);
@@ -494,15 +527,16 @@ TEST_CASE("mount policy write qualification needs config reads and early evidenc
   policy_fixture unknown(config);
   unknown.policy->qualify_writes(true);
   CHECK_FALSE(unknown.policy->write_eligible());
-  auto network_identity       = synthetic_identity();
-  network_identity.fs_type    = "gpfs";
-  auto network_config         = policy_config(true);
-  network_config.async_writes = true;
+  auto network_identity                               = synthetic_identity();
+  network_identity.fs_type                            = "gpfs";
+  auto network_config                                 = policy_config(true);
+  network_config.async_writes                         = true;
+  network_config.mount_overrides.front().allow_writes = false;
   policy_fixture network(network_config, network_identity);
   CHECK_FALSE(network.policy->base_profile().async_write_qualified);
   CHECK_FALSE(network.policy->write_eligible());
   network.policy->qualify_writes(true);
-  CHECK(network.policy->write_eligible());
+  CHECK_FALSE(network.policy->write_eligible());  // Cannot override a reads-only operator entry.
   auto reads_disabled_config        = policy_config(true);
   reads_disabled_config.async_reads = false;
   policy_fixture reads_disabled(reads_disabled_config);

@@ -346,6 +346,59 @@ file effects; simulated storage is CUDA copying from pinned RAM. An additional
 `--sync-each` simulated B-3 run at QD 2 / 2 MiB slots passed (2.290 GiB/s).
 **None of these are GDS performance or acceptance numbers.**
 
+### Spill writes (B-6; opt-in, NOT GDS qualification)
+
+`--workload spill` writes offset/file/pass-dependent nonconstant sources into NEW disposable
+`PATH.spill-N` files (one per task). Each range starts at byte 37 and ends 37
+bytes before `--task-mib`, exercising an aligned body and exact buffered edges.
+It requires `--create-file`, supports `--engine legacy|async`, and rejects
+simulator/guarded-destination mode. Sources and streams are preallocated; source
+refill and file truncation happen outside timing. `--spill-mode new` (default)
+truncates files to zero before each pass, measuring extending writes; `overwrite`
+retains allocated extents. Verification checks EVERY written byte before timing
+and after the final timed pass. Every pass uses a new seed, so stale data cannot
+match the final verification. `--flush 1` waits for each file's flush INSIDE the
+timed window; without it successful futures are host-complete, NOT durable.
+Both options are recorded in CSV. Cache eviction is advisory, not proof of cold I/O.
+
+For spill only, each explicit `--override` also sets `allow_writes=true`.
+Library overrides otherwise default to reads only. Write admission additionally
+requires non-legacy mode, `async_writes=true`, and async-write symbols.
+Automatic production evidence sources remain unavailable (AM-11); the
+benchmark's explicit override is not verified-direct evidence.
+
+```sh
+bench=./build/release/cucascade_cufile_engine_bench
+# Use different NEW prefixes for the two modes; the files are retained for inspection.
+$bench --workload spill --engine legacy --file /mnt/disk_2/spill-legacy --create-file \
+  --task-mib 8 --size-mib 16 --tasks 2 --threads 1 --reactors 2 \
+  --qd 4 --op-mib 1 --arena-mib 16 --min-seconds 1
+$bench --workload spill --engine async --file /mnt/disk_2/spill-async --create-file \
+  --task-mib 8 --size-mib 16 --tasks 2 --threads 1 --reactors 2 \
+  --qd 4 --op-mib 1 --arena-mib 16 --min-seconds 1 \
+  --spill-mode new --flush 1 --drop-cache --override mount_prefix:/mnt/disk_2
+```
+
+Add `--spill-mode new --flush 1 --drop-cache` to the legacy command too. For
+acceptance, scale tasks/size well above RAM where practical. The small commands
+above are smoke checks only; use distinct new prefixes for each run.
+
+Historical constant-source overwrite smoke, NOT B-6 evidence (libcufile 1170, ext4 /tmp,
+verified, warm/uncontrolled cache, QD 4, 1 MiB slots, 16 MiB arena):
+
+| Mode | Logical bytes | Seconds | GiB/s | Async write bytes | Engine direct pwrite bytes | Engine buffered pwrite bytes | Legacy bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| legacy | 4,546,585,428 | 1.002 | 4.227 | 0 | 0 | 0 | 4,546,585,428 |
+| async, TEST-ONLY compat admission | 3,154,088,784 | 1.002 | 2.931 | 3,151,036,416 | 0 | 3,052,368 | 0 |
+
+These are **NOT GDS** results, not a speedup claim, NVMe-fair baseline, durability
+measurement, or default-mode recommendation. Use /mnt/disk_2 and matched raw
+baselines for qualification. The CSV adds `async_write_bytes`,
+`direct_pwrite_bytes`, `buffered_pwrite_bytes`, and `NOT_GDS=1`; the pwrite
+fields count engine-originated physical bytes only. Legacy internals are not
+instrumented: `legacy_bytes` is the remaining logical-byte count, not a measured
+buffered/direct breakdown.
+
 ## Host topology collector (`collect_topology.sh`)
 
 Read-only, best-effort host survey for GDS/cuFile performance planning

@@ -50,6 +50,7 @@ struct mount_identity;
 struct mount_policy_key;
 class mount_policy;
 class device_engine;
+class file_write_state;
 class device_arena;
 class cufile_transport;
 
@@ -120,6 +121,8 @@ class cufile_io_object final : public io_object {
   /// unavailable for this file.
   [[nodiscard]] CUfileHandle_t cufile_handle() const noexcept { return _cufile_handle; }
 
+  [[nodiscard]] std::shared_ptr<file_write_state> write_state() const;
+
   [[nodiscard]] bool cufile_registered() const noexcept { return _cufile_handle != nullptr; }
 
   /// Resolve descriptor-derived mount metadata once, only when engine routing requests it.
@@ -136,6 +139,8 @@ class cufile_io_object final : public io_object {
   mutable std::atomic<std::size_t> _file_size{0};
   io_access _access{io_access::read_only};
   std::optional<object_identity> _identity;
+  mutable std::once_flag _write_state_once;
+  mutable std::shared_ptr<file_write_state> _write_state;
   mutable std::once_flag _mount_identity_once;
   mutable std::unique_ptr<mount_identity> _mount_identity;
 };
@@ -395,6 +400,10 @@ class cufile_reactor {
                          std::size_t size,
                          std::uint8_t const* source);
 
+  /// Nonblocking eligibility snapshot used to track queued engine writes before flush capture.
+  bool engine_write_candidate(std::shared_ptr<const io_object> const& object,
+                              prepared_io_slice const& slice) noexcept;
+
   /// @c fdatasync the file on the calling thread.  @throws std::system_error.
   static void flush(cufile_io_object const& file);
 
@@ -408,6 +417,17 @@ class cufile_reactor {
  private:
   /// A device-only slice parked until the work queued on its stream before
   /// dispatch has finished (@c event fires).
+  struct pending_write {
+    std::shared_ptr<const io_object> obj;
+    prepared_io_slice slice;
+    std::shared_ptr<grouped_coordinator> coordinator;
+    std::shared_ptr<std::atomic<bool>> ready;
+  };
+  struct write_wakeup {
+    std::mutex mutex;
+    std::function<void()> notify;
+  };
+  std::shared_ptr<write_wakeup> _write_wakeup = std::make_shared<write_wakeup>();
   struct waiting_slice {
     std::shared_ptr<const io_object> obj;
     prepared_io_slice slice;
@@ -590,6 +610,7 @@ class cufile_reactor {
   // shutdown() once the worker has been joined).
   std::vector<inflight_copy> _inflight_copy;
   std::vector<waiting_slice> _waiting;
+  std::vector<pending_write> _write_waiting;
   /// Staging-copy streams, indexed by device id.
   std::vector<owned_stream> _copy_streams;
   /// Pinned (portable) staging for device-only POSIX reads and writes, taken from

@@ -63,6 +63,7 @@ struct mount_override {
   mount_override_state state{mount_override_state::legacy};
   std::optional<unsigned> qd;
   std::optional<std::size_t> op_bytes;
+  bool allow_writes{false};  ///< Explicit write opt-in; qualification is reads-only by default.
   bool operator==(mount_override const&) const = default;
 };
 
@@ -220,6 +221,8 @@ struct async_engine_config {
         case mount_override_state::legacy: break;
         default: throw std::invalid_argument("mount_overrides.state is invalid");
       }
+      if (entry.allow_writes && entry.state != mount_override_state::operator_qualified)
+        throw std::invalid_argument("mount_overrides.allow_writes requires operator_qualified");
       if (entry.qd) { positive(*entry.qd, "mount_overrides.qd"); }
       if (entry.op_bytes) { aligned_bytes(*entry.op_bytes, "mount_overrides.op_bytes"); }
       for (std::size_t earlier = 0; earlier < index; ++earlier) {

@@ -44,7 +44,9 @@ namespace cucascade::io::cufile {
  * reads hand off to a process-shared device engine after control-thread warm-up. Writes
  * (@c open_io_object_for_write and the write API) use @c cuFileWrite for large
  * aligned device bodies on a real GDS platform and staged / direct @c pwrite
- * otherwise (see @c cufile_reactor).
+ * otherwise (see @c cufile_reactor). With async_writes=true, write-eligible mounts instead
+ * stage aligned bodies into engine slots for cuFileWriteAsync; edges remain exact buffered
+ * pwrite. Write futures always remain host-complete, without a durability guarantee.
  * Selected by @c io_backend::cufile and registered from the datasource factory
  * like the uring / rest backends.
  *
@@ -93,6 +95,15 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
    * @throws std::invalid_argument when @p object was not opened by a cuFile ioctx.
    */
   [[nodiscard]] path_info path_capability(io_object const& object) const;
+
+  std::size_t host_write_io(io_object const& object,
+                            std::size_t offset,
+                            std::size_t size,
+                            std::uint8_t const* source) override;
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept override;
+  exec::semi_future<void> flush_async_io(io_object const& object,
+                                         io_priority priority) noexcept override;
 
  protected:
   std::vector<cufile_reactor*> select_reactors(cufile_io_object const& object,

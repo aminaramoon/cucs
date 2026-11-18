@@ -156,6 +156,39 @@ class lazy_pool final : public control_executor, public std::enable_shared_from_
   std::vector<std::thread> _threads;
 };
 
+// Pinned cells are allocated only at bootstrap, reused and never cudaFreeHost'ed.
+std::atomic<std::size_t> write_scratch_allocated_bytes{};
+std::shared_ptr<void> write_scratch_bank(std::size_t bytes)
+{
+  struct pool {
+    std::mutex mutex;
+    std::multimap<std::size_t, void*> free;
+  };
+  static auto* banks = new pool;
+  void* data{};
+  {
+    std::lock_guard lock(banks->mutex);
+    auto found = banks->free.find(bytes);
+    if (found != banks->free.end()) {
+      bytes = found->first;
+      data  = found->second;
+      banks->free.erase(found);
+    }
+  }
+  if (!data) {
+    CUCASCADE_CUDA_TRY(cudaHostAlloc(&data, bytes, cudaHostAllocPortable));
+    write_scratch_allocated_bytes.fetch_add(bytes);
+  }
+  return {data, [bytes](void* ptr) {
+            std::lock_guard lock(banks->mutex);
+            try {
+              banks->free.emplace(bytes, ptr);
+            } catch (...) { /* Retain at process exit. */
+            }
+          }};
+}
+std::atomic<std::uint64_t> flush_wait_count{};
+
 struct completion_retirement {
   explicit completion_retirement(std::shared_ptr<grouped_coordinator> value)
     : group(std::move(value))
@@ -217,6 +250,12 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     grouped_coordinator::error_type error{std::make_error_code(std::errc::io_error)};
     enum class work { none, retry, fallback, check_size, recovery, cleanup } pending{work::none};
     bool fallback{}, cleaning{}, gate_limited{}, retry_after_recovery{};
+    bool staged{}, host_copy{}, host_ready{}, buffered_suffix{}, unknown_progress{};
+    std::shared_ptr<file_write_state::interval> interval;
+    time_point interval_wait{};
+    std::shared_ptr<std::atomic<bool>> interval_ready;
+    void* scratch{};
+    std::size_t host_direct_done{}, host_buffered_done{};
   };
   struct mount {
     mount(std::shared_ptr<mount_policy> value, std::size_t index, std::size_t capacity)
@@ -233,6 +272,8 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     std::uint64_t next_group_id{};
     std::array<std::int64_t, 2> deficit{};
     engine_histogram completion;
+    evidence_snapshot write_before;
+    std::size_t write_completed{};
     std::atomic<bool> refuse{};
     unsigned registered_submitters{};
     bool active{};
@@ -246,6 +287,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     notification wake;
     std::thread thread;
     std::atomic<mount*> calling{};
+    std::atomic<node*> calling_node{};
     std::atomic<std::int64_t> call_start{-1};
   };
   enum class result_kind {
@@ -312,6 +354,8 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   bool retry_needed{};
   long double qd_area{}, backlog_area{};
   std::uint64_t backlog_ns{};
+  std::shared_ptr<void> write_scratch;
+  std::size_t scratch_cell_bytes{};
 
   impl(int d, async_engine_config cfg, device_engine_options opts)
     : device(d),
@@ -326,6 +370,12 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       origin(options.now()),
       last_account(origin)
   {
+    if (config.async_writes) {
+      // Fallback streams the already-staged slot through this one-granule cell.
+      // No lane ever needs a largest-class pinned host buffer.
+      scratch_cell_bytes = write_granule();
+      write_scratch      = write_scratch_bank(scratch_cell_bytes * options.lanes->capacity());
+    }
     free_nodes.reserve(nodes.size());
     active_nodes.reserve(nodes.size());
     target_scratch.reserve(std::max(1U, config.coalesce_max_targets));
@@ -346,6 +396,11 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       options.buffered_fd = [](io_object const& object) {
         auto const* file = dynamic_cast<cufile_io_object const*>(&object);
         return file ? file->buffered_fd() : -1;
+      };
+    if (!options.direct_fd)
+      options.direct_fd = [](io_object const& object) {
+        auto const* file = dynamic_cast<cufile_io_object const*>(&object);
+        return file ? file->direct_fd() : -1;
       };
     if (!options.file_handle)
       options.file_handle = [](io_object const& file) -> void* {
@@ -400,8 +455,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         }
         if (n == nullptr) break;
         ++drained;
-        if (m->refuse.load() || !m->policy->read_eligible() || stop.load() ||
-            n->request->cancelled()) {
+        if (m->refuse.load() ||
+            !(n->request->slice.write ? m->policy->write_eligible() : m->policy->read_eligible()) ||
+            stop.load() || n->request->cancelled()) {
           publish({result_kind::not_submitted, n, n->generation});
           continue;
         }
@@ -411,16 +467,19 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         }
         auto& op = *n->op;
         s.calling.store(m);
+        s.calling_node.store(n);
         auto const started = options.now();
         s.call_start.store(started.time_since_epoch().count(), std::memory_order_release);
         detail::before_engine_transfer_for_testing();
-        auto const rc = options.transport->read_async(options.file_handle(*op.file),
-                                                      op.staging->base_ptr_to_pass(),
-                                                      &op.args.size,
-                                                      &op.args.file_offset,
-                                                      &op.args.buffer_offset,
-                                                      &op.args.bytes_done,
-                                                      (*op.lane)->stream());
+        auto const submit =
+          op.is_read() ? &cufile_transport::read_async : &cufile_transport::write_async;
+        auto const rc = ((*options.transport).*submit)(options.file_handle(*op.file),
+                                                       op.staging->base_ptr_to_pass(),
+                                                       &op.args.size,
+                                                       &op.args.file_offset,
+                                                       &op.args.buffer_offset,
+                                                       &op.args.bytes_done,
+                                                       (*op.lane)->stream());
         s.call_start.store(-1, std::memory_order_release);
         auto const elapsed = options.now() - started;
         auto status =
@@ -533,6 +592,10 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   void finish(node& n, bool success, proof reason)
   {
     token(n, false);
+    if (success && !n.op->is_read()) {
+      n.op->file->note_written(n.op->physical.end());
+      stats.enqueued_logical_bytes += n.op->physical.size;
+    }
     for (std::size_t i = 0; i < n.op->targets.size(); ++i) {
       if (success)
         static_cast<void>(n.op->targets[i].credit.finish_success());
@@ -594,8 +657,129 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       end = std::max(end, op.targets[i].logical.end());
     return end;
   }
+  void validate_write(node& n)
+  {
+    auto& op        = *n.op;
+    auto const done = op.args.bytes_done;
+    if (done == pending_sentinel) {
+      fail(n, std::make_error_code(std::errc::io_error));
+      return;
+    }
+    if (done < 0 && done != -ENOSPC && done != -EACCES && done != -EDQUOT)
+      n.owner->policy->revoke_writes();
+    // Unknown, zero and malformed progress is never replayed.
+    if (done <= 0 || static_cast<std::size_t>(done) > op.args.size || n.unknown_progress) {
+      n.error = std::make_error_code(std::errc::io_error);
+      finish(n, false, proof::io_observed);
+      return;
+    }
+    auto const count = static_cast<std::size_t>(done);
+    if (!n.fallback && op.kind() != operation_kind::write_edge) {
+      stats.async_write_bytes += count;
+      // Production evidence providers deliberately remain unavailable (AM-11).
+      auto& m = *n.owner;
+      if (m.write_completed < (16UL << 20)) {
+        m.write_completed += count;
+        auto const after =
+          options.write_evidence ? options.write_evidence->sample() : evidence_snapshot{};
+        bool const evidence = m.write_before.available && m.write_before.attributable &&
+                              after.available && after.attributable &&
+                              after.write_bytes >= m.write_before.write_bytes &&
+                              after.write_bytes - m.write_before.write_bytes >= m.write_completed;
+        m.policy->observe_write_evidence(count, evidence);
+      }
+    }
+    auto const end = static_cast<std::size_t>(op.args.file_offset) + count;
+    if (count == op.args.size) {
+      finish(n, true, proof::io_observed);
+      return;
+    }
+    ++stats.short_writes;
+    if (++op.attempts > config.max_short_reads) {
+      n.error = std::make_error_code(std::errc::io_error);
+      finish(n, false, proof::io_observed);
+      return;
+    }
+    ++stats.retries;
+    op.args = {op.physical.end() - end,
+               static_cast<off_t>(end),
+               op.staging->buffer_offset_to_pass() + static_cast<off_t>(end - op.physical.offset),
+               pending_sentinel};
+    if (end % n.request->slice.granule != 0) {
+      ++stats.buffered_suffixes;
+      n.buffered_suffix = true;
+      n.fallback        = true;
+      n.host_ready      = false;
+      n.pending         = node::work::fallback;
+    } else
+      n.pending = node::work::retry;
+  }
+  void stage_write(node& n, bool host)
+  {
+    auto& op          = *n.op;
+    auto const stream = (*op.lane)->stream();
+    op.mark_work_started();
+    auto status = options.transport->stream_wait_event(stream, n.request->slice.fence->event);
+    auto const* source = n.staged
+                           ? static_cast<std::byte*>(op.staging->data()) +
+                               (static_cast<std::size_t>(op.args.file_offset) - op.physical.offset)
+                           : static_cast<std::byte*>(op.targets[0].user_ptr);
+    if (status == cudaSuccess)
+      status = options.transport->memcpy_async(
+        host ? n.scratch : op.staging->data(),
+        source,
+        host ? std::min(op.args.size, scratch_cell_bytes) : op.args.size,
+        host ? cudaMemcpyDeviceToHost : cudaMemcpyDeviceToDevice,
+        stream);
+    if (status == cudaSuccess)
+      status = options.transport->record_event((*op.lane)->copy_event(), stream);
+    if (status != cudaSuccess) {
+      fail(n, status);
+      return;
+    }
+    n.host_copy = host;
+    n.pending   = node::work::none;
+    n.event     = op.track_event((*op.lane)->copy_event(), operation_phase::staging_copy, false);
+    ++n.generation;
+    poll_later(n, true);
+  }
+  bool write_interval(node& n)
+  {
+    if (n.interval) return true;
+    if (n.interval_ready && !n.interval_ready->load()) return false;
+    auto ready               = std::make_shared<std::atomic<bool>>(false);
+    std::weak_ptr<impl> weak = shared_from_this();
+    n.interval_ready         = ready;
+    n.interval               = n.request->slice.write_ticket->state->try_acquire(
+      n.op->physical,
+      n.request->slice.granule,
+      n.op->kind() == operation_kind::write_edge || options.direct_fd(*n.op->file) < 0
+                      ? write_io_mode::buffered
+                      : write_io_mode::direct,
+      [ready, weak] {
+        ready->store(true);
+        if (auto self = weak.lock()) self->wake.notify();
+      });
+    if (!n.interval) {
+      if (n.interval_wait == time_point{}) {
+        n.interval_wait = options.now();
+        ++stats.granule_conflicts;
+      }
+      return false;
+    }
+    n.interval_ready.reset();
+    if (n.interval_wait != time_point{}) {
+      stats.granule_wait_ns += ns(options.now() - n.interval_wait);
+      n.interval_wait = {};
+    }
+    return true;
+  }
   void validate(node& n)
   {
+    if (!n.op->is_read()) {
+      validate_write(n);
+      return;
+    }
     auto& op        = *n.op;
     auto const done = op.args.bytes_done;
     auto const outcome =
@@ -670,7 +854,11 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       fail(n, status);
       return;
     }
-    if (n.event.phase == operation_phase::io_inflight) {
+    if (n.event.phase == operation_phase::staging_copy) {
+      n.staged     = true;
+      n.host_ready = n.host_copy;
+      n.pending    = node::work::retry;
+    } else if (n.event.phase == operation_phase::io_inflight) {
       token(n, false);
       n.io_observed = options.now();
       sample(stats.completion, n.io_observed - n.started);
@@ -724,6 +912,56 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     }
     return count;
   }
+  ssize_t sync_write(node& n)
+  {
+    auto& op          = *n.op;
+    auto fd           = options.buffered_fd(*op.file);
+    bool const direct = !n.buffered_suffix && op.kind() != operation_kind::write_edge &&
+                        options.direct_fd(*op.file) >= 0;
+    if (direct) fd = options.direct_fd(*op.file);
+    bool using_direct = direct;
+    std::size_t written{};
+    while (written < op.args.size) {
+      auto const cell_start = written / scratch_cell_bytes * scratch_cell_bytes;
+      auto const within     = written - cell_start;
+      if (within == 0 && written != 0) {
+        // Only the first cell was copied by stage_write. Subsequent cells read
+        // the retained slot, NEVER the application source, on the blocking pool.
+        auto const status = options.transport->memcpy_async(
+          n.scratch,
+          static_cast<std::byte*>(op.staging->data()) +
+            (static_cast<std::size_t>(op.args.file_offset) - op.physical.offset) + written,
+          std::min(scratch_cell_bytes, op.args.size - written),
+          cudaMemcpyDeviceToHost,
+          (*op.lane)->stream());
+        auto const sync = options.synchronize_lane((*op.lane)->stream());
+        if (sync != cudaSuccess) return pending_sentinel;
+        if (status != cudaSuccess) return -EIO;
+      }
+      auto const done =
+        options.write_at(fd,
+                         static_cast<std::byte*>(n.scratch) + within,
+                         std::min(scratch_cell_bytes - within, op.args.size - written),
+                         op.args.file_offset + static_cast<off_t>(written));
+      if (done < 0 && errno == EINTR) continue;
+      if (done < 0 && using_direct && (errno == EINVAL || errno == EOPNOTSUPP)) {
+        fd                = options.buffered_fd(*op.file);
+        n.buffered_suffix = true;
+        using_direct      = false;
+        continue;
+      }
+      if (done <= 0) return done < 0 ? -errno : -EIO;
+      (using_direct ? n.host_direct_done : n.host_buffered_done) += static_cast<std::size_t>(done);
+      written += static_cast<std::size_t>(done);
+      // A positive O_DIRECT short suffix may have lost alignment. Its prefix is known.
+      if (written < op.args.size && written % n.request->slice.granule != 0) {
+        fd                = options.buffered_fd(*op.file);
+        n.buffered_suffix = true;
+        using_direct      = false;
+      }
+    }
+    return static_cast<ssize_t>(written);
+  }
   void service_work()
   {
     for (auto* item : active_nodes) {
@@ -733,7 +971,13 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         if (stop.load() || n.request->cancelled()) {
           n.error = std::make_error_code(std::errc::operation_canceled);
           finish(n, false, proof::io_observed);
-        } else if (n.owner->effective.qd == 0) {
+        } else if (!n.op->is_read() && !write_interval(n)) {
+          continue;
+        } else if (!n.op->is_read() && n.host_ready) {
+          n.pending    = node::work::fallback;
+          retry_needed = true;
+        } else if (n.owner->effective.qd == 0 ||
+                   (!n.op->is_read() && !n.owner->policy->write_eligible())) {
           n.fallback   = true;
           n.pending    = node::work::fallback;
           retry_needed = true;
@@ -747,6 +991,13 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         finish(n, false, proof::io_observed);
         continue;
       }
+      if (work == node::work::fallback && !n.op->is_read()) {
+        if (!write_interval(n)) continue;
+        if (!n.host_ready) {
+          stage_write(n, true);
+          continue;
+        }
+      }
       auto* executor = work == node::work::cleanup    ? cleanup.get()
                        : work == node::work::recovery ? options.recovery.get()
                                                       : options.blocking.get();
@@ -758,6 +1009,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
           accepted = executor->submit([self, p] {
             static_cast<void>(cudaSetDevice(self->device));
             // P2-R19: ALL final file/input/request/scratch/lane-state releases are off reaper.
+            p->interval.reset();
             auto const index                     = (*p->op->lane)->index();
             [[maybe_unused]] bool const released = operation_pool::try_release(*p->op);
             assert(released);
@@ -787,7 +1039,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
           accepted = executor->submit([self, p] {
             auto const status = cudaSetDevice(self->device);
             try {
-              p->op->args.bytes_done = status == cudaSuccess ? self->sync_read(*p) : -EIO;
+              p->op->args.bytes_done = status != cudaSuccess ? -EIO
+                                       : p->op->is_read()    ? self->sync_read(*p)
+                                                             : self->sync_write(*p);
             } catch (...) {
               p->op->args.bytes_done = -EIO;
             }
@@ -835,7 +1089,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         }
         break;
       case result_kind::submit_failed:
-        n.retry_after_recovery = true;
+        n.retry_after_recovery = n.op->is_read();
         n.owner->policy->open_circuit();
         ++stats.unsupported_fallbacks;
         [[fallthrough]];
@@ -846,13 +1100,21 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       case result_kind::recorded:
         sample(stats.submit, value.elapsed);
         n.owner->policy->observe_submit(value.elapsed);
-        if (!n.owner->policy->read_eligible()) n.owner->refuse.store(true);
+        if (!n.owner->policy->read_eligible() && !n.owner->policy->write_eligible())
+          n.owner->refuse.store(true);
+        if (!n.op->is_read() && n.unknown_progress) {
+          fail(n, std::make_error_code(std::errc::io_error));
+          break;
+        }
         n.event = n.op->track_event((*n.op->lane)->io_event(), operation_phase::io_inflight, false);
         poll_later(n, true);
         break;
       case result_kind::sync_done:
-        n.io_observed = options.now();
-        if (n.op->args.bytes_done > 0)
+        stats.direct_write_bytes += n.host_direct_done;
+        stats.buffered_write_bytes += n.host_buffered_done;
+        n.host_direct_done = n.host_buffered_done = 0;
+        n.io_observed                             = options.now();
+        if (n.op->is_read() && n.op->args.bytes_done > 0)
           stats.sync_bytes += static_cast<std::size_t>(n.op->args.bytes_done);
         validate(n);
         break;
@@ -876,6 +1138,13 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
             finish(n, false, proof::lane_synchronized);
         } else {
           ++stats.quarantines;
+          if (n.interval) {
+            n.interval->state->quarantine_interval();
+            ++stats.quarantined_write_intervals;
+            CUCASCADE_LOG_WARN(
+              "cuFile quarantined write pins inode interval: overlapping writes "
+              "and flushes cannot complete until process restart");
+          }
           n.op->quarantine();
           // Deliberately no credit settlement and no cleanup. Drain must report incomplete.
         }
@@ -952,6 +1221,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         if (found == mounts.end()) {
           auto m       = std::make_unique<mount>(request.slice.policy, mounts.size(), nodes.size());
           m->submitter = mounts.size() % submitters.size();
+          if (options.write_evidence) m->write_before = options.write_evidence->sample();
           m->registered_submitters = 1U << m->submitter;
           request.owner            = m.get();
           mounts.push_back(std::move(m));
@@ -1097,12 +1367,14 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       // Hint only: the unconditional lane wait remains the correctness barrier.
       r.fence_ready = cudaEventQuery(r.slice.fence->event) != cudaErrorNotReady;
     }
-    return r.fence_ready || r.owner->gated < (r.owner->effective.lanes + 7) / 8;
+    return r.fence_ready || ((!r.slice.write || r.active == 0) &&
+                             r.owner->gated < (r.owner->effective.lanes + 7) / 8);
   }
   cursor* next_request(mount& m, unsigned tier)
   {
     auto const eligible = [&](auto const& r) {
       return r && !r->finished && r->owner == &m &&
+             (r->slice.write || m.effective.qd == 0 || m.in_io < m.effective.qd) &&
              (r->slice.priority == io_priority::low ? 1U : 0U) == tier && fence_admissible(*r);
     };
     auto first = std::numeric_limits<std::uint64_t>::max();
@@ -1132,6 +1404,21 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     }
     return nullptr;
   }
+  static range_plan::piece_plan write_piece(cursor const& r, std::size_t op_bytes)
+  {
+    auto const parts = range_plan::split_write_range(r.slice.logical, r.slice.granule);
+    for (auto const part : parts) {
+      if (r.next >= part.end() || part.empty()) continue;
+      auto end = part.end();
+      if (part.offset % r.slice.granule == 0 && part.size % r.slice.granule == 0)
+        end = std::min(end, r.next + (op_bytes - r.next % op_bytes));
+      else
+        end = std::min(end, r.next + op_bytes);
+      range const exact{r.next, end - r.next};
+      return {exact, exact, end == r.slice.logical.end()};
+    }
+    throw std::logic_error("exhausted write cursor");
+  }
   struct admission {
     admission(bool value) : progress(value), started(value) {}
     admission(bool progress, bool started) : progress(progress), started(started) {}
@@ -1141,7 +1428,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   {
     auto const effective         = m.effective;
     bool const capacity_fallback = effective.qd == 0 && effective.op_bytes != 0;
-    if (effective.op_bytes == 0 || (!capacity_fallback && m.in_io >= effective.qd)) return false;
+    if (effective.op_bytes == 0) return false;
     if (m.occupied >= effective.lanes) {
       if (m.lane_wait_since == time_point{}) {
         ++stats.lane_waits;
@@ -1154,18 +1441,22 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       return false;
     auto* r = next_request(m, tier);
     if (!r) return false;
+    if (!r->slice.write && !capacity_fallback && m.in_io >= effective.qd) return false;
     range_plan::piece_plan piece;
     auto& targets = target_scratch;
     targets.clear();
     targets.push_back(r);
     std::size_t gaps{};
     try {
-      piece = range_plan::next_cut(r->next,
-                                   r->slice.logical.end(),
-                                   effective.op_bytes,
-                                   r->slice.granule,
-                                   r->slice.geometry_boundaries,
-                                   r->slice.file->size());
+      if (r->slice.write)
+        piece = write_piece(*r, effective.op_bytes);
+      else
+        piece = range_plan::next_cut(r->next,
+                                     r->slice.logical.end(),
+                                     effective.op_bytes,
+                                     r->slice.granule,
+                                     r->slice.geometry_boundaries,
+                                     r->slice.file->size());
     } catch (...) {
       r->finished = true;
       static_cast<void>(r->slice.credit.finish_error(std::current_exception()));
@@ -1190,8 +1481,11 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       }
       return false;
     }
-    auto slot = options.arena->try_lease(m.id, effective.op_bytes, true);
-    if (!slot) {
+    bool const edge = r->slice.write && (piece.logical.offset % r->slice.granule != 0 ||
+                                         piece.logical.size % r->slice.granule != 0);
+    auto slot       = edge ? std::optional<staging_lease>{}
+                           : options.arena->try_lease(m.id, effective.op_bytes, true);
+    if (!edge && !slot) {
       if (m.slot_wait_since == time_point{}) {
         ++stats.slot_waits;
         m.slot_wait_since = options.now();
@@ -1211,7 +1505,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     // Group only after resource/DRR admission. All target storage was reserved
     // at bootstrap; coalescing cannot allocate or fail unrelated requests.
     try {
-      if (config.coalesce && config.coalesce_max_targets > 1 &&
+      if (!r->slice.write && config.coalesce && config.coalesce_max_targets > 1 &&
           r->next == r->slice.logical.offset && r->slice.logical.size < effective.op_bytes / 2 &&
           r->slice.geometry_boundaries.empty()) {
         auto& budget = *r->budget;
@@ -1220,7 +1514,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
           (!coalesce_index[budget.small_begin] || coalesce_index[budget.small_begin]->finished))
           ++budget.small_begin;
         auto matches = [&](cursor const& c) {
-          return !c.finished && c.publication_visible && c.owner == &m &&
+          return !c.slice.write && !c.finished && c.publication_visible && c.owner == &m &&
                  c.slice.file == r->slice.file && c.slice.device_id == r->slice.device_id &&
                  c.slice.priority == r->slice.priority &&
                  c.slice.user_stream == r->slice.user_stream && c.slice.fence == r->slice.fence &&
@@ -1300,7 +1594,17 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     m.request_next[tier]   = r->index + 1;
     n.fallback             = capacity_fallback;
     n.retry_after_recovery = false;
-    n.gate_limited         = !r->fence_ready;
+    n.staged = n.host_copy = n.host_ready = n.buffered_suffix = n.unknown_progress = false;
+    n.interval_wait                                                                = {};
+    n.interval_ready.reset();
+    n.host_direct_done = n.host_buffered_done = 0;
+    n.scratch = r->slice.write ? static_cast<std::byte*>(write_scratch.get()) +
+                                   (*lane)->index() * scratch_cell_bytes
+                               : nullptr;
+    op->set_kind(!r->slice.write ? operation_kind::read_staged
+                 : edge          ? operation_kind::write_edge
+                                 : operation_kind::write_body_staged);
+    n.gate_limited = !r->fence_ready;
     if (n.gate_limited) ++m.gated;
     op->file      = r->slice.file;
     op->lane      = std::move(lane);
@@ -1329,7 +1633,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     }
     op->args    = {piece.physical.size,
                    static_cast<off_t>(piece.physical.offset),
-                   op->staging->buffer_offset_to_pass(),
+                edge ? 0 : op->staging->buffer_offset_to_pass(),
                    pending_sentinel};
     r->next     = piece.logical.end();
     r->finished = piece.last;
@@ -1348,6 +1652,10 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     if (piece.physical.empty()) {
       n.error = std::make_error_code(std::errc::io_error);
       finish(n, false, proof::nothing_enqueued);
+    } else if (r->slice.write) {
+      // Even capacity fallback must retain the ENTIRE source in a device slot;
+      // only edges fit directly into the one-granule host cell.
+      stage_write(n, edge);
     } else if (capacity_fallback) {
       op->set_phase(operation_phase::host_io);
       n.pending = node::work::fallback;
@@ -1440,6 +1748,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     stats.backlog_storage_qd_ns = static_cast<std::uint64_t>(backlog_area);
     stats.backlog_mean_storage_qd =
       backlog_ns == 0 ? 0 : static_cast<double>(backlog_area / backlog_ns);
+    stats.flush_waits = flush_wait_count.load();
     stats.lanes_by_phase.fill(0);
     for (auto const* n : active_nodes)
       if (!n->cleaning) ++stats.lanes_by_phase[static_cast<std::size_t>(n->op->phase())];
@@ -1499,7 +1808,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     for (std::size_t i = 0; i < submitters.size(); ++i) {
       if (i == blocked || submitters[i]->call_start.load() >= 0) continue;
       for (auto const& m : mounts) {
-        if (m->submitter != blocked || !m->policy->read_eligible()) continue;
+        if (m->submitter != blocked ||
+            (!m->policy->read_eligible() && !m->policy->write_eligible()))
+          continue;
         if ((m->registered_submitters & (1U << i)) == 0) {
           auto* p = m.get();
           if (!submitters[i]->registrations.push(std::move(p))) continue;
@@ -1548,11 +1859,16 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
           }
         }
         for (auto const& s : submitters) {
-          auto const start = s->call_start.load(std::memory_order_acquire);
-          auto* const m    = s->calling.load();
+          auto const start         = s->call_start.load(std::memory_order_acquire);
+          auto* const m            = s->calling.load();
+          auto* const calling_node = s->calling_node.load();
           if (start >= 0 && m && start == s->call_start.load(std::memory_order_acquire)) {
             m->policy->observe_stuck_call(now.time_since_epoch() - policy_clock::duration(start));
-            if (!m->policy->read_eligible()) {
+            if (now.time_since_epoch() - policy_clock::duration(start) >=
+                std::chrono::milliseconds(config.demotion.stuck_ms))
+              if (auto* n = calling_node; n && n->op && !n->op->is_read())
+                n->unknown_progress = true;
+            if (!m->policy->read_eligible() && !m->policy->write_eligible()) {
               m->refuse.store(true);
               auto const position = static_cast<std::size_t>(&s - submitters.data());
               migrate_healthy_mounts(position);
@@ -1561,7 +1877,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         }
         for (auto const& m : mounts) {
           m->policy->poll_timers();
-          m->refuse.store(!m->policy->read_eligible());
+          m->refuse.store(!m->policy->read_eligible() && !m->policy->write_eligible());
           drain_refused_commands(*m);
           if (m->in_io == 0 && m->policy->state() == mount_state::circuit_open)
             m->policy->begin_cooldown();
@@ -1612,6 +1928,35 @@ device_engine::device_engine(int device, async_engine_config config, device_engi
     throw std::runtime_error("device_engine lacks staged-read capacity; keep legacy routing");
   _impl = std::make_shared<impl>(device, std::move(config), std::move(options));
   _impl->start();
+}
+
+exec::semi_future<void> device_engine::flush_async(std::shared_ptr<const io_object> file,
+                                                   std::shared_ptr<file_write_state> state)
+{
+  auto promise        = std::make_shared<exec::promise<void>>();
+  auto future         = promise->get_semi_future();
+  auto const sequence = state->capture();
+  bool const waited   = state->when_retired(sequence, [file = std::move(file), promise] {
+    try {
+      auto task = [file, promise] {
+        try {
+          auto const* native = dynamic_cast<cufile_io_object const*>(file.get());
+          if (!native) throw std::invalid_argument("flush requires a cuFile object");
+          cufile_reactor::flush(*native);
+          promise->set_try(exec::try_t<void>::make_value());
+        } catch (...) {
+          promise->set_try(exec::try_t<void>(std::current_exception()));
+        }
+      };
+      if (!lazy_pool::blocking()->submit(std::move(task)))
+        promise->set_try(exec::try_t<void>(std::make_exception_ptr(
+          std::system_error(std::make_error_code(std::errc::no_buffer_space)))));
+    } catch (...) {
+      promise->set_try(exec::try_t<void>(std::current_exception()));
+    }
+  });
+  if (waited) flush_wait_count.fetch_add(1);
+  return future;
 }
 
 device_engine::~device_engine()
@@ -1687,11 +2032,14 @@ void device_engine::hand_off(engine_slice slice, bool reserved) noexcept
         !slice.fence->event || !slice.user_ptr || slice.device_id != e.device ||
         slice.user_stream == nullptr || slice.user_stream == cudaStreamPerThread ||
         slice.granule == 0 || slice.logical.empty() ||
+        (slice.write &&
+         (!e.config.async_writes || !slice.write_ticket || slice.granule > e.scratch_cell_bytes)) ||
         slice.logical.offset > static_cast<std::size_t>(std::numeric_limits<off_t>::max()) ||
         slice.logical.size >
           static_cast<std::size_t>(std::numeric_limits<off_t>::max()) - slice.logical.offset ||
         !std::is_sorted(slice.geometry_boundaries.begin(), slice.geometry_boundaries.end()))
       throw std::invalid_argument("invalid engine_slice");
+    if (slice.write) slice.write_ticket->state->activate();
     auto r = std::make_shared<impl::cursor>(std::move(slice));
     if (!e.control.push(std::move(r))) {
       e.rejected.fetch_add(1);
@@ -1723,10 +2071,17 @@ bool device_engine::drain(std::chrono::milliseconds timeout) noexcept
   } while (policy_clock::now() < end);
   return false;
 }
+bool device_engine::accepts_writes() const noexcept
+{
+  return _impl->config.async_writes && static_cast<bool>(_impl->write_scratch);
+}
 engine_gauges device_engine::gauges() const
 {
   std::lock_guard lock(_impl->snapshot_mutex);
-  return _impl->snapshot;
+  auto result                       = _impl->snapshot;
+  result.pinned_write_scratch_bytes = _impl->scratch_cell_bytes * _impl->options.lanes->capacity();
+  result.pinned_write_scratch_pool_bytes = write_scratch_allocated_bytes.load();
+  return result;
 }
 device_engine* device_engine::try_get(int device) noexcept
 {
@@ -1758,7 +2113,9 @@ device_engine& device_engine::for_device(int device, async_engine_config const& 
     throw std::invalid_argument("device_engine bootstrap requires an enabled engine mode");
   auto& rt = runtime::instance();
   static_cast<void>(rt.ensure_initialized());
-  if (!rt.engine_possible(config.mode)) throw std::runtime_error("cuFile async engine unavailable");
+  if (!rt.engine_possible(config.mode) &&
+      !(config.async_writes && rt.engine_possible(config.mode, true)))
+    throw std::runtime_error("cuFile async engine unavailable");
   auto& arena = device_arena::for_device(device);
   static_cast<void>(arena.warm_up(config));
   device_engine_options options;

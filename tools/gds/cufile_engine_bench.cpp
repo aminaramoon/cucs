@@ -44,6 +44,8 @@ void check(cudaError_t status)
   if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 struct options {
+  std::string spill_mode{"new"};
+  bool flush{};
   std::string file, engine{"legacy"}, workload{"sustained"}, distribution{"mixed"}, csv;
   std::size_t threads{1}, tasks{4}, pipeline{2}, task_bytes{2048 * mib}, single_bytes{1024 * mib};
   std::size_t file_bytes{4096 * mib}, chunk_min{mib}, chunk_max{8 * mib}, columns{64};
@@ -76,22 +78,24 @@ options parse(int argc, char** argv)
   for (int i = 1; i < argc; ++i) {
     std::string key = argv[i];
     if (key == "--help") {
-      std::cout << "cucascade_cufile_engine_bench --file PATH [options]\n"
-                   "  --workload sustained|restore|single (B-3/B-4/B-5; default sustained)\n"
-                   "  --engine legacy|async|simulated (default legacy)\n"
-                   "  --create-file (NEW deterministic pattern file(s); refuses overwrite)\n"
-                   "  --size-mib 4096 --threads 1 --reactors 1 --tasks 4 --pipeline 2 --sync-each\n"
-                   "  --min-seconds 1 --repetitions 1 (whole passes; setup/verification untimed)\n"
-                   "  --drop-cache (fsync + DONTNEED on measured files before EVERY timed pass)\n"
-                   "  --guarded-destinations (reverse destinations + 64-byte canaries)\n"
-                   "  --task-mib 2048 --chunk-min-mib 1 --chunk-max-mib 8\n"
-                   "  --columns 64 --col-dist kib|mixed|large --single-mib 1024\n"
-                   "  --qd 32 --op-mib 4 --arena-mib 256 --device 0 --coalesce 0|1\n"
-                   "  --override fs_type:VALUE|mount_prefix:VALUE|fsid:VALUE (repeatable)\n"
-                   "  --registration slot|unsafe-arena (slot default; AM-9 diagnostic only)\n"
-                   "  --require-direct-evidence 0|1 (default 1; 0 TEST ONLY)\n"
-                   "  --verify 0|1 (default 1: separate verified pass BEFORE timing)\n"
-                   "  --csv PATH (header + one row; '-' = stdout)\n";
+      std::cout
+        << "cucascade_cufile_engine_bench --file PATH [options]\n"
+           "  --workload sustained|restore|single|spill (B-3/B-4/B-5/B-6; default sustained)\n"
+           "  --engine legacy|async|simulated (default legacy)\n"
+           "  --create-file (NEW deterministic pattern file(s); refuses overwrite)\n"
+           "  --size-mib 4096 --threads 1 --reactors 1 --tasks 4 --pipeline 2 --sync-each\n"
+           "  --min-seconds 1 --repetitions 1 (whole passes; setup/verification untimed)\n"
+           "  --drop-cache (fsync + DONTNEED on measured files before EVERY timed pass)\n"
+           "  --guarded-destinations (reverse destinations + 64-byte canaries)\n"
+           "  --task-mib 2048 --chunk-min-mib 1 --chunk-max-mib 8\n"
+           "  --columns 64 --col-dist kib|mixed|large --single-mib 1024\n"
+           "  --qd 32 --op-mib 4 --arena-mib 256 --device 0 --coalesce 0|1\n"
+           "  --override fs_type:VALUE|mount_prefix:VALUE|fsid:VALUE (repeatable)\n"
+           "  --registration slot|unsafe-arena (slot default; AM-9 diagnostic only)\n"
+           "  --require-direct-evidence 0|1 (default 1; 0 TEST ONLY)\n"
+           "  --verify 0|1 (default 1: separate verified pass BEFORE timing)\n"
+           "  --spill-mode new|overwrite --flush 0|1 (spill; defaults new, 0)\n"
+           "  --csv PATH (header + one row; '-' = stdout)\n";
       std::exit(0);
     }
     if (key == "--create-file") {
@@ -114,7 +118,12 @@ options parse(int argc, char** argv)
     std::string value = argv[i];
     if (key == "--file")
       o.file = value;
-    else if (key == "--engine")
+    else if (key == "--spill-mode")
+      o.spill_mode = value;
+    else if (key == "--flush") {
+      if (value != "0" && value != "1") throw std::invalid_argument("--flush requires 0|1");
+      o.flush = value == "1";
+    } else if (key == "--engine")
       o.engine = value;
     else if (key == "--workload")
       o.workload = value;
@@ -202,15 +211,22 @@ options parse(int argc, char** argv)
     throw std::invalid_argument("invalid sizes/counts (see --help)");
   if (o.engine != "legacy" && o.engine != "async" && o.engine != "simulated")
     throw std::invalid_argument("invalid engine");
-  if (o.workload != "sustained" && o.workload != "restore" && o.workload != "single")
+  if (o.workload != "sustained" && o.workload != "restore" && o.workload != "single" &&
+      o.workload != "spill")
     throw std::invalid_argument("invalid workload");
+  if (o.workload == "spill" && (!o.create || o.engine == "simulated" || o.guarded_destinations))
+    throw std::invalid_argument(
+      "spill requires --create-file, legacy|async, and no destination guards");
+  if (o.spill_mode != "new" && o.spill_mode != "overwrite")
+    throw std::invalid_argument("invalid spill-mode");
   if (o.distribution != "kib" && o.distribution != "mixed" && o.distribution != "large")
     throw std::invalid_argument("invalid col-dist");
   if (o.workload == "single" && o.single_bytes > o.file_bytes)
     throw std::invalid_argument("single-mib exceeds size-mib");
   for (auto& entry : o.overrides) {
-    entry.qd       = o.qd;
-    entry.op_bytes = o.op_bytes;
+    entry.qd           = o.qd;
+    entry.op_bytes     = o.op_bytes;
+    entry.allow_writes = o.workload == "spill";
   }
   async_engine_config validation;
   validation.mount_overrides = o.overrides;
@@ -219,10 +235,11 @@ options parse(int argc, char** argv)
 }
 
 // Same offset-dependent SplitMix64 pattern as cufile_async_qd. No zero-file shortcuts.
-void fill(std::vector<std::uint64_t>& words, std::size_t offset)
+void fill(std::vector<std::uint64_t>& words, std::size_t offset, std::uint64_t seed = 0)
 {
   for (std::size_t i = 0; i < words.size(); ++i) {
-    auto v   = static_cast<std::uint64_t>(offset / 8 + i) + 0x9e3779b97f4a7c15ULL;
+    auto v = static_cast<std::uint64_t>(offset / 8 + i) + 0x9e3779b97f4a7c15ULL +
+             seed * 0xd1342543de82ef95ULL;
     v        = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9ULL;
     v        = (v ^ (v >> 27)) * 0x94d049bb133111ebULL;
     words[i] = v ^ (v >> 31);
@@ -266,7 +283,9 @@ struct layout {
 layout make_layout(options const& o, std::size_t index)
 {
   layout l;
-  l.path = o.file + (o.workload == "restore" ? ".batch-" + std::to_string(index) : "");
+  l.path = o.file + (o.workload == "restore" ? ".batch-" + std::to_string(index)
+                     : o.workload == "spill" ? ".spill-" + std::to_string(index)
+                                             : "");
   std::mt19937_64 rng(42 + index);
   if (o.workload == "restore") {
     for (std::size_t i = 0; i < o.columns; ++i) {
@@ -280,6 +299,10 @@ layout make_layout(options const& o, std::size_t index)
       l.file_bytes += (size + 4095) / 4096 * 4096;
       l.logical_bytes += size;
     }
+  } else if (o.workload == "spill") {
+    l.ranges.push_back({37, o.task_bytes - 74});
+    l.logical_bytes = o.task_bytes - 74;
+    l.file_bytes    = o.task_bytes;
   } else if (o.workload == "single") {
     l.ranges.push_back({0, o.single_bytes});
     l.logical_bytes = o.single_bytes;
@@ -301,14 +324,15 @@ struct task {
   cudaStream_t stream{};
   void* destination{};
   std::vector<std::vector<slice>> prepared;
+  std::vector<std::vector<write_slice>> prepared_writes;
   cucascade::exec::semi_future<std::size_t> future;
   layout const* description{};
   std::span<layout const> layouts;
   std::size_t selected{}, allocation_bytes{};
-  bool guarded{};
+  bool guarded{}, spilling{};
 
-  explicit task(std::span<layout const> descriptions, bool guards = false)
-    : layouts(descriptions), guarded(guards)
+  explicit task(std::span<layout const> descriptions, bool guards = false, bool spill = false)
+    : layouts(descriptions), guarded(guards), spilling(spill)
   {
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     try {
@@ -324,13 +348,19 @@ struct task {
           max_bytes = std::max(max_bytes, l.logical_bytes + 128 * l.ranges.size());
         }
       }
-      allocation_bytes = max_bytes;
+      // A shifted view of a nonconstant source distinguishes each file without
+      // allocating the whole disk working set on the GPU. Refill once per pass,
+      // outside timing; a pipeline slot never has two active users.
+      allocation_bytes = max_bytes + (spill ? layouts.size() * 4096 : 0);
       check(cudaMallocAsync(&destination, allocation_bytes, stream));
       prepared.reserve(layouts.size());
+      prepared_writes.reserve(layouts.size());
+      std::size_t layout_index{};
       for (auto const& l : layouts) {
         std::vector<slice> slices;
         slices.reserve(l.ranges.size());
-        std::size_t offset = guarded ? allocation_bytes : 0;
+        std::size_t offset = guarded ? allocation_bytes : spill ? layout_index * 4096 : 0;
+        ++layout_index;
         for (auto rng : l.ranges) {
           if (guarded) offset -= rng.size + 128;
           slices.emplace_back(
@@ -339,6 +369,10 @@ struct task {
             static_cast<std::uint8_t*>(destination) + offset + (guarded ? 64 : 0));
           if (!guarded) offset += rng.size;
         }
+        std::vector<write_slice> writes;
+        for (auto const& s : slices)
+          writes.emplace_back(s.offset(), s.size(), s.dst);
+        prepared_writes.push_back(std::move(writes));
         prepared.push_back(std::move(slices));
       }
       check(cudaStreamSynchronize(stream));  // Pool growth finishes BEFORE timing.
@@ -348,6 +382,14 @@ struct task {
       static_cast<void>(cudaStreamDestroy(stream));
       throw;
     }
+  }
+  void prepare_spill(std::uint64_t seed)
+  {
+    std::vector<std::uint64_t> words((allocation_bytes + 7) / 8);
+    fill(words, 0, seed);
+    check(
+      cudaMemcpyAsync(destination, words.data(), allocation_bytes, cudaMemcpyHostToDevice, stream));
+    check(cudaStreamSynchronize(stream));
   }
   void select(std::size_t index)
   {
@@ -370,17 +412,29 @@ struct task {
   void consume(bool verify)
   {
     if (std::move(future).get() != description->logical_bytes)
-      throw std::runtime_error("short logical read");
+      throw std::runtime_error("short logical transfer");
     // AM-1: consume future then synchronize ONLY this task's caller stream.
     check(cudaStreamSynchronize(stream));
-    if (!verify) return;
+    if (verify) verify_contents();
+  }
+  void verify_contents()
+  {
     file_descriptor reference(::open(description->path.c_str(), O_RDONLY | O_CLOEXEC));
     if (reference.get() < 0) throw std::runtime_error("verification open failed");
     std::vector<std::byte> expected(64 * 1024), actual(64 * 1024);
     for (auto const& s : slices()) {
-      // Full contents for small columns, otherwise head/middle/tail samples.
-      auto count = std::min<std::size_t>(s.size() <= 64 * 1024 ? s.size() : 256, s.size());
-      for (auto relative : {std::size_t{0}, (s.size() - count) / 2, s.size() - count}) {
+      // Every spill byte is checked, including every physical body piece.
+      std::vector<std::size_t> offsets;
+      if (spilling) {
+        for (std::size_t offset = 0; offset < s.size(); offset += actual.size())
+          offsets.push_back(offset);
+      } else {
+        auto count = std::min<std::size_t>(s.size() <= 64 * 1024 ? s.size() : 256, s.size());
+        offsets    = {0, (s.size() - count) / 2, s.size() - count};
+      }
+      for (auto relative : offsets) {
+        auto count =
+          std::min(spilling || s.size() <= 64 * 1024 ? actual.size() : 256, s.size() - relative);
         pread_exact(reference.get(), expected.data(), count, s.offset() + relative);
         check(
           cudaMemcpyAsync(actual.data(), s.dst + relative, count, cudaMemcpyDeviceToHost, stream));
@@ -427,7 +481,7 @@ int run(options const& o)
   for (std::size_t i = 0; i < o.threads * o.tasks; ++i)
     layouts.push_back(make_layout(o, i));
   if (o.create) {
-    if (o.workload == "restore")
+    if (o.workload == "restore" || o.workload == "spill")
       for (auto const& l : layouts)
         create_file(l.path, l.file_bytes);
     else
@@ -446,6 +500,7 @@ int run(options const& o)
   cfg.async_engine.mount_overrides               = o.overrides;
   cfg.async_engine.probe.require_direct_evidence = o.require_direct;
   cfg.async_engine.coalesce                      = o.coalesce;
+  cfg.async_engine.async_writes                  = o.workload == "spill";
   if (o.engine == "simulated") {
     // Synthetic CUDA/host scheduling is not a libcufile slow-submit qualification signal.
     cfg.async_engine.demotion.slow_floor_us = 100000;
@@ -505,8 +560,10 @@ int run(options const& o)
   auto const open_start = clock_type::now();
   std::vector<std::shared_ptr<io_object>> objects;
   for (auto const& l : layouts) {
-    auto object = o.workload != "restore" && !objects.empty() ? objects.front()
-                                                              : context->open_io_object(l.path);
+    auto object = o.workload == "spill"
+                    ? context->open_io_object_for_write(l.path, {write_mode::open_existing})
+                  : o.workload != "restore" && !objects.empty() ? objects.front()
+                                                                : context->open_io_object(l.path);
     if (object->size() < l.file_bytes) throw std::runtime_error("input file too small");
     if (simulator && !static_cast<cufile_io_object const&>(*object).cufile_registered())
       throw std::runtime_error(
@@ -534,7 +591,9 @@ int run(options const& o)
                 })->file_bytes);
   create_file(warm_disk.path, warm_bytes);
   warm_disk.created = true;
-  auto warm_object  = context->open_io_object(warm_disk.path);
+  auto warm_object  = o.workload == "spill" ? context->open_io_object_for_write(
+                                               warm_disk.path, {write_mode::open_existing})
+                                            : context->open_io_object(warm_disk.path);
   if (engine) {
     // Prewarm every physical stream before the policy watchdog can mistake lazy
     // libcufile initialization for a slow/stuck transport. Hold leases to visit each once.
@@ -563,6 +622,19 @@ int run(options const& o)
         pread_exact(file.buffered_fd(), expected.data(), expected.size(), 0);
         if (actual != expected) throw std::runtime_error("physical warmup data mismatch");
       }
+      if (o.workload == "spill") {
+        args.bytes_done = pending_sentinel;
+        auto write_rc   = transport->write_async(file.cufile_handle(),
+                                               slot->base_ptr_to_pass(),
+                                               &args.size,
+                                               &args.file_offset,
+                                               &args.buffer_offset,
+                                               &args.bytes_done,
+                                               (*lane)->stream());
+        check(cudaStreamSynchronize((*lane)->stream()));
+        if (!write_rc.ok() || args.bytes_done != static_cast<ssize_t>(args.size))
+          throw std::runtime_error("physical write warmup failed");
+      }
       warm_lanes.push_back(std::move(*lane));
     }
   }
@@ -580,8 +652,10 @@ int run(options const& o)
   std::vector<std::vector<std::unique_ptr<task>>> pipelines(o.threads);
   for (std::size_t t = 0; t < o.threads; ++t)
     for (std::size_t p = 0; p < depth; ++p)
-      pipelines[t].push_back(std::make_unique<task>(
-        std::span<layout const>{layouts}.subspan(t * o.tasks, o.tasks), o.guarded_destinations));
+      pipelines[t].push_back(
+        std::make_unique<task>(std::span<layout const>{layouts}.subspan(t * o.tasks, o.tasks),
+                               o.guarded_destinations,
+                               o.workload == "spill"));
   auto execute = [&](std::size_t thread, bool verify) {
     auto& slots = pipelines[thread];
     auto finish = [&](std::size_t i) { slots[i % depth]->consume(verify); };
@@ -591,12 +665,32 @@ int run(options const& o)
       next.select(i);
       if (verify && next.guarded)
         check(cudaMemsetAsync(next.destination, 0xcc, next.allocation_bytes, next.stream));
-      next.future = context->device_readv_async_io(
-        *objects[thread * o.tasks + i], next.slices(), ::cuda::stream_ref{next.stream});
+      if (o.workload == "spill")
+        next.future = context->device_writev_async(*objects[thread * o.tasks + i],
+                                                   next.prepared_writes[next.selected],
+                                                   ::cuda::stream_ref{next.stream});
+      else
+        next.future = context->device_readv_async_io(
+          *objects[thread * o.tasks + i], next.slices(), ::cuda::stream_ref{next.stream});
     }
     for (std::size_t i = o.tasks - std::min(depth, o.tasks); i < o.tasks; ++i)
       finish(i);
+    if (o.workload == "spill" && o.flush)
+      for (std::size_t i = 0; i < o.tasks; ++i)
+        context->flush_async(*objects[thread * o.tasks + i]).get();
   };
+  auto prepare_spill = [&](std::size_t pass) {
+    if (o.workload != "spill") return;
+    for (std::size_t t = 0; t < o.threads; ++t)
+      for (std::size_t p = 0; p < depth; ++p)
+        pipelines[t][p]->prepare_spill(1 + pass * (o.threads * depth) + t * depth + p);
+    if (o.spill_mode == "new")
+      for (auto const& object : objects) {
+        auto const& file = static_cast<cufile_io_object const&>(*object);
+        if (ftruncate(file.buffered_fd(), 0)) throw std::runtime_error("spill truncate failed");
+      }
+  };
+  prepare_spill(0);
   // Verification is a separate, untimed pass. No pread/D2H comparisons in timing.
   if (o.verify)
     for (std::size_t t = 0; t < o.threads; ++t)
@@ -617,7 +711,7 @@ int run(options const& o)
   auto evict = [&] {
     if (!o.drop_cache) return;
     for (std::size_t i = 0; i < objects.size(); ++i) {
-      if (o.workload != "restore" && i != 0) break;
+      if (o.workload != "restore" && o.workload != "spill" && i != 0) break;
       auto const& file = static_cast<cufile_io_object const&>(*objects[i]);
       if (fsync(file.buffered_fd())) throw std::runtime_error("cache-drop fsync failed");
       auto error = posix_fadvise(file.buffered_fd(), 0, 0, POSIX_FADV_DONTNEED);
@@ -670,6 +764,7 @@ int run(options const& o)
     measured_backlog_ns{};
   try {
     do {
+      prepare_spill(passes + 1);  // Untimed; unique source seed and fresh extents per pass.
       evict();  // Untimed, repeated for EVERY pass, including after verification/creation.
       auto pass_before = snapshot();  // Exclude eviction/idle gaps from engine QD integrals too.
       auto start       = clock_type::now();
@@ -701,6 +796,13 @@ int run(options const& o)
   sampler.join();
   sample_effective();
   auto after = snapshot();
+  if (o.verify && o.workload == "spill")
+    for (std::size_t t = 0; t < o.threads; ++t)
+      for (std::size_t i = 0; i < o.tasks; ++i) {
+        auto& slot = *pipelines[t][i % depth];
+        slot.select(i);
+        slot.verify_contents();  // Final timed pass, not another write pass.
+      }
   // Histograms are additive; remove the untimed warm-up samples.
   auto subtract = [](engine_histogram a, engine_histogram const& b) {
     for (std::size_t i = 0; i < a.buckets.size(); ++i)
@@ -709,12 +811,15 @@ int run(options const& o)
     a.total_ns -= b.total_ns;
     return a;
   };
-  auto submit          = subtract(after.submit, before.submit);
-  auto completion      = subtract(after.completion, before.completion);
-  auto ops             = after.completed_ops - before.completed_ops;
-  auto transport_bytes = after.async_registered_bytes - before.async_registered_bytes +
-                         after.async_unregistered_bytes - before.async_unregistered_bytes +
-                         after.sync_bytes - before.sync_bytes;
+  auto submit            = subtract(after.submit, before.submit);
+  auto completion        = subtract(after.completion, before.completion);
+  auto ops               = after.completed_ops - before.completed_ops;
+  auto const write_bytes = after.async_write_bytes - before.async_write_bytes +
+                           after.direct_write_bytes - before.direct_write_bytes +
+                           after.buffered_write_bytes - before.buffered_write_bytes;
+  auto transport_bytes = write_bytes + after.async_registered_bytes -
+                         before.async_registered_bytes + after.async_unregistered_bytes -
+                         before.async_unregistered_bytes + after.sync_bytes - before.sync_bytes;
   auto mean = [](std::uint64_t integral, std::uint64_t duration) {
     return duration ? static_cast<double>(integral) / static_cast<double>(duration) : 0;
   };
@@ -752,7 +857,8 @@ int run(options const& o)
     "arena_bytes,pipeline,sync_each,columns,col_dist,cache_state,reactors,passes,min_seconds,"
     "repetitions,chunk_min_bytes,chunk_max_bytes,task_bytes,single_bytes,file_bytes,file,"
     "overrides,libcufile_version,gds_available,compat_only,forced_compat,Q_eff_min,S_eff_min,"
-    "guarded_destinations";
+    "guarded_destinations,async_write_bytes,direct_pwrite_bytes,buffered_pwrite_bytes,spill_mode,"
+    "flush,NOT_GDS";
   std::ostringstream row;
   row << std::fixed << std::setprecision(3) << o.engine << ',' << o.workload << ',' << o.threads
       << ',' << o.tasks << ',' << o.verify << ',' << (o.unsafe_arena ? "unsafe-arena" : "slot")
@@ -786,7 +892,10 @@ int run(options const& o)
       << ',' << gds_available() << ',' << platform.compat_only << ',' << platform.forced_compat
       << ',' << (min_qd.load() == std::numeric_limits<unsigned>::max() ? 0 : min_qd.load()) << ','
       << (min_bytes.load() == std::numeric_limits<std::size_t>::max() ? 0 : min_bytes.load()) << ','
-      << o.guarded_destinations;
+      << o.guarded_destinations << ',' << after.async_write_bytes - before.async_write_bytes << ','
+      << after.direct_write_bytes - before.direct_write_bytes << ','
+      << after.buffered_write_bytes - before.buffered_write_bytes << ',' << o.spill_mode << ','
+      << o.flush << ",1";
   std::cout << header << '\n' << row.str() << '\n';
   if (!o.csv.empty() && o.csv != "-") {
     std::ofstream csv(o.csv);

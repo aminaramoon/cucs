@@ -268,6 +268,21 @@ struct transport_simulator::state {
       std::lock_guard lock(self.mutex);
       if (item.write && item.copy->count != 0)
         self.image_size = std::max(self.image_size, item.copy->file_offset + item.copy->count);
+      if (item.write && item.result > 0 && self.config.mirror_write_fd >= 0) {
+        std::size_t written{};
+        while (written < static_cast<std::size_t>(item.result)) {
+          auto const count = pwrite(self.config.mirror_write_fd,
+                                    self.image + item.copy->file_offset + written,
+                                    static_cast<std::size_t>(item.result) - written,
+                                    static_cast<off_t>(item.copy->file_offset + written));
+          if (count < 0 && errno == EINTR) continue;
+          if (count <= 0) {
+            item.result = -EIO;
+            break;
+          }
+          written += static_cast<std::size_t>(count);
+        }
+      }
       if (!item.rule.preserve_bytes_done) *item.bytes_done = item.result;
       ++self.counts.completed;
       if (item.inflight_counted) {
@@ -392,6 +407,12 @@ std::vector<transport_simulator::submission> transport_simulator::submissions() 
 {
   std::lock_guard lock(_state->mutex);
   return _state->calls;
+}
+
+void transport_simulator::mirror_writes_to(int fd)
+{
+  std::lock_guard lock(_state->mutex);
+  _state->config.mirror_write_fd = fd;
 }
 
 std::vector<std::byte> transport_simulator::image() const

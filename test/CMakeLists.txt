@@ -143,6 +143,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_mount_policy.cpp
               io/cufile/test_engine_coalesce.cpp
               io/cufile/test_engine_read.cpp
+              io/cufile/test_engine_write.cpp
               io/cufile/test_engine_failure.cpp
               io/cufile/test_engine_sched.cpp
               io/cufile/test_engine_ioctx.cpp)

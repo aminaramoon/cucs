@@ -239,6 +239,7 @@ class operation {
   operation& operator=(operation&&)      = delete;
 
   [[nodiscard]] operation_kind kind() const noexcept { return _kind; }
+  void set_kind(operation_kind kind) noexcept { _kind = kind; }
   [[nodiscard]] operation_phase phase() const noexcept { return _phase; }
   [[nodiscard]] bool is_read() const noexcept
   {

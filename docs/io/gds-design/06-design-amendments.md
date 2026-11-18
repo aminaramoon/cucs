@@ -340,6 +340,9 @@ Promotes open question §9.15 into the plan.
   throttled live snapshots, deadline/notification-driven backlog service, and
   reaper active-ns/iteration gauges. Cleanup has an independently started,
   semaphore-driven executor, isolated from sync I/O; final owners stay off-reaper.
+  Phase 5 interval notifications avoid fixed-period conflict polling; G-5 must
+  still measure range-waiter scans, legacy queue wakeups, inode activity guards,
+  and quarantined-holder idle health checks under high contention.
   Per-mount/tier intrusive ready queues, incremental request accounting, batched
   cleanup and parked-only eventfd writes remain Phase 7 prerequisites for G-5.
   Replacing the DRR containers is a separate scheduler change requiring high-R
@@ -431,3 +434,79 @@ Extends AM-6; legacy remains the default. No hardware qualification is implied.
   - The I/O-event poll cap becomes `clamp(p50_completion(mount, class) / 8, poll.io_cap_us, 1 ms)`, instead of a fixed 100 µs.
   - A loop wake-up caused by an unrelated ring publication must not re-poll lane heads whose deadline has not arrived.
   - B-1 and B-3 must report `queries_per_op` ≤ 70 on both compat and GDS hosts before the default flips (G-5).
+
+## AM-16: Async write ordering, failure and pinned budget (Phase 5 review)
+
+Extends §4.10 / §6.13. Legacy remains the default; no direct-write hardware
+qualification or B-6 acceptance result is implied.
+
+- **Identity and tickets.** Writable handles lazily share a weak, process-wide
+  `(st_dev, st_ino)` registry. Final destruction removes only its own entry,
+  never a replacement created during the final-owner race. Handles, typed
+  submission tickets, intervals and flush callbacks retain live state.
+  Tickets cover queued legacy and engine writes before splitting/dispatch.
+- **Legacy activation barrier (P5-R2).** Before inode activation, a legacy
+  dispatch takes only an activity guard: granule-sharing legacy peers are NOT
+  serialized. A submission-time capability snapshot (or explicit engine
+  handoff) activates that inode before a gated write can be flushed. The snapshot
+  may conservatively activate an unqualified inode, but never a legacy-only
+  context or a shared engine without write support. Engine interval
+  admission waits for preactivation guards to retire before storage I/O; later
+  legacy dispatches take intervals. This guards synchronous dispatch instead of
+  waiting for whole submission tickets, which could deadlock a mixed request.
+  No process-global engine flag or application-thread mount lookup is needed.
+  The short mutex/guard overhead remains subject to NFR-2 Phase 7 qualification.
+- **Intervals and notification.** The bookkeeping mutex blocks briefly; a lock
+  miss is never a conflict. Each inode fixes its granule on first use.
+  Same-mode byte overlaps and cross-mode granule overlaps conflict. Legacy
+  body slices use conservative `mixed` intervals; buffered-only slices use
+  `buffered`. Release notifies range-overlapping waiters outside the mutex.
+  Engine nodes park without 100-us retries, retaining already-staged slots and
+  lanes but no blocking worker. Parked legacy writes do not consume the reactor
+  in-flight gate; release wakes its queue. Synchronous `host_write` waits on a
+  condition variable. Idle health wakes remain a notification-failure fallback.
+  AM-13 G-5 must measure waiter scans and contention, not assume NFR-3.
+- **Quarantine.** Unproven lanes retain slots, cells, intervals and tickets for
+  process lifetime. `quarantined_write_intervals`, the inode diagnostic count
+  and a warning expose that overlapping writes and flushes on that inode cannot
+  complete. `drain` reports incomplete. No timeout may release a possibly-live
+  interval; disjoint operations remain schedulable.
+- **Routing and evidence.** Slices stay wholly engine or wholly legacy.
+  Routing checks shared-engine `accepts_writes()`, not just facade configuration
+  (first bootstrap still wins). `allow_writes` requires an operator-qualified
+  override; read probes/test promotion never grant writes. Automatic production
+  evidence remains unavailable (AM-11), so explicit write override is the only
+  production route. Missing evidence revokes automatic writes only, not standing
+  overrides or reads. Independently, negative completions revoke writes even
+  with overrides, logging once; ENOSPC/EACCES/EDQUOT do not demote the mount.
+- **Progress and completion.** Source reads wait for the caller fence; futures
+  are host-complete, not durable. Unknown/zero/negative/oversized progress fails
+  without replay and never advances `note_written`. A sentinel requires owned
+  lane recovery, not mere event observation. Watchdog-classified stuck writes
+  still fail after recovery even if their delayed submit eventually succeeds
+  (§7 #29); this conservative rule is intentionally retained.
+  Positive shorts reuse only the known suffix of the slot; unaligned suffixes
+  and known-progress direct EINVAL/EOPNOTSUPP continuations go buffered under
+  the same interval. Cleanup releases resources off-reaper.
+- **Pinned budget.** Write engines preallocate one `write_granule()` cell per
+  lane, not one largest-class cell. Blocking fallback streams retained-slot
+  contents through that cell in granule chunks, synchronizing only its owned
+  lane before reuse. No class-sized fallback pool or per-operation pinned
+  allocation is needed: 160 lanes cost 640 KiB with 4-KiB pages, or 10 MiB with
+  64-KiB pages. `pinned_write_scratch_bytes` reports the engine budget and
+  `pinned_write_scratch_pool_bytes` the process total including idle banks.
+  Returned banks are reused in the process pool (avoiding device-wide
+  cudaFreeHost synchronization); production engines themselves are
+  process-lifetime. Reservation-manager integration remains open (AM-5).
+- **Flush.** Sticky per-inode engine history selects sequence-driven flush even
+  through legacy handles. Capture waits for writes at or before that sequence,
+  including in-flight writes (stronger than resolved-before public semantics),
+  never later tickets. Retirement callbacks enqueue fdatasync on the blocking
+  pool; workers never wait on the sequence.
+- **B-6.** Spill requires real legacy/libcufile transport, not the read-image
+  simulator. Shifted SplitMix64 source views distinguish offsets/files and every
+  pass refills with a unique seed outside timing. Verify every written byte
+  before timing and after the final timed pass. `--spill-mode new|overwrite`
+  defaults to truncating to zero before each pass; `--flush 1` includes flush
+  in timing. CSV records both. Recipes use `/mnt/disk_2` and advisory cache
+  eviction. Compat smoke is not GDS evidence.

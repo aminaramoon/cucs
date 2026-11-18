@@ -435,6 +435,11 @@ TEST_CASE("cuFile engine capability requires async read, direct properties and o
     api.has_async_read = false;
     api.read_async     = nullptr;
   }
+  SECTION("missing async write")
+  {
+    api.has_async_write = false;
+    api.write_async     = nullptr;
+  }
   SECTION("force compat environment") { forced_compat = true; }
   driver_open_state driver;
   runtime context(&api, driver, {}, forced_compat);
@@ -443,6 +448,10 @@ TEST_CASE("cuFile engine capability requires async read, direct properties and o
   CHECK(context.engine_possible(engine_mode::async_auto) ==
         (library.dstatusflags != 0 && api.has_async_read && !forced_compat));
   CHECK(context.engine_possible(engine_mode::async_simulated_for_testing) == api.has_async_read);
+  CHECK(context.engine_possible(engine_mode::async_auto, true) ==
+        (library.dstatusflags != 0 && api.has_async_write && !forced_compat));
+  CHECK(context.engine_possible(engine_mode::async_simulated_for_testing, true) ==
+        api.has_async_write);
 }
 
 TEST_CASE("cuFile driver transaction excludes legacy opening throughout setters and properties",

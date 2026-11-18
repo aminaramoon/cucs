@@ -46,7 +46,16 @@
     - AM-12: bounded admission of fence-blocked reads.
     - AM-13: tracked follow-ups.
     - The `cudf/datasource.hpp` change is doc-only (verified).
-  - **Phase 4 (coalescing + engine benchmark): DONE** (commit follows).
+  - **Phase 5 (async writes): DONE** (commit follows).
+    - Review: CHANGES-REQUIRED (17 findings). Integrity core sound: no path replays a write of unknown progress.
+      - Fixed: R1-R10, R12-R17.
+      - Declined: R11, keeping the conservative stuck-write failure policy (recorded in AM-16).
+    - Tests: 893 cases, 892 passed, 1 skipped. Zero warnings.
+    - Lead race loop: 12 of 12 passed.
+    - `types.hpp` gained a typed `backend_owner` ticket on slices, so inode write sequencing survives slice splitting.
+  - Phase 6 (polling, deferred hardening, affinity, params, profiles, docs): next
+  - Phase 7a (non-GDS qualification: runner/analysis tooling, B-10 compat regression, soak, sanitizers, B-1 here): after Phase 6
+  - **Phase 4 (coalescing + engine benchmark): DONE**, commit `d11c9de`.
     - Review: no BLOCKING findings; P4-R1 to R18 all fixed.
     - Tests: 860 cases, 859 passed, 1 skipped. Zero warnings.
     - Lead race loop: 12 of 12 passed.

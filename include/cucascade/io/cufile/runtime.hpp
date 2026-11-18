@@ -171,10 +171,12 @@ class runtime {
   /**
    * @brief Capability gate only; default legacy mode always returns false. Never initializes.
    * async_auto additionally requires direct-capable properties and no forced compat mode.
-   * async_simulated_for_testing requires only an open driver and async read symbols, permitting
+   * With writes=true the independent async-write group is checked instead of async-read.
+   * async_simulated_for_testing requires only an open driver and the selected symbols, permitting
    * the explicit compat/simulator tests in AM-4/AM-7. Neither mode qualifies a specific mount.
    */
-  [[nodiscard]] bool engine_possible(engine_mode mode = engine_mode::legacy) const noexcept;
+  [[nodiscard]] bool engine_possible(engine_mode mode = engine_mode::legacy,
+                                     bool writes      = false) const noexcept;
   [[nodiscard]] std::uint64_t generation() const noexcept;
   /// Null before initialization or when the library is absent.
   [[nodiscard]] cufile_api const* api() const noexcept;
@@ -196,6 +198,7 @@ class runtime {
   std::atomic<cufile_api const*> _api{nullptr};
   std::atomic<bool> _engine_capable{false};
   std::atomic<bool> _async_capable{false};
+  std::atomic<bool> _write_capable{false}, _direct_capable{false};
   std::atomic<std::uint64_t> _generation{0};
 };
 

@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cucascade/io/cufile/async_transport.hpp>
+#include <cucascade/io/cufile/file_write_state.hpp>
 #include <cucascade/io/cufile/mount_policy.hpp>
 #include <cucascade/io/cufile/operation.hpp>
 
@@ -37,7 +38,8 @@ using engine_fence = submit_fence;
 /**
  * @brief One adopted slice credit. Streams MUST already be resolved on the caller thread.
  *
- * The fence must already be recorded. The caller keeps user_ptr valid through synchronization
+ * The fence must already be recorded. Write sources stay valid until the host-complete future.
+ * For reads the caller keeps user_ptr valid through synchronization
  * of user_stream after success (AM-1); PTDS requests instead finish host-complete. Cancellation
  * is optional and supplements coordinator.should_continue(). Submitted storage work drains.
  * The original credit pins lazy expansion; every non-final piece adds a new credit first.
@@ -52,6 +54,8 @@ struct engine_slice {
   /// Optional facade-pass publication barrier: no expansion until all siblings are visible.
   std::shared_ptr<std::atomic<bool>> publication_ready;
   std::size_t merge_gap_bytes{IO_BLOCK_SIZE};
+  bool write{false};
+  std::shared_ptr<file_write_state::ticket> write_ticket;
   range logical;
   void* user_ptr{};
   int device_id{-1};
@@ -93,7 +97,13 @@ struct engine_gauges {
   std::uint64_t metadata_fallbacks{}, unsupported_fallbacks{}, late_copy_failures{};
   std::uint64_t reaper_iterations{}, reaper_active_ns{};
   std::uint64_t async_registered_bytes{}, async_unregistered_bytes{}, sync_bytes{};
-  std::uint64_t enqueued_logical_bytes{};  ///< Exact targets served, excluding gaps/retries.
+  std::uint64_t async_write_bytes{}, direct_write_bytes{}, buffered_write_bytes{};
+  std::uint64_t short_writes{}, buffered_suffixes{}, granule_conflicts{}, granule_wait_ns{};
+  std::size_t pinned_write_scratch_bytes{}, quarantined_write_intervals{};
+  /// Total process-wide allocated write banks, including cached idle banks; not additive.
+  std::size_t pinned_write_scratch_pool_bytes{};
+  std::uint64_t flush_waits{};  ///< Process-wide inode flush waits, not additive across devices.
+  std::uint64_t enqueued_logical_bytes{};  ///< Successful exact targets (writes host-complete).
   engine_histogram submit, completion, residence, io_poll_delay, copy_poll_delay;
   std::vector<engine_mount_gauges> mounts;
 };
@@ -120,10 +130,14 @@ struct device_engine_options {
   std::function<void*(io_object const&)> file_handle;
   /// Nonblocking descriptor extraction; injected simulator files can exercise fstat/pread.
   std::function<int(io_object const&)> buffered_fd;
+  std::function<int(io_object const&)> direct_fd;
+  std::shared_ptr<evidence_source> write_evidence;
+  /// Known-progress POSIX write seam (blocking executor only).
+  std::function<ssize_t(int, void const*, std::size_t, off_t)> write_at = ::pwrite;
 };
 
 /**
- * @brief Per-device staged-read scheduler shared by opt-in reactor facades.
+ * @brief Per-device staged I/O scheduler shared by opt-in reactor facades.
  *
  * for_device bootstraps once (first configuration wins) and intentionally never destroys the
  * engine or arena. try_get never constructs. Explicit instances are for tests/control bootstrap.
@@ -136,6 +150,9 @@ class device_engine {
   [[nodiscard]] static device_engine& for_device(int device,
                                                  async_engine_config const& config = {});
   [[nodiscard]] static device_engine* try_get(int device) noexcept;
+  /// Captures the inode sequence now; fdatasync runs on the process blocking pool.
+  [[nodiscard]] static exec::semi_future<void> flush_async(std::shared_ptr<const io_object> file,
+                                                           std::shared_ptr<file_write_state> state);
   device_engine(int device, async_engine_config config, device_engine_options options);
   ~device_engine();
   device_engine(device_engine const&)            = delete;
@@ -143,6 +160,7 @@ class device_engine {
 
   /// Published bootstrap is usable until stop or a failed device-thread initialization.
   [[nodiscard]] bool ready() const noexcept;
+  [[nodiscard]] bool accepts_writes() const noexcept;
 
   /// Bounded metadata admission, no waits for lanes/slots/thread creation; adopts credit always.
   void hand_off(engine_slice slice, bool reserved = false) noexcept;

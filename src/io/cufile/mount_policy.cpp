@@ -337,6 +337,8 @@ mount_policy::mount_policy(mount_policy_key key,
       case mount_override_state::operator_qualified:
         _state             = mount_state::operator_qualified;
         _operator_override = true;
+        _override_writes   = entry->allow_writes;
+        _writes_qualified  = entry->allow_writes;
         break;
       case mount_override_state::known_compat: _state = mount_state::known_compat; break;
       case mount_override_state::legacy: _override_legacy = true; break;
@@ -349,9 +351,11 @@ bool mount_policy::read_eligible() const noexcept { return _config.async_reads &
 bool mount_policy::write_eligible() const noexcept
 {
   auto const current = state();
-  return _config.async_writes && _writes_qualified.load(std::memory_order_relaxed) &&
+  return _config.mode != engine_mode::legacy && _config.async_writes &&
+         _writes_qualified.load(std::memory_order_relaxed) &&
          !_write_evidence_failed.load(std::memory_order_relaxed) &&
-         (current == mount_state::verified_direct || current == mount_state::operator_qualified);
+         (current == mount_state::verified_direct ||
+          (current == mount_state::operator_qualified && _operator_override && _override_writes));
 }
 
 mount_profile mount_policy::base_profile() const noexcept { return _profile; }
@@ -375,6 +379,13 @@ void mount_policy::set_effective(effective_profile profile)
   _effective_epoch.fetch_add(1);
 }
 
+void mount_policy::revoke_writes() noexcept
+{
+  if (!_write_evidence_failed.exchange(true))
+    CUCASCADE_LOG_WARN("cuFile mount {}: async write failed; later writes revert to legacy",
+                       _key.mount_id);
+}
+
 void mount_policy::qualify_writes(bool qualified) noexcept
 {
   _writes_qualified.store(qualified, std::memory_order_relaxed);
@@ -386,7 +397,12 @@ void mount_policy::observe_write_evidence(std::size_t bytes, bool direct) noexce
   if (_write_bytes >= interval) return;
   _write_bytes += std::min(bytes, interval - _write_bytes);
   _write_direct_seen = _write_direct_seen || direct;
-  if (_write_bytes == interval && !_write_direct_seen) _write_evidence_failed = true;
+  if (_write_bytes == interval && !_write_direct_seen && !_operator_override) {
+    _write_evidence_failed = true;
+    CUCASCADE_LOG_WARN(
+      "cuFile mount {}: no attributable async write evidence; writes revert to legacy",
+      _key.mount_id);
+  }
 }
 
 struct mount_policy::probe_task_guard {

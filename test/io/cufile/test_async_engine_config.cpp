@@ -103,6 +103,19 @@ TEST_CASE("async engine modes and feature switches validate independently", "[io
   }
 }
 
+TEST_CASE("async write overrides require explicit operator qualification", "[io][cufile][config]")
+{
+  auto state = GENERATE(mount_override_state::operator_qualified,
+                        mount_override_state::known_compat,
+                        mount_override_state::legacy);
+  async_engine_config cfg;
+  cfg.mount_overrides.push_back({mount_match::mount_prefix, "/", state, {}, {}, true});
+  if (state == mount_override_state::operator_qualified)
+    CHECK_NOTHROW(cfg.validate());
+  else
+    check_invalid(cfg, "allow_writes");
+}
+
 TEST_CASE("async engine rejects unknown mode values", "[io][cufile][config]")
 {
   auto const invalid = GENERATE(3U, 255U);

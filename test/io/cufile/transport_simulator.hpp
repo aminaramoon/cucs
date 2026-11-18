@@ -57,6 +57,8 @@ class transport_simulator final : public cufile_transport {
     /// Opt-in initialized/stable-input contract for submit-time validation, snapshots and
     /// file-offset fault selectors. By default no input argument is read until stream execution.
     bool sample_arguments_at_submit{false};
+    /// Optional borrowed fd: mirror completed GPU writes before publishing completion.
+    int mirror_write_fd{-1};
   };
 
   struct fault {
@@ -127,6 +129,7 @@ class transport_simulator final : public cufile_transport {
 
   void add_fault(fault rule);
   void clear_faults();
+  void mirror_writes_to(int fd);
   /// Force synchronous fallback errors independently of the async fault script.
   void set_sync_result(ssize_t result) noexcept;
   [[nodiscard]] bool unblock(std::size_t index) noexcept;

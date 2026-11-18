@@ -27,6 +27,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -111,10 +112,65 @@ std::vector<cufile_reactor*> cufile_ioctx::select_reactors(
   int device_id)
 {
   auto selected = next_reactor(object, slices.size(), operation, device_id);
+  if (operation == io_op_type::write_vector_async && !selected.empty()) {
+    for (auto const& slice : slices)
+      if (slice.backend_owner &&
+          selected.front()->engine_write_candidate(object.shared_from_this(), slice))
+        object.write_state()->activate();
+  }
   if (operation == io_op_type::host_vector_async && slices.size() > 1 && !selected.empty() &&
       selected.front()->coalescing_candidate(object, slices))
     selected.resize(1);
   return selected;
 }
 
+std::size_t cufile_ioctx::host_write_io(io_object const& object,
+                                        std::size_t offset,
+                                        std::size_t size,
+                                        std::uint8_t const* source)
+{
+  auto const* file = dynamic_cast<cufile_io_object const*>(&object);
+  if (!file || !file->writable() || !size)
+    return templated_ioctx<cufile_reactor>::host_write_io(object, offset, size, source);
+  auto state       = file->write_state();
+  auto ticket      = state->begin();
+  auto const parts = range_plan::split_write_range({offset, size}, write_granule());
+  auto const mode  = parts[1].empty() ? write_io_mode::buffered : write_io_mode::mixed;
+  auto interval    = state->acquire_legacy({offset, size}, write_granule(), mode);
+  return templated_ioctx<cufile_reactor>::host_write_io(object, offset, size, source);
+}
+
+exec::semi_future<std::size_t> cufile_ioctx::mixed_writev_async_io(
+  io_object const& object, std::vector<prepared_io_slice>&& slices) noexcept
+{
+  try {
+    // Track submission sequences even on legacy handles, so a later engine handoff
+    // and a flush on another handle see earlier writes of the same inode.
+    auto const* file = dynamic_cast<cufile_io_object const*>(&object);
+    if (file && file->writable() && !slices.empty()) {
+      auto ticket = file->write_state()->begin();
+      for (auto& slice : slices)
+        slice.backend_owner = ticket;
+    }
+    return templated_ioctx<cufile_reactor>::mixed_writev_async_io(object, std::move(slices));
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+}
+
+exec::semi_future<void> cufile_ioctx::flush_async_io(io_object const& object,
+                                                     io_priority priority) noexcept
+{
+  try {
+    auto const* file = dynamic_cast<cufile_io_object const*>(&object);
+    if (file && file->writable()) {
+      auto state = file->write_state();
+      if (state->has_engine_work())
+        return device_engine::flush_async(object.shared_from_this(), std::move(state));
+    }
+    return templated_ioctx<cufile_reactor>::flush_async_io(object, priority);
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+}
 }  // namespace cucascade::io::cufile

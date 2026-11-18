@@ -890,7 +890,8 @@ void cufile_reactor::reactor_context::notify_engines() const noexcept
 void cufile_reactor::reactor_context::ensure_engine(int device) noexcept
 {
   if (device < 0 || _config.async_engine.mode == engine_mode::legacy ||
-      !_config.async_engine.async_reads || has_simulated_engine() || engine_for_device(device))
+      (!_config.async_engine.async_reads && !_config.async_engine.async_writes) ||
+      has_simulated_engine() || engine_for_device(device))
     return;
   try {
     std::lock_guard lock(_engine_mutex);
@@ -901,7 +902,9 @@ void cufile_reactor::reactor_context::ensure_engine(int device) noexcept
           try {
             auto& rt    = runtime::instance();
             std::ignore = rt.ensure_initialized();
-            if (rt.engine_possible(self->_config.async_engine.mode)) {
+            if (rt.engine_possible(self->_config.async_engine.mode) ||
+                (self->_config.async_engine.async_writes &&
+                 rt.engine_possible(self->_config.async_engine.mode, true))) {
               auto binding = std::make_shared<engine_binding>();
               cudaDeviceProp properties{};
               CUCASCADE_CUDA_TRY(cudaGetDeviceProperties(&properties, device));
@@ -938,9 +941,13 @@ void cufile_reactor::reactor_context::ensure_engine(int device) noexcept
 
 bool cufile_reactor::submit_fence_enabled() const noexcept
 {
-  if (_config.async_engine.mode == engine_mode::legacy || !_config.async_engine.async_reads)
+  if (_config.async_engine.mode == engine_mode::legacy ||
+      (!_config.async_engine.async_reads && !_config.async_engine.async_writes))
     return false;
-  if (runtime::instance().engine_possible(_config.async_engine.mode)) return true;
+  if (runtime::instance().engine_possible(_config.async_engine.mode) ||
+      (_config.async_engine.async_writes &&
+       runtime::instance().engine_possible(_config.async_engine.mode, true)))
+    return true;
   // Explicit simulator injection may be used even without an installed libcufile.
   return _ctx->has_simulated_engine();
 }
@@ -954,8 +961,10 @@ void cufile_reactor::record_submit_fences(std::vector<prepared_io_slice>& slices
   };
   std::vector<recorded> events;
   for (auto& slice : slices) {
-    if (!slice.has_device_request() || slice.has_host_request() || slice.kind != io_op_kind::read ||
-        slice.on_complete || slice.d_buffer.original_stream_was_null)
+    if (!slice.has_device_request() || slice.has_host_request() ||
+        (slice.is_write() ? !_config.async_engine.async_writes
+                          : !_config.async_engine.async_reads) ||
+        slice.on_complete || (!slice.is_write() && slice.d_buffer.original_stream_was_null))
       continue;
     _ctx->ensure_engine(slice.d_buffer.device_id);
     if (!_ctx->engine_for_device(slice.d_buffer.device_id)) continue;
@@ -1022,15 +1031,20 @@ struct cufile_reactor::engine_route_result {
 cufile_reactor::engine_route_result cufile_reactor::engine_route(
   std::shared_ptr<const io_object> const& obj, prepared_io_slice const& slice) noexcept
 {
-  if (_config.async_engine.mode == engine_mode::legacy || !_config.async_engine.async_reads ||
-      slice.kind != io_op_kind::read || !slice.has_device_request() || slice.has_host_request() ||
-      !slice.d_buffer.fence || slice.d_buffer.original_stream_was_null || slice.on_complete ||
-      !_engine_outstanding || _engine_outstanding->cancel->load())
+  if (_config.async_engine.mode == engine_mode::legacy ||
+      (slice.is_write() ? !_config.async_engine.async_writes : !_config.async_engine.async_reads) ||
+      slice.is_flush() || !slice.has_device_request() || slice.has_host_request() ||
+      !slice.d_buffer.fence || (!slice.is_write() && slice.d_buffer.original_stream_was_null) ||
+      slice.on_complete || !_engine_outstanding || _engine_outstanding->cancel->load())
     return {};
   auto const* file = dynamic_cast<cufile_io_object const*>(obj.get());
-  if (!file || !file->cufile_registered() || file->direct_fd() < 0) return {};
+  if (!file || !file->cufile_registered() || file->direct_fd() < 0 ||
+      (slice.is_write() && !file->writable()))
+    return {};
   auto binding = _ctx->engine_for_device(slice.d_buffer.device_id);
-  if (!binding || !binding->engine->ready()) return {};
+  if (!binding || !binding->engine->ready() ||
+      (slice.is_write() && !binding->engine->accepts_writes()))
+    return {};
   try {
     auto policy = mount_policy_registry::instance().get_or_create(
       file->policy_key(binding->device_uuid, binding->generation),
@@ -1044,13 +1058,38 @@ cufile_reactor::engine_route_result cufile_reactor::engine_route(
     probe.simulated = binding->simulated;
     // A request that triggers qualification stays legacy even if the control task
     // finishes while this worker is preempted inside ensure_probe.
-    bool const was_eligible = policy->read_eligible();
+    if (slice.is_write() && !binding->simulated &&
+        (!runtime::instance().api() || !runtime::instance().api()->has_async_write))
+      return {};
+    bool const was_eligible = slice.is_write() ? policy->write_eligible() : policy->read_eligible();
     policy->ensure_probe(std::move(probe));  // Try-lock + bounded control queue; never waits.
-    if (!was_eligible || !policy->read_eligible()) return {};
+    if (!was_eligible || !(slice.is_write() ? policy->write_eligible() : policy->read_eligible()))
+      return {};
     return {std::move(binding), std::move(policy)};
   } catch (...) {
     return {};  // Policy/bootstrap metadata failure must retain the legacy path.
   }
+}
+
+std::shared_ptr<file_write_state> cufile_io_object::write_state() const
+{
+  std::call_once(_write_state_once,
+                 [this] { _write_state = file_write_state::get(buffered_fd()); });
+  return _write_state;
+}
+bool cufile_reactor::engine_write_candidate(std::shared_ptr<const io_object> const& object,
+                                            prepared_io_slice const& slice) noexcept
+{
+  // Submission-time activation is deliberately a capability-only snapshot:
+  // no mountinfo, policy creation or probe scheduling on the caller thread.
+  if (!slice.is_write() || _config.async_engine.mode == engine_mode::legacy ||
+      !_config.async_engine.async_writes || !slice.has_device_request() ||
+      slice.has_host_request() || !slice.d_buffer.fence || slice.on_complete)
+    return false;
+  auto const* file = dynamic_cast<cufile_io_object const*>(object.get());
+  auto binding     = _ctx->engine_for_device(slice.d_buffer.device_id);
+  return file && file->writable() && file->cufile_registered() && file->direct_fd() >= 0 &&
+         binding && binding->engine->ready() && binding->engine->accepts_writes();
 }
 
 cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
@@ -1059,6 +1098,10 @@ cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx, std::string
   if (_ctx == nullptr) {
     throw std::invalid_argument("cufile_reactor: reactor_context must be non-null");
   }
+  _write_wakeup->notify = [this] {
+    // A null queue entry only interrupts the timed dequeue; it is never dispatched.
+    static_cast<void>(_requests.enqueue(nullptr, io_priority::high));
+  };
   _config = _ctx->cfg();
   if (_config.async_engine.mode != engine_mode::legacy) {
     _config.async_engine.validate();
@@ -1076,7 +1119,12 @@ cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx, std::string
   _waiting.reserve(_config.max_inflight);
 }
 
-cufile_reactor::~cufile_reactor() { shutdown(); }
+cufile_reactor::~cufile_reactor()
+{
+  shutdown();
+  std::lock_guard lock(_write_wakeup->mutex);
+  _write_wakeup->notify = {};
+}
 
 void cufile_reactor::start()
 {
@@ -1353,11 +1401,18 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
                                   "' was not created by this backend");
     }
 
+    // Standalone reactor callers (without an ioctx submission ticket) still share inode ordering.
+    if (slice.is_write() && !slice.backend_owner && file->writable())
+      slice.backend_owner = file->write_state()->begin();
+
     // A legacy-parked slice stays legacy even if its mount qualified meanwhile.
     if (auto route = stream_ready ? engine_route_result{} : engine_route(obj, slice);
         route.binding) {
       engine_slice adopted;
       adopted.merge_gap_bytes          = _config.merge_gap_size();
+      adopted.write                    = slice.is_write();
+      adopted.write_ticket             = slice.backend_owner;
+      adopted.granule                  = slice.is_write() ? write_granule() : 4096;
       adopted.logical                  = slice.rng;
       adopted.user_ptr                 = slice.d_buffer.data;
       adopted.device_id                = slice.d_buffer.device_id;
@@ -1391,6 +1446,32 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
     bool const device_only = slice.has_device_request() && !slice.has_host_request();
     if (device_only && !stream_ready && park_if_stream_busy(obj, slice, coordinator)) return;
 
+    // Tracked legacy writes retain their exact old I/O policy; only conflicting
+    // inode granules wait resource-free, rather than occupying a blocking worker.
+    std::shared_ptr<file_write_state::interval> write_interval;
+    if (slice.is_write() && slice.backend_owner) {
+      auto ticket      = slice.backend_owner;
+      auto const parts = range_plan::split_write_range(slice.rng, write_granule());
+      auto const mode  = parts[1].empty() ? write_io_mode::buffered : write_io_mode::mixed;
+      auto ready       = std::make_shared<std::atomic<bool>>(false);
+      std::weak_ptr<write_wakeup> wake = _write_wakeup;
+      write_interval                   = ticket->state->try_acquire(
+        slice.rng,
+        write_granule(),
+        mode,
+        [ready, wake] {
+          ready->store(true);
+          if (auto owner = wake.lock()) {
+            std::lock_guard lock(owner->mutex);
+            if (owner->notify) owner->notify();
+          }
+        },
+        true);
+      if (!write_interval) {
+        _write_waiting.push_back({obj, std::move(slice), coordinator, std::move(ready)});
+        return;
+      }
+    }
     request              = std::make_unique<io_op_request>();
     request->obj         = obj;
     request->coordinator = coordinator;
@@ -2063,6 +2144,20 @@ void cufile_reactor::write_device_staged(cufile_io_object const& file,
 
 void cufile_reactor::poll_completions() noexcept
 {
+  if (!_write_waiting.empty()) {
+    auto pending = std::move(_write_waiting);
+    _write_waiting.clear();
+    for (auto& write : pending) {
+      if (write.coordinator->should_continue() && !write.ready->load()) {
+        _write_waiting.push_back(std::move(write));
+        continue;
+      }
+      if (write.coordinator->should_continue())
+        dispatch_slice(write.obj, std::move(write.slice), write.coordinator, true);
+      else
+        write.coordinator->report_error(canceled_error());
+    }
+  }
   // Parked device slices whose stream reached the point recorded at dispatch.
   // They are moved out first: dispatching one may park nothing (its gate is
   // open) but is long and synchronous, and must not race this scan.
@@ -2141,6 +2236,9 @@ void cufile_reactor::cancel_waiting(grouped_coordinator::error_type const& error
     waiting.coordinator->report_error(error);
   }
   _waiting.clear();
+  for (auto& waiting : _write_waiting)
+    waiting.coordinator->report_error(error);
+  _write_waiting.clear();
 }
 
 void cufile_reactor::drain_inflight(grouped_coordinator::error_type const& terminal_error) noexcept

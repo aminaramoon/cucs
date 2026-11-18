@@ -215,6 +215,7 @@ class mount_policy : public std::enable_shared_from_this<mount_policy> {
   void set_effective(effective_profile);
   /// Only a qualified client/version may enable direct writes. Still needs read qualification.
   void qualify_writes(bool qualified) noexcept;
+  void revoke_writes() noexcept;
   /// Reaper-only. Checks first 16 MiB; unattributed/missing delta revokes write eligibility.
   void observe_write_evidence(std::size_t bytes, bool attributable_direct) noexcept;
   /// Try-lock + CAS + bounded queue submission; task retains file/transport, not arena facade.
@@ -254,6 +255,7 @@ class mount_policy : public std::enable_shared_from_this<mount_policy> {
   std::atomic<mount_state> _state{mount_state::unknown};
   bool _override_legacy{false};
   bool _operator_override{false};
+  bool _override_writes{false};
   std::atomic<bool> _writes_qualified{false};
   std::atomic<bool> _write_evidence_failed{false};
   std::size_t _write_bytes{};

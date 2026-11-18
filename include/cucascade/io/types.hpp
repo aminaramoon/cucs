@@ -48,6 +48,10 @@ struct cached_chunk;
 class metadata_store;
 }  // namespace cucascade::io::cache
 
+namespace cucascade::io::cufile {
+struct file_write_ticket;
+}
+
 namespace cucascade::io {
 class ioctx;
 }  // namespace cucascade::io
@@ -444,6 +448,8 @@ struct prepared_io_slice {
   /// Read (default), write or flush.  A write slice carries exactly one source:
   /// a contiguous host buffer or a device buffer, which the reactor only reads.
   io_op_kind kind{io_op_kind::read};
+  /// Typed cuFile inode sequencing ticket, propagated through slice splitting.
+  std::shared_ptr<cufile::file_write_ticket> backend_owner;
 
   prepared_io_slice() noexcept = default;
   explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}

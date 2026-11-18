@@ -220,6 +220,13 @@ void runtime::initialize(process_cufile_parameters const& parameters)
                           _report.properties.nvfs.dstatusflags != 0 && !_report.forced_compat &&
                           !_report.frozen_parameters.force_compat_mode.value_or(false),
                         std::memory_order_release);
+  _write_capable.store(
+    opened.opened && api != nullptr && api->has_async_write && api->write_async != nullptr,
+    std::memory_order_release);
+  _direct_capable.store(opened.opened && _report.properties_available &&
+                          _report.properties.nvfs.dstatusflags != 0 && !_report.forced_compat &&
+                          !_report.frozen_parameters.force_compat_mode.value_or(false),
+                        std::memory_order_release);
   _initialized = true;
   _generation.store(_report.generation, std::memory_order_release);
   for (auto const& entry : _report.parameters) {
@@ -255,9 +262,13 @@ init_report runtime::ensure_initialized(process_cufile_parameters const& paramet
   return report;
 }
 
-bool runtime::engine_possible(engine_mode mode) const noexcept
+bool runtime::engine_possible(engine_mode mode, bool writes) const noexcept
 {
   if (_generation.load(std::memory_order_acquire) == 0) { return false; }
+  if (writes)
+    return _write_capable.load(std::memory_order_acquire) &&
+           (mode == engine_mode::async_simulated_for_testing ||
+            (mode == engine_mode::async_auto && _direct_capable.load(std::memory_order_acquire)));
   if (mode == engine_mode::async_simulated_for_testing) {
     return _async_capable.load(std::memory_order_acquire);
   }
