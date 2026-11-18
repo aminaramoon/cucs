@@ -183,6 +183,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   struct mount;
   struct request_budget {
     std::array<std::int64_t, 2> deficit{};
+    std::size_t small_begin{}, small_end{};
   };
   struct cursor {
     explicit cursor(engine_slice value)
@@ -193,9 +194,11 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     std::shared_ptr<grouped_coordinator> group;
     mount* owner{};
     std::size_t next{}, active{}, index{};
+    std::size_t coalesce_index{std::numeric_limits<std::size_t>::max()};
+    std::size_t publication_index{std::numeric_limits<std::size_t>::max()};
     std::uint64_t group_id{};
     std::shared_ptr<request_budget> budget;
-    bool finished{}, fence_ready{};
+    bool finished{}, fence_ready{}, publication_visible{};
     time_point fence_queried{};
     [[nodiscard]] bool cancelled() const noexcept
     {
@@ -205,6 +208,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   struct node {
     operation* op{};
     std::shared_ptr<cursor> request;
+    std::vector<cursor*> targets;  // requests[] retains every cursor until this node retires.
     mount* owner{};
     recorded_event event;
     std::uint64_t generation{};
@@ -277,6 +281,13 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   detail::engine_ring<std::shared_ptr<cursor>> control;
   detail::engine_ring<result> completions;
   std::vector<std::shared_ptr<cursor>> requests;
+  std::vector<cursor*> coalesce_index, target_scratch;
+  struct publication_snapshot {
+    std::shared_ptr<std::atomic<bool>> flag;
+    std::size_t cursors{};
+    bool visible{};
+  };
+  std::vector<publication_snapshot> publications;
   std::vector<std::unique_ptr<mount>> mounts;
   std::vector<node> nodes;
   std::vector<node*> free_nodes, active_nodes;
@@ -317,8 +328,13 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   {
     free_nodes.reserve(nodes.size());
     active_nodes.reserve(nodes.size());
-    for (auto& n : nodes)
+    target_scratch.reserve(std::max(1U, config.coalesce_max_targets));
+    coalesce_index.reserve(config.max_pending_slices_per_device);
+    publications.reserve(config.max_pending_slices_per_device);
+    for (auto& n : nodes) {
+      n.targets.reserve(config.coalesce ? config.coalesce_max_targets : 1);
       free_nodes.push_back(&n);
+    }
     requests.reserve(config.max_pending_slices_per_device);
     mounts.reserve(config.max_pending_slices_per_device);
     submitters.reserve(config.submitters_per_device);
@@ -517,10 +533,12 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   void finish(node& n, bool success, proof reason)
   {
     token(n, false);
-    if (success)
-      static_cast<void>(n.op->targets[0].credit.finish_success());
-    else
-      static_cast<void>(n.op->targets[0].credit.finish_error(n.error));
+    for (std::size_t i = 0; i < n.op->targets.size(); ++i) {
+      if (success)
+        static_cast<void>(n.op->targets[i].credit.finish_success());
+      else
+        static_cast<void>(n.op->targets[i].credit.finish_error(n.error));
+    }
     if (reason != proof::event_observed) n.op->prove_recovery_quiescence();
     n.op->set_phase(operation_phase::terminal);
     n.pending = node::work::cleanup;
@@ -540,14 +558,15 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     auto status = detail::delay_engine_copy_for_testing(stream);
     if (status == cudaSuccess)
       status = options.transport->stream_wait_event(stream, r.slice.fence->event);
-    if (status == cudaSuccess)
-      status =
-        options.transport->memcpy_async(op.targets[0].user_ptr,
-                                        static_cast<std::byte*>(op.staging->data()) +
-                                          (op.targets[0].logical.offset - op.physical.offset),
-                                        op.targets[0].logical.size,
-                                        cudaMemcpyDeviceToDevice,
-                                        stream);
+    for (std::size_t i = 0; status == cudaSuccess && i < op.targets.size(); ++i) {
+      auto const& target = op.targets[i];
+      status             = options.transport->memcpy_async(
+        target.user_ptr,
+        static_cast<std::byte*>(op.staging->data()) + (target.logical.offset - op.physical.offset),
+        target.logical.size,
+        cudaMemcpyDeviceToDevice,
+        stream);
+    }
     if (status == cudaSuccess)
       status = detail::engine_copy_record_failure_for_testing()
                  ? cudaErrorNotPermitted
@@ -561,8 +580,19 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     n.event = op.track_event((*op.lane)->copy_event(), operation_phase::copy_inflight, true);
     ++n.generation;
     poll_later(n, true);
+    for (std::size_t i = 0; i < op.targets.size(); ++i)
+      stats.enqueued_logical_bytes += op.targets[i].logical.size;
     // All destination enqueues and the join precede the credit decrement (AM-1).
-    if (!r.slice.original_stream_was_ptds) static_cast<void>(op.targets[0].credit.finish_success());
+    if (!r.slice.original_stream_was_ptds)
+      for (std::size_t i = 0; i < op.targets.size(); ++i)
+        static_cast<void>(op.targets[i].credit.finish_success());
+  }
+  static std::size_t required_end(operation const& op) noexcept
+  {
+    std::size_t end{};
+    for (std::size_t i = 0; i < op.targets.size(); ++i)
+      end = std::max(end, op.targets[i].logical.end());
+    return end;
   }
   void validate(node& n)
   {
@@ -572,7 +602,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       done == pending_sentinel || done < 0 || static_cast<std::size_t>(done) > op.args.size
         ? detail::completion_outcome::error
       : static_cast<std::size_t>(op.args.file_offset) + static_cast<std::size_t>(done) <
-          op.targets[0].logical.end()
+          required_end(op)
         ? detail::completion_outcome::short_read
         : detail::completion_outcome::validated;
     detail::observe_engine_completion_for_testing(
@@ -604,7 +634,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     auto const end = static_cast<std::size_t>(op.args.file_offset) + static_cast<std::size_t>(done);
     bool const progress = end > op.valid_end;
     op.valid_end        = std::max(op.valid_end, end);
-    if (op.valid_end >= op.targets[0].logical.end()) {
+    if (op.valid_end >= required_end(op)) {
       copy(n);
       return;
     }
@@ -744,9 +774,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         } else if (work == node::work::check_size) {
           accepted = executor->submit([self, p] {
             struct stat st{};
-            bool const valid =
-              fstat(self->options.buffered_fd(*p->op->file), &st) == 0 && st.st_size >= 0 &&
-              static_cast<std::uint64_t>(st.st_size) >= p->op->targets[0].logical.end();
+            bool const valid = fstat(self->options.buffered_fd(*p->op->file), &st) == 0 &&
+                               st.st_size >= 0 &&
+                               static_cast<std::uint64_t>(st.st_size) >= required_end(*p->op);
             self->publish({result_kind::size_checked,
                            p,
                            p->generation,
@@ -853,7 +883,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       case result_kind::cleaned:
         if (n.gate_limited) --n.owner->gated;
         --n.owner->occupied;
-        --n.request->active;
+        for (auto* target : n.targets)
+          --target->active;
+        n.targets.clear();
         n.op       = nullptr;
         n.cleaning = false;
         n.pending  = node::work::none;
@@ -870,16 +902,49 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
 
   void accept_requests()
   {
+    // Observe closed publications BEFORE draining their ring entries. A flag turning true
+    // later in this iteration cannot make a partially accepted batch eligible.
+    // Exactly one load per shared flag: per-cursor loads can split a batch if
+    // the producer publishes halfway through this loop.
+    for (auto& p : publications)
+      if (p.flag && !p.visible) p.visible = p.flag->load(std::memory_order_acquire);
+    for (auto const& r : requests)
+      if (r && !r->finished && !r->publication_visible)
+        r->publication_visible = publications[r->publication_index].visible;
+    bool changed = false;
     std::shared_ptr<cursor> r;
     while (control.pop(r)) {
+      changed   = true;
       auto slot = std::find(requests.begin(), requests.end(), nullptr);
       if (slot == requests.end()) {
         requests.push_back(std::move(r));
         slot = std::prev(requests.end());
       } else
         *slot = std::move(r);
-      auto& request = **slot;
-      request.index = static_cast<std::size_t>(slot - requests.begin());
+      auto& request               = **slot;
+      request.index               = static_cast<std::size_t>(slot - requests.begin());
+      request.publication_visible = !request.slice.publication_ready;
+      if (request.slice.publication_ready) {
+        auto entry = std::find_if(publications.begin(), publications.end(), [&](auto const& p) {
+          return p.flag == request.slice.publication_ready;
+        });
+        if (entry == publications.end()) {
+          entry = std::find_if(
+            publications.begin(), publications.end(), [](auto const& p) { return !p.flag; });
+          if (entry == publications.end()) {
+            publications.emplace_back();
+            entry = std::prev(publications.end());
+          }
+          // A newly seen flag has NO pre-drain snapshot. Defer it so a concurrent
+          // final handoff is drained before any of this publication can expand.
+          entry->flag    = request.slice.publication_ready;
+          entry->visible = false;
+          retry_needed   = true;
+        }
+        ++entry->cursors;
+        request.publication_index   = static_cast<std::size_t>(entry - publications.begin());
+        request.publication_visible = entry->visible;
+      }
       try {
         auto const found = std::find_if(mounts.begin(), mounts.end(), [&](auto const& m) {
           return m->policy->key() == request.slice.policy->key();
@@ -912,6 +977,26 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       } catch (...) {
         request.finished = true;
         static_cast<void>(request.slice.credit.finish_error(std::current_exception()));
+      }
+    }
+    if (changed && config.coalesce) {
+      // Sort once per arrival batch, not per admission/backpressure retry.
+      coalesce_index.clear();
+      for (auto const& c : requests)
+        if (c) {
+          c->coalesce_index = std::numeric_limits<std::size_t>::max();
+          if (!c->finished && c->budget) coalesce_index.push_back(c.get());
+        }
+      std::sort(coalesce_index.begin(), coalesce_index.end(), [](auto* a, auto* b) {
+        if (a->budget != b->budget)
+          return std::less<request_budget*>{}(a->budget.get(), b->budget.get());
+        return a->slice.logical.offset < b->slice.logical.offset;
+      });
+      for (std::size_t i = 0; i < coalesce_index.size(); ++i) {
+        auto& c          = *coalesce_index[i];
+        c.coalesce_index = i;
+        if (i == 0 || coalesce_index[i - 1]->budget != c.budget) c.budget->small_begin = i;
+        c.budget->small_end = i + 1;
       }
     }
   }
@@ -1004,6 +1089,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   }
   bool fence_admissible(cursor& r)
   {
+    if (!r.publication_visible) return false;
     if (!r.fence_ready &&
         (r.fence_queried == time_point{} ||
          options.now() - r.fence_queried >= std::chrono::microseconds(config.poll.fence_hint_us))) {
@@ -1069,6 +1155,10 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     auto* r = next_request(m, tier);
     if (!r) return false;
     range_plan::piece_plan piece;
+    auto& targets = target_scratch;
+    targets.clear();
+    targets.push_back(r);
+    std::size_t gaps{};
     try {
       piece = range_plan::next_cut(r->next,
                                    r->slice.logical.end(),
@@ -1081,7 +1171,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       static_cast<void>(r->slice.credit.finish_error(std::current_exception()));
       return true;
     }
-    auto const cost = static_cast<std::int64_t>(piece.physical.size);
+    auto cost = static_cast<std::int64_t>(piece.physical.size);
     if (m.deficit[tier] < cost) {
       m.deficit[tier] += static_cast<std::int64_t>(effective.op_bytes);
       return {true, false};  // New quantum, yield to the next mount before spending it.
@@ -1118,6 +1208,88 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     }
     auto* op = operations.try_acquire();
     if (!op) return false;
+    // Group only after resource/DRR admission. All target storage was reserved
+    // at bootstrap; coalescing cannot allocate or fail unrelated requests.
+    try {
+      if (config.coalesce && config.coalesce_max_targets > 1 &&
+          r->next == r->slice.logical.offset && r->slice.logical.size < effective.op_bytes / 2 &&
+          r->slice.geometry_boundaries.empty()) {
+        auto& budget = *r->budget;
+        while (
+          budget.small_begin < budget.small_end &&
+          (!coalesce_index[budget.small_begin] || coalesce_index[budget.small_begin]->finished))
+          ++budget.small_begin;
+        auto matches = [&](cursor const& c) {
+          return !c.finished && c.publication_visible && c.owner == &m &&
+                 c.slice.file == r->slice.file && c.slice.device_id == r->slice.device_id &&
+                 c.slice.priority == r->slice.priority &&
+                 c.slice.user_stream == r->slice.user_stream && c.slice.fence == r->slice.fence &&
+                 c.slice.original_stream_was_ptds == r->slice.original_stream_was_ptds &&
+                 c.slice.cancel == r->slice.cancel && c.slice.granule == r->slice.granule &&
+                 c.slice.merge_gap_bytes == r->slice.merge_gap_bytes &&
+                 c.next == c.slice.logical.offset &&
+                 c.slice.logical.size < effective.op_bytes / 2 &&
+                 c.slice.geometry_boundaries.empty();
+        };
+        auto* primary = r;
+        auto grouped  = piece;
+        auto end      = r->slice.logical.end();
+        bool seeded   = false;
+        for (auto i = budget.small_begin;
+             i < budget.small_end && targets.size() < config.coalesce_max_targets;
+             ++i) {
+          auto* c = coalesce_index[i];
+          if (!c || !matches(*c)) continue;
+          // Same fence: reuse the primary's hint, never query per target.
+          if (!seeded) {
+            primary          = c;
+            targets[0]       = c;
+            grouped.logical  = c->slice.logical;
+            grouped.physical = range_plan::staged_physical_range(
+              grouped.logical, c->slice.granule, c->slice.file->size());
+            grouped.last = true;
+            end          = c->slice.logical.end();
+            seeded       = true;
+            continue;
+          }
+          auto const logical      = c->slice.logical;
+          auto const gap          = logical.offset > end ? logical.offset - end : 0;
+          auto const combined_end = std::max(end, logical.end());
+          if (gap > r->slice.merge_gap_bytes || combined_end > r->slice.file->size()) break;
+          auto physical = range_plan::staged_physical_range(
+            {grouped.logical.offset, combined_end - grouped.logical.offset},
+            r->slice.granule,
+            r->slice.file->size());
+          if (physical.size > effective.op_bytes) break;
+          grouped.physical = physical;
+          end              = combined_end;
+          gaps += gap;
+          targets.push_back(c);
+        }
+        if (targets.size() > 1) {
+          primary->fence_ready = r->fence_ready;
+          r                    = primary;
+          piece                = grouped;
+          cost                 = static_cast<std::int64_t>(piece.physical.size);
+        } else {
+          targets[0] = r;  // No merge: preserve the original lazy striping cut.
+          gaps       = 0;
+        }
+      }
+    } catch (...) {
+      // Grouping is optional: retain the original single-slice plan and credit.
+      targets.clear();
+      targets.push_back(r);
+      gaps = 0;
+    }
+    if (m.deficit[tier] < cost || r->budget->deficit[tier] < cost) {
+      static_cast<void>(operation_pool::try_release(*op));
+      if (m.deficit[tier] < cost)
+        m.deficit[tier] += static_cast<std::int64_t>(effective.op_bytes);
+      else
+        m.current_group[tier] = 0;
+      return {true, false};
+    }
     auto& n = *free;
     free_nodes.pop_back();
     active_nodes.push_back(&n);
@@ -1141,6 +1313,20 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       piece.logical,
       static_cast<std::byte*>(r->slice.user_ptr) + (piece.logical.offset - r->slice.logical.offset),
       std::move(credit));
+    n.targets.push_back(r);
+    for (std::size_t i = 1; i < targets.size(); ++i) {
+      auto& c = *targets[i];
+      op->targets.emplace_back(c.slice.logical, c.slice.user_ptr, std::move(c.slice.credit));
+      c.next     = c.slice.logical.end();
+      c.finished = true;
+      ++c.active;
+      n.targets.push_back(&c);
+    }
+    if (targets.size() > 1) {
+      ++stats.coalesced_ops;
+      stats.coalesced_targets += targets.size();
+      stats.gap_bytes += gaps;
+    }
     op->args    = {piece.physical.size,
                    static_cast<off_t>(piece.physical.offset),
                    op->staging->buffer_offset_to_pass(),
@@ -1207,6 +1393,15 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
           r->slice.credit.finish_error(std::make_error_code(std::errc::operation_canceled)));
       }
       if (!r->finished || r->active != 0) continue;
+      if (r->coalesce_index != std::numeric_limits<std::size_t>::max()) {
+        coalesce_index[r->coalesce_index] = nullptr;
+        r->coalesce_index                 = std::numeric_limits<std::size_t>::max();
+      }
+      if (r->publication_index != std::numeric_limits<std::size_t>::max()) {
+        auto& publication = publications[r->publication_index];
+        if (--publication.cursors == 0) publication.flag.reset();
+        r->publication_index = std::numeric_limits<std::size_t>::max();
+      }
       auto self = shared_from_this();
       // Move ownership BEFORE publication: even an immediately running cleanup must be
       // the last owner, never a racing reaper reset (P2-R19).
@@ -1231,14 +1426,18 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   void update_snapshot()
   {
     if (live != 0 && options.now() - last_snapshot < 1ms) return;
-    last_snapshot             = options.now();
-    stats.outstanding_slices  = outstanding.load();
-    stats.metadata_rejections = rejected.load();
-    stats.metadata_fallbacks  = rejected.load();
-    stats.live_operations     = live;
-    stats.mean_storage_qd     = ns(options.now() - origin) == 0
-                                  ? 0
-                                  : static_cast<double>(qd_area / ns(options.now() - origin));
+    last_snapshot               = options.now();
+    stats.outstanding_slices    = outstanding.load();
+    stats.metadata_rejections   = rejected.load();
+    stats.metadata_fallbacks    = rejected.load();
+    stats.live_operations       = live;
+    stats.mean_storage_qd       = ns(options.now() - origin) == 0
+                                    ? 0
+                                    : static_cast<double>(qd_area / ns(options.now() - origin));
+    stats.accounted_ns          = ns(last_account - origin);
+    stats.storage_qd_ns         = static_cast<std::uint64_t>(qd_area);
+    stats.backlog_ns            = backlog_ns;
+    stats.backlog_storage_qd_ns = static_cast<std::uint64_t>(backlog_area);
     stats.backlog_mean_storage_qd =
       backlog_ns == 0 ? 0 : static_cast<double>(backlog_area / backlog_ns);
     stats.lanes_by_phase.fill(0);

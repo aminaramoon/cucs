@@ -104,4 +104,17 @@ std::vector<cufile_reactor*> cufile_ioctx::next_reactor(cufile_io_object const& 
   return result;
 }
 
+std::vector<cufile_reactor*> cufile_ioctx::select_reactors(
+  cufile_io_object const& object,
+  std::span<prepared_io_slice const> slices,
+  io_op_type operation,
+  int device_id)
+{
+  auto selected = next_reactor(object, slices.size(), operation, device_id);
+  if (operation == io_op_type::host_vector_async && slices.size() > 1 && !selected.empty() &&
+      selected.front()->coalescing_candidate(object, slices))
+    selected.resize(1);
+  return selected;
+}
+
 }  // namespace cucascade::io::cufile

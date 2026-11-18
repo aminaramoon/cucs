@@ -350,3 +350,84 @@ Promotes open question §9.15 into the plan.
   from an isolated read probe (FR-9). The current probe threshold is
   `submit_max_us`; absent real-host evidence it must not imply baseline seeding
   or direct qualification.
+
+## AM-14: Coalescing implementation contract (Phase 4 review P4-R1–R18)
+
+Extends AM-6; legacy remains the default. No hardware qualification is implied.
+
+- **Configuration.** Enabled modes default to `coalesce=true`; legacy ignores it.
+  `coalesce_max_targets` defaults to 64 and validates in [1, 4096]. A physical
+  operation holds one moved credit per exact logical target, not one new credit
+  per group. Cancellation and terminal failure apply to the whole physical group;
+  all targets belong to the same logical request. Cleanup retains every cursor,
+  file, fence, stream owner and retirement ticket through physical quiescence.
+- **Eligibility and geometry.** Targets must share mount, request, file, device,
+  priority, caller stream, fence, PTDS origin, cancellation flag, granule and
+  merge-gap setting. They must be unstarted, smaller than `S_eff/2`, and have no
+  explicit geometry boundaries. Offset-sorted targets may share a granule-aligned
+  window no larger than `S_eff`, with gaps no larger than `merge_gap_size()`,
+  within EOF. Only a group of at least two skips the absolute striping grid;
+  a singleton retains the ordinary `next_cut` plan. Gaps are read, never copied.
+  One fence wait, N exact copies, one event and one caller-stream join implement
+  AM-1/AM-2. Original PTDS groups settle only after the copy event is observed.
+- **Publication.** A reactor pass lazily creates a shared flag only on an actual
+  engine handoff. Reapers snapshot each shared flag exactly once BEFORE draining
+  the control ring; newly encountered flags defer visibility to the next iteration.
+  This prevents mid-drain publication from exposing only some siblings. Grouping
+  uses cached cursor visibility; an unpublished batch cannot submit storage. The pass publishes and notifies engines on exit,
+  and BEFORE any legacy dispatch can park or perform synchronous I/O. Later
+  handoffs start a new publication. Allocation failure disables optional batching
+  rather than failing the read. Idle and legacy-only passes create no flag and
+  cause no publication notification. Notifications still broadcast to installed
+  engines; targeted/parked-only notifications remain Phase 7 G-5 work.
+- **Routing.** Single-reactor batching is restricted to currently engine-eligible,
+  device-only requests with multiple slices and at least one slice below half
+  the smallest class (1 MiB). All slices must have a caller fence and the same
+  device; null-origin, callback-bearing, mixed, unqualified and all-large requests
+  keep Phase 3 fan-out. Qualification/demotion/metadata pressure may still change
+  worker-side routing; publication never waits behind that fallback's I/O.
+- **Bounded host work.** Engine construction reserves the candidate index,
+  target scratch, node target arrays and each operation record's overflow
+  capacity, plus per-publication visibility records. Pool reuse retains this storage. No grouping allocation, including
+  overflow reserve, occurs during admission; grouping exceptions revert to the
+  original single-slice plan, without adopting credits or failing other requests.
+  A per-request offset index is sorted once per arrival batch. Retiring cursors
+  null their entries, consumed heads advance, and admission stops at the target
+  cap or physical-window limit. Grouping runs after initial DRR/resource checks
+  and reuses the primary's shared-fence hint. A larger grouped cost still obeys
+  DRR before adoption.
+- **Remaining CPU qualification (AM-13 / Phase 7 G-5).** Measure index rebuilds
+  under streaming arrivals, publication-record lookup on acceptance,
+  scans past incompatible identities/large slices,
+  repeated grouping on a larger-group DRR miss, existing request selection and
+  per-cursor fence-hint scans, and broadcast publication wakeups. Intrusive ready
+  queues, incremental accounting, batched cleanup and parked-only wakeups remain
+  prerequisites; these changes do not claim NFR-3 or acceptance performance.
+- **Benchmark contract.** Pipeline streams, maximum-size destinations, CUDA pool
+  growth and per-layout slice metadata are prepared before timing. Verification
+  is a separate untimed pass; every measured consumption still waits on the
+  future and then the caller stream. Whole passes repeat until both the requested
+  repetition count and minimum measured duration are met (defaults 1 and 1 s).
+  A dedicated same-mount warm-up file avoids rereading the restore working set.
+  Optional `--drop-cache` fsyncs and requests `POSIX_FADV_DONTNEED` on every
+  measured file before EVERY timed pass, after verification/creation; eviction
+  is untimed and advisory, never a claim of proven cold storage.
+- **Evidence labels.** CSV records admission (`direct_policy`,
+  `operator_override`, `test_only_compat`, `simulated`, or `legacy`),
+  transport, coalescing, requested profiles, pipeline/layout/chunk configuration,
+  file and overrides, libcufile/platform state, cache policy, repetitions and
+  observed effective-profile extrema. These are admission/configuration labels,
+  not proof that a mount used direct I/O; transport counters expose legacy
+  fallback. TEST-ONLY compat bypass can never appear as qualified direct async.
+  Optional guarded destinations reverse copy order and check per-target canaries
+  in the verified pass; small columns receive full-content comparisons.
+  Simulator files all use one largest-file image: only identically patterned
+  files are supported; results are not disk or GDS throughput.
+
+## AM-15: Reaper polling must scale with completion latency (lead observation, Phase 4 smoke)
+
+- On the compat dev box (sustained B-3, QD 32, 4 MiB, completion p50 of about 8.4 ms) the engine measured `queries_per_op` = 400. The NFR-3 target is 8, with a ceiling of 70.
+- Required in Phase 6:
+  - The I/O-event poll cap becomes `clamp(p50_completion(mount, class) / 8, poll.io_cap_us, 1 ms)`, instead of a fixed 100 µs.
+  - A loop wake-up caused by an unrelated ring publication must not re-poll lane heads whose deadline has not arrived.
+  - B-1 and B-3 must report `queries_per_op` ≤ 70 on both compat and GDS hosts before the default flips (G-5).

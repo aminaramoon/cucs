@@ -974,6 +974,37 @@ void cufile_reactor::record_submit_fences(std::vector<prepared_io_slice>& slices
   }
 }
 
+bool cufile_reactor::coalescing_candidate(cufile_io_object const& object,
+                                          std::span<prepared_io_slice const> slices) const noexcept
+{
+  if (slices.size() <= 1 || _config.async_engine.mode == engine_mode::legacy ||
+      !_config.async_engine.coalesce || !_config.async_engine.async_reads ||
+      !object.cufile_registered() || object.direct_fd() < 0)
+    return false;
+  // Use the smallest supported class, conservatively. Mixed/large/unqualified reads
+  // retain Phase 3 fan-out even when the context's engine is enabled.
+  bool small = false;
+  int device = slices.front().d_buffer.device_id;
+  for (auto const& slice : slices) {
+    if (!slice.has_device_request() || slice.has_host_request() || slice.kind != io_op_kind::read ||
+        slice.on_complete || !slice.d_buffer.fence || slice.d_buffer.original_stream_was_null ||
+        slice.d_buffer.device_id != device)
+      return false;
+    small = small || slice.size() < capacity_mib / 2;
+  }
+  auto binding = _ctx->engine_for_device(device);
+  if (!small || !binding || !binding->engine->ready()) return false;
+  try {
+    auto policy = mount_policy_registry::instance().get_or_create(
+      object.policy_key(binding->device_uuid, binding->generation),
+      object.mount_identity_info(),
+      _config.async_engine);
+    return policy->read_eligible();
+  } catch (...) {
+    return false;
+  }
+}
+
 struct cufile_reactor::engine_retirement_ticket {
   explicit engine_retirement_ticket(std::shared_ptr<engine_admission> value)
     : state(std::move(value))
@@ -1308,7 +1339,8 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
                                     prepared_io_slice slice,
                                     std::shared_ptr<grouped_coordinator> const& coordinator,
                                     bool stream_ready,
-                                    bool* handed_off) noexcept
+                                    bool* handed_off,
+                                    engine_publication* publication) noexcept
 {
   // Every terminal path must either finish `request` (finish_success / finish_error,
   // exactly once) or, before `request` exists, settle the slice's completion and one
@@ -1325,6 +1357,7 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
     if (auto route = stream_ready ? engine_route_result{} : engine_route(obj, slice);
         route.binding) {
       engine_slice adopted;
+      adopted.merge_gap_bytes          = _config.merge_gap_size();
       adopted.logical                  = slice.rng;
       adopted.user_ptr                 = slice.d_buffer.data;
       adopted.device_id                = slice.d_buffer.device_id;
@@ -1339,6 +1372,7 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
       adopted.retirement_owner = std::make_shared<engine_retirement_ticket>(_engine_outstanding);
       // Last throwing allocation precedes credit adoption: catch still owns exactly one credit.
       if (route.binding->engine->try_reserve_slice()) {
+        if (publication) adopted.publication_ready = publication->take();
         adopted.credit = operation_credit{coordinator};
         route.binding->engine->hand_off(std::move(adopted), true);
         if (handed_off) *handed_off = true;
@@ -1347,6 +1381,9 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
       // Metadata pressure is a routing miss, not a failed read. The original
       // coordinator credit is still owned here and is served by legacy below.
     }
+
+    // Do not hold engine visibility behind any synchronous legacy work in this pass.
+    if (publication) publication->publish();
 
     // A device-only slice (a read into or a write from device memory) must not
     // touch its buffer before the work queued on its stream before the call has
@@ -2159,6 +2196,12 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
       // completes inside dispatch_slice, so the in-flight window alone never ends the pass;
       // without this cap a many-slice low request could not be parked for a high
       // one until its last slice.
+      // No allocation or engine notification on idle/legacy-only passes.
+      engine_publication publication{*_ctx, {}};
+      auto* batch =
+        _config.async_engine.mode != engine_mode::legacy && _config.async_engine.coalesce
+          ? &publication
+          : nullptr;
       std::size_t pass_bytes = 0;
       for (std::size_t dispatched = 0;
            dispatched < pass_slices && pass_bytes < _config.max_op_bytes &&
@@ -2178,7 +2221,8 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
                        std::move(slice),
                        scheduler.active->coordinator,
                        false,
-                       &handed_off);
+                       &handed_off,
+                       batch);
         if (handed_off) {
           pass_bytes -= bytes;
           // Engine handoffs do not consume this synchronous worker's pass budget.
@@ -2186,6 +2230,7 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
           ++dispatched;
         }
       }
+      publication.publish();
       if (scheduler.active != nullptr && scheduler.active->empty()) { scheduler.active.reset(); }
 
       bool const has_capacity = inflight_count() < _config.max_inflight;

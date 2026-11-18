@@ -743,7 +743,7 @@ class templated_ioctx : public ioctx {
       slice.priority = priority;
     }
 
-    auto reactors    = next_reactor(typed, slices.size(), operation, device_id);
+    auto reactors    = select_reactors(typed, slices, operation, device_id);
     auto coordinator = std::make_shared<grouped_coordinator>(total_bytes, slices.size());
     auto future      = coordinator->get_future();
 
@@ -822,6 +822,15 @@ class templated_ioctx : public ioctx {
       return future;
     }
   }
+  /// Slice-aware policy; by default preserve the existing reactor fan-out.
+  virtual std::vector<Reactor*> select_reactors(io_object_type const& object,
+                                                std::span<prepared_io_slice const> slices,
+                                                io_op_type operation,
+                                                int device_id)
+  {
+    return next_reactor(object, slices.size(), operation, device_id);
+  }
+
   /// Resolve the queue tier for a request whose slices are @p slices.  An
   /// explicit priority on the first slice wins (a cache prefetch stamps
   /// @c low).  @c automatic always resolves to @c high, whatever the call

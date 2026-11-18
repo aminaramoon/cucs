@@ -665,6 +665,24 @@ if(CUCASCADE_BUILD_IO AND CUCASCADE_CUFILE_INCLUDE_DIR)
   target_compile_options(cucascade_cufile_async_qd
                          PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
   set_target_properties(cucascade_cufile_async_qd PROPERTIES CXX_EXTENSIONS OFF)
+
+  add_executable(
+    cucascade_cufile_engine_bench EXCLUDE_FROM_ALL
+    tools/gds/cufile_engine_bench.cpp test/io/cufile/transport_simulator.cpp
+    test/io/cufile/transport_simulator_kernels.cu)
+  target_include_directories(cucascade_cufile_engine_bench
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/io/cufile)
+  target_link_libraries(cucascade_cufile_engine_bench PRIVATE cucascade_io
+                                                              CUDA::cudart)
+  target_compile_features(cucascade_cufile_engine_bench PRIVATE cxx_std_20)
+  target_compile_options(
+    cucascade_cufile_engine_bench
+    PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>)
+  set_target_properties(
+    cucascade_cufile_engine_bench
+    PROPERTIES CXX_EXTENSIONS OFF
+               CUDA_STANDARD 20
+               CUDA_STANDARD_REQUIRED ON)
 endif()
 
 # =============================================================================
@@ -793,7 +811,8 @@ if(CUCASCADE_BUILD_TESTS)
   add_subdirectory(test)
   # The standalone loader consumer must keep compiling with the I/O test build.
   if(TARGET cucascade_io_tests AND TARGET cucascade_cufile_async_qd)
-    add_dependencies(cucascade_io_tests cucascade_cufile_async_qd)
+    add_dependencies(cucascade_io_tests cucascade_cufile_async_qd
+                     cucascade_cufile_engine_bench)
   endif()
 endif()
 

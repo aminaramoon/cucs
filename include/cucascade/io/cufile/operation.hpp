@@ -148,7 +148,7 @@ struct operation_target {
   operation_credit credit;
 };
 
-/** @brief Two inline targets, spilling only when later coalescing needs more slices. */
+/** @brief Two inline targets, spilling only when coalescing needs more slices. */
 class operation_targets {
  public:
   operation_targets()                                    = default;
@@ -156,6 +156,12 @@ class operation_targets {
   operation_targets& operator=(operation_targets const&) = delete;
   operation_targets(operation_targets&&)                 = delete;
   operation_targets& operator=(operation_targets&&)      = delete;
+
+  /// Allocate before adopting credits so expansion cannot strand a partially built group.
+  void reserve(std::size_t count)
+  {
+    if (count > _inline.size()) _overflow.reserve(count - _inline.size());
+  }
 
   operation_target& emplace_back(range logical, void* user_ptr, operation_credit credit)
   {
@@ -167,6 +173,20 @@ class operation_targets {
     auto& value = _overflow.emplace_back(operation_target{logical, user_ptr, std::move(credit)});
     ++_size;
     return value;
+  }
+
+  /// Reset credits while retaining control-thread-preallocated overflow capacity.
+  void clear() noexcept
+  {
+    for (auto& value : _inline)
+      value.reset();
+    _overflow.clear();
+    _size = 0;
+  }
+  void swap_storage(operation_targets& other) noexcept
+  {
+    assert(empty() && other.empty());
+    _overflow.swap(other._overflow);
   }
 
   [[nodiscard]] std::size_t size() const noexcept { return _size; }
@@ -332,12 +352,14 @@ class operation {
 namespace detail {
 
 struct operation_pool_state {
-  explicit operation_pool_state(std::size_t capacity)
+  explicit operation_pool_state(std::size_t capacity, std::size_t targets)
     : records(std::make_unique<operation[]>(capacity)), capacity(capacity)
   {
     free.reserve(capacity);
-    for (std::size_t index = 0; index < capacity; ++index)
+    for (std::size_t index = 0; index < capacity; ++index) {
+      records[index].targets.reserve(targets);
       free.push_back(capacity - index - 1);
+    }
   }
 
   std::mutex mutex;
@@ -369,7 +391,8 @@ class operation_pool {
     if (lanes > std::numeric_limits<std::size_t>::max() / 4) {
       throw std::overflow_error("operation_pool capacity overflow");
     }
-    _state = std::make_shared<detail::operation_pool_state>(4 * lanes);
+    _state = std::make_shared<detail::operation_pool_state>(
+      4 * lanes, config.coalesce ? config.coalesce_max_targets : 1);
   }
   operation_pool(operation_pool const&)            = delete;
   operation_pool& operator=(operation_pool const&) = delete;
@@ -410,8 +433,12 @@ class operation_pool {
     }
     // Settlement can run coordinator continuations; never hold the pool mutex across it.
     auto const generation = op._event_generation;
+    op.targets.clear();
+    operation_targets storage;
+    op.targets.swap_storage(storage);
     std::destroy_at(&op);
     std::construct_at(&op);
+    op.targets.swap_storage(storage);
     op._event_generation = generation;
     {
       std::lock_guard lock(state->mutex);

@@ -121,6 +121,231 @@ Small cached/compat-mode results are **not** GDS qualification. Use `/mnt/disk_2
 for NVMe comparisons and capture matched `gdsio` and attributable direct-path
 evidence on real-GDS filesystems.
 
+## Public-API engine benchmark (`cucascade_cufile_engine_bench`)
+
+Phase 4 / B-3, B-4 and B-5. This standalone C++20/CUDA target links
+`cucascade_io`, **not cuDF or Google Benchmark**. It is `EXCLUDE_FROM_ALL`, but
+building `cucascade_io_tests` also builds it when IO/cuFile headers are enabled.
+The simulated mode compiles the same CUDA-backed transport simulator used by
+the engine tests; storage is a pinned in-memory file image, not a disk read.
+
+```sh
+pixi run cmake --preset release
+pixi run cmake --build build/release --target cucascade_cufile_engine_bench -- -j 20
+./build/release/cucascade_cufile_engine_bench --help
+```
+
+Every task uses `device_readv_async_io`, destinations allocated with
+`cudaMallocAsync` from the device's default CUDA memory pool, and its own
+nonblocking stream. `--threads N` runs N submitting threads, each looping over
+`--tasks N` tasks (default 4). `--reactors N` independently selects the reactor
+pool size (default 1); it is not coupled to submitting threads. `--pipeline N` bounds outstanding tasks per thread
+(default 2); `--sync-each` consumes each task immediately. Consumption always
+waits for the future **and synchronizes that task's stream** before inspecting
+or freeing destinations (AM-1). Pipeline streams, maximum-size destinations,
+CUDA pool growth, per-layout slice metadata and submitting threads are prepared
+before timing. Verification runs as a **separate untimed pass**; measured
+consumption only waits for I/O and synchronizes the caller stream. Whole passes
+repeat until both `--repetitions N` (default 1) and `--min-seconds N` (default
+1 second of measured I/O) are met. Set `--min-seconds 0` for a deliberately
+short correctness smoke, never a throughput comparison. Eviction, engine
+cleanup between passes and task destruction are untimed. Destinations are
+reused across tasks; the pool retains cached allocations until teardown.
+
+Policy/physical-stream warm-up uses a dedicated, temporary `PATH.warmup-PID`
+file beside the input (directory write permission required), not every restore
+file. `--drop-cache` fsyncs every measured file and requests
+`posix_fadvise(POSIX_FADV_DONTNEED)` after verification/creation and before
+**every timed pass**. This is advisory eviction, not proof of a cold device
+cache; CSV records `dontneed_before_each_pass`. Without it, CSV reports
+`verified_warm_uncontrolled` or `uncontrolled`. Simulator data is pinned
+memory regardless of this option.
+
+Workloads:
+
+- `--workload sustained` (default, B-3): `--task-mib 2048`, scattered chunks
+  uniform in `--chunk-min-mib 1` .. `--chunk-max-mib 8`, independently random
+  4 KiB-aligned offsets in the `--size-mib 4096` working set. Fixed seeds make
+  each task reproducible. Destination ranges remain distinct even if file
+  windows overlap.
+- `--workload restore` (B-4): one vectored request per synthetic batch file,
+  named `--file PREFIX.batch-INDEX` (INDEX spans all threads' tasks). Each
+  file has `--columns 64` columns on a 4 KiB-aligned layout. `--col-dist kib`
+  draws 1..16 KiB; `mixed` (default) draws 70% 1..16 KiB, 25% 1..8 MiB,
+  5% 64..128 MiB; `large` draws 64..1024 MiB. The file size is the resulting
+  layout size, independent of `--size-mib`. Start large-column tests with few
+  columns/tasks: pipelined destinations can occupy many GiB.
+- `--workload single` (B-5): a single `--single-mib 1024` buffer per task.
+  Use `--threads 1 --tasks 1 --sync-each` for exactly one big-buffer read.
+
+Modes and safety:
+
+- `--engine legacy` is the default and preserves the library's legacy path.
+- `--engine async` uses **real libcufile** and the async engine. Supply an
+  explicit `--override fs_type:VALUE`, `mount_prefix:VALUE`, or `fsid:VALUE`
+  (repeatable) to operator-qualify the target mount per AM-4. `--qd 32` and
+  `--op-mib 4` set these overrides' preferred profiles; capacity fitting may
+  reduce either. `--arena-mib 256` provisions the selected 1/2/4/8 MiB slot
+  class, so a geometry absent from the arena cannot be reported as effective.
+  Without a matching qualified/probed policy, reads stay legacy and the tool
+  warns if no measured engine transport bytes were observed.
+- `--require-direct-evidence 0` is **TEST ONLY**. For `--engine async` it uses
+  the library's testing admission mode to bypass the process GDS capability
+  gate on compat hosts, while retaining the real libcufile transport and
+  reporting `test_only_compat_admission=1`. This is not direct evidence.
+- `--engine simulated` injects an isolated simulator binding, operator-qualifies
+  `/` if no override was provided, and relaxes slow/stuck-submit demotion
+  thresholds (100 ms / 1 s): simulator host scheduling is not a libcufile
+  qualification signal. The largest input file is loaded into pinned host
+  memory; allow that memory in the host budget. **Every file is served from
+  this one image:** simulated runs require the identical offset-dependent
+  SplitMix64 contents that `--create-file` generates in every file (including
+  the generated warm-up image), not arbitrary user batch files.
+  Verification rejects differing sampled contents; uniform files cannot expose
+  this limitation. Public routing still needs a cuFile-registered file; compat
+  libcufile is sufficient.
+- `--registration slot` is the default. `unsafe-arena` is an **unqualified,
+  potentially corrupting diagnostic opt-in**, never a recommended production
+  setting (AM-9). `--coalesce 0|1` allows a direct B-4 comparison (default 1).
+- `--create-file` creates NEW deterministic offset-dependent SplitMix64 files
+  using the P0 harness pattern and refuses overwrite. With it absent all files
+  are read-only. B-4 uses the same pattern at each file offset in every batch.
+- Verification is on by default, in a separate **untimed** pass: check full
+  contents for columns <= 64 KiB, otherwise up to 256 bytes at the head, middle
+  and tail of **every destination**, against buffered file reads. Physical lane
+  warm-up additionally verifies the entire warm-up window.
+  `--guarded-destinations` reverses destination order and adds 64-byte canaries
+  on both sides of every destination, poisoned and checked in the verified pass,
+  so a copy overrun cannot hide under a later column's copy. It changes destination
+  alignment; compare timings only with the same setting. `--verify 0` skips
+  this verified pass. Sampling is not exhaustive corruption qualification; use
+  the full-content P0 harness and engine tests too.
+
+Reporting: stdout is a CSV header and row; `--csv PATH` writes the same pair
+(`--csv -` keeps stdout only). GiB/s uses successful logical bytes. Engine
+columns include time-weighted QD and backlog-only QD (additive integral/time
+bases exclude warm-up and between-pass eviction/idle gaps; per-pass observation
+windows include physical cleanup), peak QD (engine lifetime, including warm-up),
+minimum/maximum sampled `Q_eff`/`S_eff` (5 ms sampling), slot/lane wait episodes and nanoseconds,
+refill-gap nanoseconds, coalesced operations/targets, gap bytes, bytes by
+registered/unregistered async and synchronous fallback transport, exact engine
+logical bytes and remaining legacy logical bytes. Physical transport counts
+include alignment padding, gaps and retries; logical counts do not. Submit and
+completion p50/p99 are log2-histogram bucket **upper bounds**, in microseconds;
+completion is host-observed I/O validation, not final copy execution. Queries
+per operation excludes warm-up and counts reaper I/O/copy queries (not fence
+hints). Engine-only fields are zero for legacy, **not measurements of legacy
+transport internals**. `open_register_ms` separately times file opening and
+cuFile handle registration. CSV also records admission separately from transport
+(`test_only_compat` is never plain qualified async), coalescing, requested
+QD/op/arena sizes, pipeline, reactors, layouts, chunk limits, file path,
+operator overrides, libcufile version, platform GDS/compat state, cache policy,
+repetitions and measured passes. CSV fields containing paths/overrides are quoted.
+Admission labels describe requested policy, not direct-path evidence or a promise
+that a matching override exists; byte counters expose legacy routing. No
+direct evidence collection is performed. AM-13's remaining scheduler/CPU qualification still
+applies: this benchmark does not itself pass G-1..G-8.
+
+### Real-GDS host recipes
+
+**Collect topology first**, including GPU/NIC/NUMA affinity, mount identities,
+filesystem block/stripe sizes, GDS status and matched raw baselines:
+
+```sh
+OUT=/tmp/gds-topology.md tools/gds/collect_topology.sh \
+  --probe-dir /mnt/disk_2,/gpfs/scratch,/mnt/weka,/mnt/vast
+# Only with permission to create disposable baseline files:
+tools/gds/collect_topology.sh --gdsio /mnt/disk_2
+```
+
+Adapt paths, fs types and working-set sizes to the collector's output. Mount
+prefix selectors avoid guessing the filesystem's reported type (especially
+WEKA and VAST). Operator qualification is **never** reported as verified GDS.
+Use `--drop-cache` for NVMe-fair comparisons with matched baselines. The default
+verified pass is untimed; it is evicted before measurement when that flag is set.
+
+```sh
+bench=./build/release/cucascade_cufile_engine_bench
+# Local NVMe: /mnt/disk_2 for NVMe-fair comparisons, not /tmp.
+$bench --file /mnt/disk_2/engine-b3.bin --create-file --engine async \
+  --override mount_prefix:/mnt/disk_2 --size-mib 16384 --task-mib 2048 \
+  --threads 8 --reactors 8 --tasks 16 --qd 32 --op-mib 4 --arena-mib 256 \
+  --drop-cache --min-seconds 5 --csv /tmp/nvme-b3.csv
+# GPFS: compare --op-mib 2 against the measured filesystem block-size class
+# (1/2/4/8 MiB supported), with enough arena bytes to sustain matched Q_eff.
+$bench --file /gpfs/scratch/engine-b3.bin --create-file --engine async \
+  --override mount_prefix:/gpfs/scratch --size-mib 16384 --threads 8 \
+  --tasks 16 --qd 32 --op-mib 8 --arena-mib 512 --csv /tmp/gpfs-b3.csv
+# WEKA DISK restore: repeat with --coalesce 0, and kib/mixed/large distributions.
+$bench --file /mnt/weka/engine-b4 --create-file --engine async \
+  --override mount_prefix:/mnt/weka --workload restore --columns 128 \
+  --col-dist mixed --threads 4 --tasks 4 --qd 32 --op-mib 4 --arena-mib 256
+# VAST/NFS: confirm RDMA mount and attributable direct-path evidence separately.
+$bench --file /mnt/vast/engine-b5.bin --create-file --engine async \
+  --override mount_prefix:/mnt/vast --workload single --single-mib 1024 \
+  --size-mib 4096 --threads 1 --tasks 1 --sync-each --qd 32 --op-mib 4
+```
+
+For each mount repeat B-3 at 1/2/4/8/16 threads, B-4 for all column distributions,
+and B-5. Compare `--engine legacy` with `--engine async` on the **same files**
+(omit `--create-file` on repeats). Record Q_eff/S_eff, transport bytes, topology,
+libcufile version and attributable direct-path evidence with matched `gdsio`
+baselines. This provides B-9's legacy/async comparison, not its entire
+registered/unregistered/POSIX/forced-compat matrix; use P0's `--register` and
+`--mode` sweeps plus explicit environment controls for those other transports.
+Do not freeze profiles or flip defaults from cached/compat results.
+
+### Phase 4 compat-host smoke (NOT GDS numbers)
+
+Development host: ext4 under `/tmp`, compat libcufile, no real GDS storage mode.
+All nine verified runs below exited 0. Each has two submitting threads, three
+tasks/thread, pipeline 2, QD 4, S_eff 1 MiB, 16 MiB slot-registered arena.
+B-3 uses 8 MiB tasks / 1..2 MiB chunks / 32 MiB file; B-4 uses 128 columns
+of 1..16 KiB per batch; B-5 uses 8 MiB buffers / 32 MiB file. Commands:
+
+```sh
+bench=./build/release/cucascade_cufile_engine_bench
+# Once; refuses overwrite. First invocation may use --engine legacy.
+$bench --file /tmp/cucs-p4-engine-smoke.bin --create-file --engine legacy \
+  --size-mib 32 --task-mib 8 --chunk-min-mib 1 --chunk-max-mib 2 \
+  --threads 2 --tasks 3 --pipeline 2 --qd 4 --op-mib 1 --arena-mib 16
+# Repeat for MODE=legacy,simulated,async and each of the three workloads:
+$bench --file /tmp/cucs-p4-engine-smoke.bin --engine "$MODE" \
+  --size-mib 32 --task-mib 8 --chunk-min-mib 1 --chunk-max-mib 2 --single-mib 8 \
+  --threads 2 --tasks 3 --pipeline 2 --qd 4 --op-mib 1 --arena-mib 16 \
+  --override fs_type:ext4 --require-direct-evidence 0 --workload sustained
+# B-4: replace --file with /tmp/cucs-p4-restore-smoke, --workload with restore,
+# add --columns 128 --col-dist kib; --create-file ONLY on its first invocation.
+# B-5: replace --workload with single; keep the original 32 MiB file.
+```
+
+**Historical, verification-bound smoke; NOT comparable throughput.** These
+pre-review runs included verification and allocation in 5–17 ms windows for B-4.
+The 0.346 → 0.644 ratio must not be interpreted as a coalescing speedup. Current
+commands use the corrected untimed verification/pipeline and minimum-duration
+methodology above; these historical values are retained only as provenance.
+
+| Workload | Mode | Verification-bound smoke GiB/s (not comparable) | Mean / backlog QD | Peak QD | Coalesced ops / targets | Engine logical / legacy bytes |
+|---|---|---:|---:|---:|---:|---:|
+| B-3 | legacy | 3.588 | 0 / 0 | 0 | 0 / 0 | 0 / 50331648 |
+| B-3 | simulated | 3.574 | 3.610 / 3.852 | 4 | 0 / 0 | 50331648 / 0 |
+| B-3 | async (compat) | 2.003 | 3.752 / 3.960 | 4 | 0 / 0 | 50331648 / 0 |
+| B-4 | legacy | 0.346 | 0 / 0 | 0 | 0 / 0 | 0 / 6799360 |
+| B-4 | simulated | 0.644 | 0.841 / 1.807 | 4 | 12 / 768 | 6799360 / 0 |
+| B-4 | async (compat) | 0.519 | 1.227 / 2.476 | 4 | 12 / 768 | 6799360 / 0 |
+| B-5 | legacy | 4.957 | 0 / 0 | 0 | 0 / 0 | 0 / 50331648 |
+| B-5 | simulated | 4.808 | 3.562 / 3.903 | 4 | 0 / 0 | 50331648 / 0 |
+| B-5 | async (compat) | 3.259 | 3.743 / 3.934 | 4 | 0 / 0 | 50331648 / 0 |
+
+Both engine B-4 runs read 8,028,160 physical bytes, including 1,215,488 gap
+bytes, and copied exactly 6,799,360 logical bytes. B-3/B-5 read 50,331,648
+registered-async bytes with zero synchronous/unregistered fallback bytes.
+Example B-3 async submit p50/p99: 16.384/131.072 us; completion:
+2097.152/2097.152 us; 3.024 queries/op. Timings include verification and cached
+file effects; simulated storage is CUDA copying from pinned RAM. An additional
+`--sync-each` simulated B-3 run at QD 2 / 2 MiB slots passed (2.290 GiB/s).
+**None of these are GDS performance or acceptance numbers.**
+
 ## Host topology collector (`collect_topology.sh`)
 
 Read-only, best-effort host survey for GDS/cuFile performance planning

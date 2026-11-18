@@ -49,6 +49,9 @@ struct engine_slice {
   std::shared_ptr<void> retirement_owner;
   /// Engine-installed group guard: failed futures wait for already-enqueued sibling copies.
   std::shared_ptr<void> completion_retirement;
+  /// Optional facade-pass publication barrier: no expansion until all siblings are visible.
+  std::shared_ptr<std::atomic<bool>> publication_ready;
+  std::size_t merge_gap_bytes{IO_BLOCK_SIZE};
   range logical;
   void* user_ptr{};
   int device_id{-1};
@@ -78,13 +81,19 @@ struct engine_mount_gauges {
 struct engine_gauges {
   std::size_t storage_qd{}, max_storage_qd{}, outstanding_slices{}, live_operations{};
   double mean_storage_qd{}, backlog_mean_storage_qd{};
+  /// Additive time bases/integrals for warm-up-excluding benchmark windows.
+  std::uint64_t accounted_ns{}, storage_qd_ns{}, backlog_ns{}, backlog_storage_qd_ns{};
   std::array<std::size_t, 13> lanes_by_phase{};
   std::uint64_t slot_waits{}, lane_waits{}, slot_wait_ns{}, lane_wait_ns{}, refill_gap_ns{};
   std::uint64_t queries{}, completed_ops{}, retries{}, short_reads{}, recoveries{}, quarantines{};
+  /// Cancellations count cancelled operations plus unstarted cursors (not grouped targets).
   std::uint64_t cancellations{}, metadata_rejections{}, not_submitted{};
+  std::uint64_t coalesced_ops{}, coalesced_targets{}, gap_bytes{};
+  /// late_copy_failures counts physical operations, not their coalesced targets.
   std::uint64_t metadata_fallbacks{}, unsupported_fallbacks{}, late_copy_failures{};
   std::uint64_t reaper_iterations{}, reaper_active_ns{};
   std::uint64_t async_registered_bytes{}, async_unregistered_bytes{}, sync_bytes{};
+  std::uint64_t enqueued_logical_bytes{};  ///< Exact targets served, excluding gaps/retries.
   engine_histogram submit, completion, residence, io_poll_delay, copy_poll_delay;
   std::vector<engine_mount_gauges> mounts;
 };

@@ -36,4 +36,27 @@
       - The harness now verifies content by default.
     - AM-11 records the fit-order correction, evidence-source honesty (nvidia-fs parsing deferred to Phase 7), and immutable slot geometry.
     - Process note: agents' own helper sub-agents ran concurrent builds and corrupted the ninja metadata (later repaired). Phase 3+ prompts forbid delegation.
-  - Phase 3 (async engine reads): running
+  - **Phase 3 (async engine reads): DONE**, commit `bf775d1`.
+    - Review: CHANGES-REQUIRED (26 findings).
+      - No memory-safety, double-settlement or stream-ordering defects.
+      - Fixed: R1, R3–R13, R16–R17, R19–R26.
+      - Partly fixed; remainder deferred: R2 to Phase 7 (CPU qualification); R14, R15, R18 to Phase 6.
+    - Tests: 841 cases, 840 passed, 1 skipped. Zero build warnings.
+    - Lead race check: 57 `[engine]` cases in 2 parallel instances, random order and seeds, 10 rounds: 20 of 20 runs passed.
+    - AM-12: bounded admission of fence-blocked reads.
+    - AM-13: tracked follow-ups.
+    - The `cudf/datasource.hpp` change is doc-only (verified).
+  - **Phase 4 (coalescing + engine benchmark): DONE** (commit follows).
+    - Review: no BLOCKING findings; P4-R1 to R18 all fixed.
+    - Tests: 860 cases, 859 passed, 1 skipped. Zero warnings.
+    - Lead race loop: 12 of 12 passed.
+    - AM-14 records the coalescing, publication and routing contracts.
+    - Lead smoke on the compat dev box (NOT GDS: ext4, cuFile compat, page cache dropped, QD 32, 4 MiB ops, 256 MiB arena):
+
+      | Workload | Legacy | Async engine |
+      |---|---|---|
+      | Sustained (B-3) | 3.99 GiB/s | 6.56 GiB/s (+64%), mean QD 24.1 |
+      | Single 1 GiB (B-5) | 6.38 GiB/s | 6.63 GiB/s (device-bound) |
+    - **Tracked perf issue (Phase 6):** `queries_per_op` = 400, against an NFR-3 target of 8 and a ceiling of 70.
+      - With a completion p50 of 8.4 ms, the poll cap of 100 us alone accounts for about 80 queries per op. The rest suggests wake-driven re-polling of lane heads.
+      - The poll cadence must scale with the observed completion latency.

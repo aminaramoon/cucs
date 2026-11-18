@@ -80,6 +80,8 @@ struct async_engine_config {
   bool direct_registered_io{false};
   bool stream_register{true};
   bool affinity{true};
+  bool coalesce{true};  ///< Engine-only small-slice grouping; legacy routing is unchanged.
+  unsigned coalesce_max_targets{64};
 
   /// Mounts are assigned round-robin to 1..8 submitters on each device.
   unsigned submitters_per_device{1};
@@ -162,6 +164,10 @@ struct async_engine_config {
     positive(max_pending_slices_per_device, "max_pending_slices_per_device");
     positive(low_service_interval, "low_service_interval");
     positive(max_short_reads, "max_short_reads");
+    // coalesce is independently selectable, including in legacy mode.
+    positive(coalesce_max_targets, "coalesce_max_targets");
+    if (coalesce_max_targets > 4096)
+      throw std::invalid_argument("coalesce_max_targets must be in [1, 4096]");
     if (device_lane_cap > 160 || max_pending_slices_per_device > (1UL << 20)) {
       throw std::invalid_argument("engine metadata/lane capacity exceeds supported limit");
     }

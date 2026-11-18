@@ -300,6 +300,9 @@ class cufile_reactor {
 
   [[nodiscard]] bool submit_fence_enabled() const noexcept;
   void record_submit_fences(std::vector<prepared_io_slice>& slices);
+  /// Single-reactor batching is allowed only for currently eligible small device reads.
+  [[nodiscard]] bool coalescing_candidate(cufile_io_object const& object,
+                                          std::span<prepared_io_slice const> slices) const noexcept;
   [[nodiscard]] std::shared_ptr<reactor_context> context() const noexcept { return _ctx; }
 
   /// Present for reactor-concept symmetry with the uring reactor; does nothing.
@@ -435,6 +438,28 @@ class cufile_reactor {
 
   void worker_loop(std::stop_token const& stop_token);
 
+  /// Lazily opened only by real handoffs; legacy I/O publishes before blocking.
+  struct engine_publication {
+    reactor_context& context;
+    std::shared_ptr<std::atomic<bool>> ready;
+    std::shared_ptr<std::atomic<bool>> take() noexcept
+    {
+      try {
+        if (!ready) ready = std::make_shared<std::atomic<bool>>(false);
+      } catch (...) { /* Coalescing is optional under metadata pressure. */
+      }
+      return ready;
+    }
+    void publish() noexcept
+    {
+      if (!ready) return;
+      ready->store(true, std::memory_order_release);
+      context.notify_engines();
+      ready.reset();
+    }
+    ~engine_publication() { publish(); }
+  };
+
   /// Turn one slice into cuFile reads or a POSIX pread.  Never throws --
   /// errors are reported through the slice's completion and coordinator.  A
   /// device-only slice whose stream still has queued work is parked (see
@@ -442,8 +467,9 @@ class cufile_reactor {
   void dispatch_slice(std::shared_ptr<const io_object> const& obj,
                       prepared_io_slice slice,
                       std::shared_ptr<grouped_coordinator> const& coordinator,
-                      bool stream_ready = false,
-                      bool* handed_off  = nullptr) noexcept;
+                      bool stream_ready               = false,
+                      bool* handed_off                = nullptr,
+                      engine_publication* publication = nullptr) noexcept;
 
   /// When the slice's stream still has queued work, record an event on it and
   /// park the slice in @ref _waiting; returns whether it was parked.

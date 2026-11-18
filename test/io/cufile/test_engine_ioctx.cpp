@@ -8,6 +8,7 @@
 #include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/cufile/runtime.hpp>
 
+#include <pthread.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -134,6 +135,34 @@ TEST_CASE("ioctx engine vectored reads join exact bytes onto the caller stream",
                    contents.begin() + static_cast<std::ptrdiff_t>(2 * mib - 11),
                    r.image.begin() + static_cast<std::ptrdiff_t>(2 * mib + 11)));
   CHECK(r.transport->snapshot().submitted >= 2);
+}
+
+TEST_CASE("ioctx tiny columns publish together across a multi-reactor context",
+          "[cufile][engine][coalesce][ioctx]")
+{
+  if (!has_device()) SKIP("CUDA unavailable");
+  api_fixture f;
+  auto& r = f.resources;
+  cufile_ioctx context(4, f.shared);
+  context.start();
+  auto object = context.open_io_object(f.disk.path);
+  std::vector<slice> slices;
+  auto expected = std::vector<std::byte>(r.bytes, std::byte{0xcc});
+  for (std::size_t i = 100; i != 0; --i) {
+    auto offset = (i - 1) * 4096 + 37;
+    auto dest   = (100 - i) * 8192;
+    slices.emplace_back(offset, 1024, static_cast<std::uint8_t*>(r.destination) + dest);
+    std::copy_n(r.image.begin() + static_cast<std::ptrdiff_t>(offset),
+                1024,
+                expected.begin() + static_cast<std::ptrdiff_t>(dest));
+  }
+  CHECK(context.device_readv_async_io(*object, slices, ::cuda::stream_ref{r.stream}).get(5s) ==
+        102400);
+  CHECK(r.contents() == expected);
+  REQUIRE(r.engine->drain(5s));
+  CHECK(r.transport->snapshot().read_calls == 2);
+  CHECK(r.transport->snapshot().wait_calls == 4);  // one fence + one join per group
+  context.shutdown();
 }
 
 TEST_CASE("ioctx engine success is enqueued rather than host complete", "[cufile][engine][ioctx]")
@@ -538,11 +567,20 @@ TEST_CASE("ioctx engine delayed copy is joined before an immediate consumer",
   seam_reset reset;
   REQUIRE(cudaStreamSynchronize(r.stream) == cudaSuccess);
   cufile_detail::set_staging_copy_delay_for_testing(200ms);
-  auto future = f.read(r.stream);
+  auto targets = GENERATE(1U, 8U);
+  std::vector<slice> slices;
+  for (unsigned i = 0; i < targets; ++i)
+    slices.emplace_back(i * 4096, 1024, static_cast<std::uint8_t*>(r.destination) + i * 8192);
+  auto future = f.context->device_readv_async_io(*f.object, slices, ::cuda::stream_ref{r.stream});
   // This is intentionally before the copy can execute, not a host-complete read.
-  REQUIRE(std::move(future).get(5s) == mib);
+  REQUIRE(std::move(future).get(5s) == targets * 1024);
   // Synchronize ONLY the caller stream: without the join this reads the 0xcc poison.
-  CHECK(r.contents(mib) == std::vector<std::byte>(r.image.begin(), r.image.begin() + mib));
+  auto expected = std::vector<std::byte>(mib, std::byte{0xcc});
+  for (unsigned i = 0; i < targets; ++i)
+    std::copy_n(r.image.begin() + i * 4096, 1024, expected.begin() + i * 8192);
+  CHECK(r.contents(mib) == expected);
+  REQUIRE(r.engine->drain(5s));
+  CHECK(r.engine->gauges().coalesced_targets == (targets > 1 ? targets : 0));
 }
 
 TEST_CASE("ioctx engine metadata pressure retains the legacy read path", "[cufile][engine][ioctx]")
@@ -584,4 +622,90 @@ TEST_CASE("ioctx published engine lookup does not miss under contention", "[cufi
   for (auto& reader : readers)
     reader.join();
   CHECK(misses.load() == 0);
+}
+
+TEST_CASE("ioctx legacy dispatch publishes engine handoffs before blocking",
+          "[cufile][engine][coalesce][ioctx]")
+{
+  if (!has_device()) SKIP("CUDA unavailable");
+  api_fixture f;
+  auto& r = f.resources;
+  struct hold {
+    std::atomic<bool> entered{}, released{};
+    ~hold() { released.store(true); }
+  } held;
+  seam_reset reset;
+  cufile_detail::set_cufile_transfer_hook_for_testing(
+    [](void* value) {
+      char name[16]{};
+      static_cast<void>(pthread_getname_np(pthread_self(), name, sizeof(name)));
+      if (std::string_view(name).find("mixed-pass") != 0) return;
+      auto& state = *static_cast<hold*>(value);
+      state.entered.store(true);
+      while (!state.released.load())
+        std::this_thread::sleep_for(50us);
+    },
+    &held);
+  cufile_reactor worker(f.shared, "mixed-pass");
+  worker.start();
+  // Ensure assertion unwinding releases the held worker BEFORE its destructor joins.
+  struct release {
+    hold& state;
+    ~release() { state.released.store(true); }
+  } guard{held};
+  std::vector<prepared_io_slice> slices;
+  slices.emplace_back(
+    range{0, 1024},
+    device_buffer{static_cast<std::uint8_t*>(r.destination), ::cuda::stream_ref{r.stream}, 0});
+  slices.emplace_back(
+    range{mib, mib},
+    device_buffer{
+      static_cast<std::uint8_t*>(r.destination) + mib, ::cuda::stream_ref{cudaStreamLegacy}, 0});
+  worker.record_submit_fences(slices);
+  slices[1].d_buffer.original_stream_was_null = true;  // Force synchronous legacy.
+  REQUIRE(cudaStreamSynchronize(r.stream) == cudaSuccess);
+  auto group  = std::make_shared<grouped_coordinator>(mib + 1024, 2);
+  auto future = group->get_future();
+  worker.enqueue(grouped_io_request::create(f.object, std::move(slices), group));
+  REQUIRE(until([&] { return held.entered.load(); }));
+  // The engine must run WHILE the legacy worker remains held in the same pass.
+  REQUIRE(until([&] { return r.transport->snapshot().completed == 1; }));
+  CHECK_FALSE(future.is_ready());
+  held.released.store(true);
+  REQUIRE(std::move(future).get(5s) == mib + 1024);
+  worker.shutdown();
+}
+
+TEST_CASE("ioctx coalescing routing preserves legacy mixed and large fan-out",
+          "[cufile][engine][coalesce][ioctx]")
+{
+  if (!has_device()) SKIP("CUDA unavailable");
+  auto eligible = GENERATE(false, true);
+  api_fixture f(false,
+                false,
+                eligible ? mount_override_state::operator_qualified : mount_override_state::legacy);
+  struct inspect_context : cufile_ioctx {
+    using cufile_ioctx::cufile_ioctx;
+    using cufile_ioctx::select_reactors;
+  } context(4, f.shared);
+  auto& r = f.resources;
+  cufile_reactor recorder(f.shared);
+  std::vector<prepared_io_slice> slices;
+  for (unsigned i = 0; i < 4; ++i)
+    slices.emplace_back(
+      range{i * mib, mib},
+      device_buffer{
+        static_cast<std::uint8_t*>(r.destination) + i * mib, ::cuda::stream_ref{r.stream}, 0});
+  recorder.record_submit_fences(slices);
+  auto const& object = static_cast<cufile_io_object const&>(*f.object);
+  using io_op_type   = cufile_ioctx::io_op_type;
+  CHECK(context.select_reactors(object, slices, io_op_type::host_vector_async, 0).size() == 4);
+  for (auto& slice : slices)
+    slice.rng.size = 1024;
+  CHECK(context.select_reactors(object, slices, io_op_type::host_vector_async, 0).size() ==
+        (eligible ? 1 : 4));
+  slices.back().d_buffer.original_stream_was_null = true;
+  CHECK(context.select_reactors(object, slices, io_op_type::host_vector_async, 0).size() == 4);
+  slices.back() = prepared_io_slice(range{0, 1024}, host_buffer{nullptr});
+  CHECK(context.select_reactors(object, slices, io_op_type::host_vector_async, 0).size() == 4);
 }

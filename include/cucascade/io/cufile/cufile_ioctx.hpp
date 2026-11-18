@@ -73,7 +73,9 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
    * reactor, least backlogged first.  A host-only vectored write goes to one
    * reactor: its page-cache writes with early writeback keep the device busy,
    * and interleaving writers of one file only contends on its inode.  Other
-   * operations keep the base selection.
+   * operations keep the base selection. The slice-aware policy below batches only
+   * currently engine-eligible, device-only requests with small slices on one reactor;
+   * unqualified, mixed and all-large requests retain normal fan-out.
    */
   std::vector<cufile_reactor*> next_reactor(cufile_io_object const& object,
                                             std::size_t n_slices,
@@ -93,6 +95,11 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
   [[nodiscard]] path_info path_capability(io_object const& object) const;
 
  protected:
+  std::vector<cufile_reactor*> select_reactors(cufile_io_object const& object,
+                                               std::span<prepared_io_slice const> slices,
+                                               io_op_type operation,
+                                               int device_id) override;
+
   /// Opens @p path with this ioctx's @c use_odirect / @c compat_mode, which the
   /// static @c cufile_reactor::create_io_object(path) cannot see.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
