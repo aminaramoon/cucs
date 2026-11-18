@@ -17,10 +17,12 @@
 
 #include <cucascade/io/cufile/async_transport.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
+#include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/cufile/lane_pool.hpp>
 #include <cucascade/io/cufile/mount_policy.hpp>
 #include <cucascade/io/cufile/operation.hpp>
 #include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -585,15 +587,16 @@ void mount_policy::run_probe(mount_probe_context const& context) noexcept
       retained->bytes_done     = pending_sentinel;
       retained->inflight_owner = retained;
       auto const start         = policy_clock::now();
-      auto const status        = context.transport->read_async(context.file->cufile_handle(),
+      detail::before_engine_transfer_for_testing();
+      auto const status   = context.transport->read_async(context.file->cufile_handle(),
                                                         retained->slot->base_ptr_to_pass(),
                                                         &retained->size,
                                                         &retained->file_offset,
                                                         &retained->buffer_offset,
                                                         &retained->bytes_done,
                                                         stream);
-      auto const returned      = policy_clock::now();
-      auto const record = context.transport->record_event((*retained->lane)->io_event(), stream);
+      auto const returned = policy_clock::now();
+      auto const record   = context.transport->record_event((*retained->lane)->io_event(), stream);
       // Control-only synchronization; even a failed submit/record may have enqueued DMA.
       auto const sync = cudaStreamSynchronize(stream);
       if (sync != cudaSuccess) {
@@ -753,6 +756,7 @@ void mount_policy::begin_cooldown() noexcept
 void mount_policy::poll_timers() noexcept
 {
   std::shared_ptr<mount_probe_context> context;
+  std::weak_ptr<cufile_io_object const> file;
   {
     std::unique_lock lock(_mutex, std::try_to_lock);
     if (!lock) {
@@ -778,14 +782,23 @@ void mount_policy::poll_timers() noexcept
     _state = mount_state::unknown;
     if (_probe_context) {
       try {
-        context       = std::make_shared<mount_probe_context>(*_probe_context);
-        context->file = _probe_file.lock();
+        context = std::make_shared<mount_probe_context>(*_probe_context);
+        file    = _probe_file;
       } catch (...) {
         return;
       }
     }
   }
-  if (context && context->file) ensure_probe(*context);
+  if (context) {
+    try {
+      auto self   = shared_from_this();
+      std::ignore = _executor->submit([self, context, file] {
+        context->file = file.lock();
+        if (context->file) self->ensure_probe(*context);
+      });
+    } catch (...) { /* Never materialize the final file owner on a reaper. */
+    }
+  }
 }
 
 mount_policy_gauges mount_policy::gauges() const
@@ -802,6 +815,7 @@ struct mount_policy_registry::impl {
   std::mutex mutex;
   std::unordered_map<mount_policy_key, std::shared_ptr<mount_policy>, mount_policy_key_hash>
     policies;
+  std::unordered_map<mount_policy_key, bool, mount_policy_key_hash> warned;
 };
 
 mount_policy_registry::mount_policy_registry() : _impl(std::make_shared<impl>()) {}
@@ -822,7 +836,14 @@ std::shared_ptr<mount_policy> mount_policy_registry::get_or_create(
 {
   std::lock_guard lock(_impl->mutex);
   auto const found = _impl->policies.find(key);
-  if (found != _impl->policies.end()) return found->second;
+  if (found != _impl->policies.end()) {
+    if (!found->second->matches_config(config) && !_impl->warned[key]) {
+      _impl->warned[key] = true;
+      CUCASCADE_LOG_WARN("cuFile mount {}: configuration differs; first configuration wins",
+                         key.mount_id);
+    }
+    return found->second;
+  }
   auto policy = std::make_shared<mount_policy>(
     key, std::move(identity), std::move(config), std::move(executor), std::move(now));
   _impl->policies.emplace(std::move(key), policy);

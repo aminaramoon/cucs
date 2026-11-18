@@ -84,6 +84,7 @@ struct transport_simulator::state {
   mutable std::mutex mutex;
   std::condition_variable cv;
   options config;
+  std::atomic<ssize_t> sync_result{std::numeric_limits<ssize_t>::min()};
   std::size_t image_size{0};
   std::size_t image_capacity{0};
   void* pinned_image{nullptr};
@@ -538,6 +539,37 @@ cudaError_t transport_simulator::stream_wait_event(cudaStream_t stream, cudaEven
     ++_state->counts.wait_errors;
   }
   return result;
+}
+
+void transport_simulator::set_sync_result(ssize_t result) noexcept
+{
+  _state->sync_result.store(result);
+}
+
+ssize_t transport_simulator::read_sync(
+  void*, void* base, std::size_t size, off_t file_offset, off_t buffer_offset) noexcept
+{
+  if (!valid_range(base, size, file_offset, buffer_offset)) return -EINVAL;
+  auto const forced = _state->sync_result.load();
+  if (forced != std::numeric_limits<ssize_t>::min()) return forced;
+  try {
+    auto contents     = image();
+    auto const offset = static_cast<std::size_t>(file_offset);
+    if (offset >= contents.size()) return 0;
+    auto const count = std::min(size, contents.size() - offset);
+    cudaStream_t stream{};
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return -EIO;
+    auto const copied = cudaMemcpyAsync(static_cast<std::byte*>(base) + buffer_offset,
+                                        contents.data() + offset,
+                                        count,
+                                        cudaMemcpyHostToDevice,
+                                        stream);
+    auto const status = cudaStreamSynchronize(stream);
+    static_cast<void>(cudaStreamDestroy(stream));
+    return copied == cudaSuccess && status == cudaSuccess ? static_cast<ssize_t>(count) : -EIO;
+  } catch (...) {
+    return -ENOMEM;
+  }
 }
 
 cufile_transport::status transport_simulator::read_async(void*,

@@ -33,8 +33,9 @@ Replaces FR-1, §4.8 step 4, and the P5 two-phase event API (FR-32, §6.12,
   is only possible on the caller's thread. Requests whose original stream was
   `cudaStreamPerThread` are therefore resolved **host-complete**: the reaper
   waits until it observes every `copy_ev` before settling the last credit.
-  Null streams (pinned to `cudaStreamLegacy`) and explicit streams use the
-  enqueued contract.
+  Explicit streams use the enqueued contract. Original null streams remain on
+  the legacy host-complete route conservatively (P3-R20); an explicitly supplied
+  `cudaStreamLegacy` may use the engine.
 - **Legacy, compat, and POSIX paths** stay host-complete. That is stronger than
   the contract, so it conforms.
 - **Errors.** The contract can only resolve after I/O validation. Async cuFile
@@ -49,6 +50,8 @@ Replaces FR-1, §4.8 step 4, and the P5 two-phase event API (FR-32, §6.12,
   - Callers that assume host-complete reads must synchronize the stream before
     touching the data from the host:
     - `src/cudf/disk_io.cpp` read path
+    - `include/cucascade/cudf/datasource.hpp` scalar/vector read contracts (updated
+      in Phase 3; implementation call-site audit remains separate)
     - `check_transferred`
     - the benchmarks
     - `test_cufile_reactor.cpp:660`
@@ -70,9 +73,10 @@ input-waiter cap, and the read part of the submitter's `cudaStreamWaitEvent` in
 - Before the D2D copy, the reaper enqueues `cudaStreamWaitEvent(lane, fence)` on
   the lane, then the copy. The fence orders the copy after the destination's
   stream-ordered allocation and any earlier caller work. A busy caller stream
-  therefore delays only copies, never storage queue depth.
-- The read path no longer needs `input_wait` lanes, `ops_in_input_wait`, or the
-  device input-waiter cap. Writes keep them, because the staging copy *reads the
+  therefore never gates the storage submission itself. Copies retain their lane
+  and slot; AM-12 bounds that retention so unrelated callers keep making progress.
+- The read path does not use the write-style `input_wait` phase or
+  `ops_in_input_wait`. AM-12 supplies its separate admission hint cap. Writes keep them, because the staging copy *reads the
   caller's source*.
 - Direct registered reads (FR-18) write into caller memory, so they keep a fence
   wait before the I/O.
@@ -281,3 +285,68 @@ Promotes open question §9.15 into the plan.
   final file, lane-pool, input and scratch owners to the blocking cleanup pool.
   Phase 2's standalone resource APIs are not themselves nonblocking final-owner
   destructors. Test this handoff before enabling the Phase 3 scheduler (FR-5).
+
+
+## AM-12: Bound fence-blocked read admission (Phase 3 review P3-R1)
+
+- A nonblocking, reaper-only fence readiness hint is cached per cursor. A pending
+  hint is queried no more often than `poll.fence_hint_us`; readiness is sticky.
+  It is a scheduling hint, never a correctness fence.
+- Across a mount, at most `ceil(effective.lanes / 8)` pieces admitted with an
+  unready hint may retain a lane/slot. The count covers the entire lease, including
+  I/O, fence-waiting copy and cleanup. This is deliberately more conservative
+  than counting only validated copies. The hint cap applies across slices and
+  logical requests, so many slices sharing one busy stream cannot bypass it.
+- Further pieces remain resource-free. Ready requests of either priority remain
+  schedulable; a gated high-priority cursor does not suppress ready low work.
+- The first admitted piece still submits storage without waiting for the fence.
+  Every D2D retains its unconditional fence wait. Every non-PTDS success retains
+  its caller-stream join. Original PTDS requests still complete host-observed.
+- A gated 16 MiB request and a ready 1 MiB request on the same mount must both
+  progress independently, with QD 1 and 4 and in either arrival order.
+
+## AM-13: Phase 3 review integration and explicitly tracked follow-up
+
+- **Context-level completion (P3-R8/R19).** In a non-legacy cuFile context,
+  device-only reads on original non-PTDS streams may resolve enqueued. Routing is
+  dynamic; callers must always wait on the stream before host/foreign-stream
+  access and retain destinations through that wait. The reaper inserts the join
+  later, from another thread: graph capture on that stream while a read is in
+  flight is unsupported. Later CUDA copy errors cannot revoke early success;
+  stream/context synchronization and `late_copy_failures` expose them.
+- **Legacy redispatch (P3-R10).** A legacy slice parked on its input stream stays
+  legacy when redispatched, even if qualification finishes in the meantime.
+  A request observing an unqualified policy before scheduling its probe also
+  stays legacy even if the worker is preempted until after probe completion.
+- **Metadata pressure (P3-R6).** Facades reserve engine metadata before credit
+  adoption; exhaustion preserves the original credit and uses legacy. Direct
+  engine callers retain the explicit bounded-admission error.
+- **Fallback (P3-R4/R5/R24).** Retry nodes whose grant becomes zero use sync
+  staging. Backend refusal/unsupported first completions and submit errors are
+  reissued through sync fallback after event observation or owned-lane recovery.
+  Unsupported async operation conservatively opens the mount circuit, rather
+  than repeatedly failing user reads. Terminal ENOSPC/EACCES, malformed counts,
+  nonprogress, exhausted short-read retries and file shrink still fail. Negative
+  fallback results are terminal; no EINVAL loop is allowed.
+- **Phase 6 error/lifecycle hardening.** Add bounded transient ESTALE-class
+  backoff and finer per-file demotion; Phase 3 uses a single sync fallback instead
+  of replaying async transient errors. Replace an errored CUDA lane rather than
+  reusing it after a successful owned-lane synchronization (§7 #42). Wire
+  per-file granules and geometry boundaries, currently the conservative 4096-byte
+  granule and no explicit geometry boundaries. Extend nonblocking lease-release
+  APIs before moving resource retirement onto the reaper (P3-R15).
+- **Phase 7 CPU/performance qualification (P3-R2/R3).** Phase 3 now uses a free-node
+  stack, active-node iteration, constant-time cursor lookup, merged submit results,
+  throttled live snapshots, deadline/notification-driven backlog service, and
+  reaper active-ns/iteration gauges. Cleanup has an independently started,
+  semaphore-driven executor, isolated from sync I/O; final owners stay off-reaper.
+  Per-mount/tier intrusive ready queues, incremental request accounting, batched
+  cleanup and parked-only eventfd writes remain Phase 7 prerequisites for G-5.
+  Replacing the DRR containers is a separate scheduler change requiring high-R
+  fairness/CPU benchmarks; this correction does not claim the NFR-3 budget passes.
+  Do not enable the engine by default or use it for acceptance measurements
+  until these remaining costs are bounded and measured.
+- **Phase 7 qualification (P3-R26).** Seed the healthy submit-latency baseline
+  from an isolated read probe (FR-9). The current probe threshold is
+  `submit_max_us`; absent real-host evidence it must not imply baseline seeding
+  or direct qualification.

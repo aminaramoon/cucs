@@ -152,6 +152,9 @@ class datasource : public cudf::io::datasource {
                                                   cudf_stream_type stream) override;
   size_t device_read(size_t offset, size_t size, uint8_t* dst, cudf_stream_type stream) override;
 
+  /// Completion follows ioctx::device_readv_async_io: an opt-in cuFile context
+  /// may resolve enqueued. Keep dst alive and synchronize stream before host or
+  /// foreign-stream access; do not graph-capture stream while the read is in flight.
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
@@ -168,11 +171,13 @@ class datasource : public cudf::io::datasource {
   /// \p priority is the reactor queue tier (see @c io_priority); @c automatic
   /// resolves to high, as for every device read.
   ///
-  /// The future settles only once every range has stopped touching its
-  /// destination (failed and cancelled siblings included); on success the bytes
-  /// are in place without further synchronization of \p stream.  The caller
-  /// keeps every destination alive until then (see
-  /// @c ioctx::device_readv_async_io).
+  /// With an opt-in cuFile engine context, success may mean enqueued and joined
+  /// onto \p stream, not host-complete. Keep every destination alive through
+  /// synchronization of that stream before host or foreign-stream access.
+  /// Do not graph-capture that stream while the read is in flight. Later CUDA
+  /// copy errors are observed at synchronization, not by revoking early success.
+  /// Legacy contexts and original PTDS callers remain host-complete.
+  /// See @c ioctx::device_readv_async_io for the context-level contract.
   std::future<size_t> device_read_ranges_async(std::span<const slice> slices,
                                                ::cuda::stream_ref stream,
                                                io_priority priority = io_priority::automatic);

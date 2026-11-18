@@ -127,6 +127,8 @@ class transport_simulator final : public cufile_transport {
 
   void add_fault(fault rule);
   void clear_faults();
+  /// Force synchronous fallback errors independently of the async fault script.
+  void set_sync_result(ssize_t result) noexcept;
   [[nodiscard]] bool unblock(std::size_t index) noexcept;
   void unblock_all() noexcept;
   /// Blocking control-thread recovery for partial enqueue failures; exclude concurrent submits
@@ -149,6 +151,7 @@ class transport_simulator final : public cufile_transport {
   [[nodiscard]] device_arena_hooks arena_hooks(
     device_arena_hooks hooks = device_arena_hooks::defaults());
 
+  [[nodiscard]] ssize_t read_sync(void*, void*, std::size_t, off_t, off_t) noexcept override;
   [[nodiscard]] status read_async(
     void*, void*, std::size_t*, off_t*, off_t*, ssize_t*, cudaStream_t) noexcept override;
   [[nodiscard]] status write_async(

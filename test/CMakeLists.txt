@@ -140,7 +140,11 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_runtime_params.cpp
               io/cufile/test_lane_pool.cpp
               io/cufile/test_operation.cpp
-              io/cufile/test_mount_policy.cpp)
+              io/cufile/test_mount_policy.cpp
+              io/cufile/test_engine_read.cpp
+              io/cufile/test_engine_failure.cpp
+              io/cufile/test_engine_sched.cpp
+              io/cufile/test_engine_ioctx.cpp)
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20

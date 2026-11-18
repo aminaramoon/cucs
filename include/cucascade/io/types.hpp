@@ -348,6 +348,12 @@ struct host_buffer {
   std::variant<std::monostate, std::uint8_t*, std::vector<cache::cached_chunk*>> buffer;
 };
 
+/// Caller-recorded input dependency. The owner returns its event to a per-device pool.
+struct submit_fence {
+  cudaEvent_t event{};
+  std::shared_ptr<void> owner;
+};
+
 struct device_buffer {
   device_buffer() noexcept = default;
 
@@ -368,6 +374,10 @@ struct device_buffer {
   /// (see @c detail::resolve_default_streams in templated_ioctx.hpp); null
   /// when @c stream is the caller's own.
   std::shared_ptr<void> stream_owner;
+  std::shared_ptr<submit_fence> fence;
+  /// Captured only by reactors opting into submit fences, before stream resolution.
+  bool original_stream_was_ptds{false};
+  bool original_stream_was_null{false};
 };
 
 class prepared_io_completion final {

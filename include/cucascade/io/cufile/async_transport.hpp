@@ -50,6 +50,10 @@ class cufile_transport {
 
   virtual ~cufile_transport() = default;
 
+  /// Blocking-pool only. Returns bytes or a negative transport error; never called by reaper.
+  [[nodiscard]] virtual ssize_t read_sync(
+    void* handle, void* base, std::size_t size, off_t file_offset, off_t buffer_offset) noexcept;
+
   [[nodiscard]] virtual status read_async(void* handle,
                                           void* base,
                                           std::size_t* size,
@@ -92,6 +96,7 @@ class cufile_async_transport final : public cufile_transport {
  public:
   explicit cufile_async_transport(cufile_api const* api) noexcept : _api(api) {}
 
+  [[nodiscard]] ssize_t read_sync(void*, void*, std::size_t, off_t, off_t) noexcept override;
   [[nodiscard]] status read_async(
     void*, void*, std::size_t*, off_t*, off_t*, ssize_t*, cudaStream_t) noexcept override;
   [[nodiscard]] status write_async(

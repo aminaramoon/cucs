@@ -1,0 +1,156 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#pragma once
+
+#include <cucascade/io/cufile/async_transport.hpp>
+#include <cucascade/io/cufile/mount_policy.hpp>
+#include <cucascade/io/cufile/operation.hpp>
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <vector>
+
+namespace cucascade::io::cufile {
+
+/** @brief Caller-recorded event and its lifetime proof. Destruction is off the reaper. */
+using engine_fence = submit_fence;
+
+/**
+ * @brief One adopted slice credit. Streams MUST already be resolved on the caller thread.
+ *
+ * The fence must already be recorded. The caller keeps user_ptr valid through synchronization
+ * of user_stream after success (AM-1); PTDS requests instead finish host-complete. Cancellation
+ * is optional and supplements coordinator.should_continue(). Submitted storage work drains.
+ * The original credit pins lazy expansion; every non-final piece adds a new credit first.
+ */
+struct engine_slice {
+  /// Optional facade drain ticket. Retained through ALL child retirements, not just the early
+  /// AM-1 future. Last field destroyed: accepted slices release it on blocking cleanup; rejected
+  /// handoffs release it on the handoff thread. Its destructor must be noexcept/nonblocking.
+  std::shared_ptr<void> retirement_owner;
+  /// Engine-installed group guard: failed futures wait for already-enqueued sibling copies.
+  std::shared_ptr<void> completion_retirement;
+  range logical;
+  void* user_ptr{};
+  int device_id{-1};
+  cudaStream_t user_stream{cudaStreamLegacy};
+  std::shared_ptr<void> stream_owner;
+  bool original_stream_was_ptds{false};
+  std::shared_ptr<engine_fence> fence;
+  operation_credit credit;
+  std::shared_ptr<const io_object> file;
+  io_priority priority{io_priority::high};
+  std::shared_ptr<std::atomic<bool>> cancel;
+  std::shared_ptr<mount_policy> policy;
+  std::size_t granule{4096};
+  std::vector<std::size_t> geometry_boundaries;
+};
+
+/** @brief Log2 nanosecond histogram; bucket 63 includes overflow. */
+struct engine_histogram {
+  std::array<std::uint64_t, 64> buckets{};
+  std::uint64_t count{}, total_ns{};
+};
+struct engine_mount_gauges {
+  std::uint64_t mount_id{};
+  effective_profile effective;
+  std::size_t storage_qd{}, max_storage_qd{}, occupied_lanes{}, max_occupied_lanes{};
+};
+struct engine_gauges {
+  std::size_t storage_qd{}, max_storage_qd{}, outstanding_slices{}, live_operations{};
+  double mean_storage_qd{}, backlog_mean_storage_qd{};
+  std::array<std::size_t, 13> lanes_by_phase{};
+  std::uint64_t slot_waits{}, lane_waits{}, slot_wait_ns{}, lane_wait_ns{}, refill_gap_ns{};
+  std::uint64_t queries{}, completed_ops{}, retries{}, short_reads{}, recoveries{}, quarantines{};
+  std::uint64_t cancellations{}, metadata_rejections{}, not_submitted{};
+  std::uint64_t metadata_fallbacks{}, unsupported_fallbacks{}, late_copy_failures{};
+  std::uint64_t reaper_iterations{}, reaper_active_ns{};
+  std::uint64_t async_registered_bytes{}, async_unregistered_bytes{}, sync_bytes{};
+  engine_histogram submit, completion, residence, io_poll_delay, copy_poll_delay;
+  std::vector<engine_mount_gauges> mounts;
+};
+
+/**
+ * @brief Explicit bootstrap/test dependencies. Construction is CONTROL-THREAD ONLY.
+ *
+ * Arena must be warmed before construction and outlive this engine, including an incomplete
+ * drain. Pools/transports/executors are retained internally. Injected executors must enqueue,
+ * never execute inline, and may reject work transiently. Recovery synchronizes OWNED lanes only.
+ */
+struct device_engine_options {
+  device_arena* arena{};
+  std::shared_ptr<lane_pool> lanes;
+  std::shared_ptr<cufile_transport> transport;
+  std::shared_ptr<control_executor> control;
+  std::shared_ptr<control_executor> blocking;
+  std::shared_ptr<control_executor> recovery;
+  std::shared_ptr<control_executor> cleanup;
+  policy_now now                                            = [] { return policy_clock::now(); };
+  std::function<cudaError_t(cudaEvent_t)> query_event       = cudaEventQuery;
+  std::function<cudaError_t(cudaStream_t)> synchronize_lane = cudaStreamSynchronize;
+  /// Opaque handle extraction never does I/O. Default accepts cufile_io_object only.
+  std::function<void*(io_object const&)> file_handle;
+  /// Nonblocking descriptor extraction; injected simulator files can exercise fstat/pread.
+  std::function<int(io_object const&)> buffered_fd;
+};
+
+/**
+ * @brief Per-device staged-read scheduler shared by opt-in reactor facades.
+ *
+ * for_device bootstraps once (first configuration wins) and intentionally never destroys the
+ * engine or arena. try_get never constructs. Explicit instances are for tests/control bootstrap.
+ * request_stop cancels pending work, drains submitted work, and never destroys the arena.
+ * drain(false) means incomplete: a stuck call/quarantine is retained, never detached/replayed or
+ * falsely completed. Destruction attempts a bounded drain; on timeout the live engine is retained.
+ */
+class device_engine {
+ public:
+  [[nodiscard]] static device_engine& for_device(int device,
+                                                 async_engine_config const& config = {});
+  [[nodiscard]] static device_engine* try_get(int device) noexcept;
+  device_engine(int device, async_engine_config config, device_engine_options options);
+  ~device_engine();
+  device_engine(device_engine const&)            = delete;
+  device_engine& operator=(device_engine const&) = delete;
+
+  /// Published bootstrap is usable until stop or a failed device-thread initialization.
+  [[nodiscard]] bool ready() const noexcept;
+
+  /// Bounded metadata admission, no waits for lanes/slots/thread creation; adopts credit always.
+  void hand_off(engine_slice slice, bool reserved = false) noexcept;
+  /// Facades reserve AFTER all throwing preparation; a miss leaves their legacy credit intact.
+  [[nodiscard]] bool try_reserve_slice() noexcept;
+  /// Must be called if a successful reservation cannot be handed off.
+  void release_slice_reservation() noexcept;
+  /// Wake after cancellation/policy changes. Policy/quotas are recomputed on the control executor.
+  void notify() noexcept;
+  void request_stop() noexcept;
+  [[nodiscard]] bool drain(std::chrono::milliseconds timeout) noexcept;
+  /// Eventually consistent diagnostic snapshot, not a barrier for early AM-1 success.
+  [[nodiscard]] engine_gauges gauges() const;
+
+ private:
+  struct impl;
+  std::shared_ptr<impl> _impl;
+};
+
+}  // namespace cucascade::io::cufile

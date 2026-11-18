@@ -48,6 +48,10 @@ namespace cucascade::io::cufile {
 
 struct mount_identity;
 struct mount_policy_key;
+class mount_policy;
+class device_engine;
+class device_arena;
+class cufile_transport;
 
 // ---------------------------------------------------------------------------
 // cufile_io_object
@@ -190,7 +194,8 @@ class cufile_io_object final : public io_object {
  * and served once that event completed, while the worker keeps serving other
  * requests.  Staging copies then run on a reactor-owned stream per device.
  *
- * Completion: a request's future settles only once every one of its slices has
+ * Legacy completion (mode=legacy, the default): a request's future settles only
+ * once every one of its slices has
  * stopped touching its destination (or, for a write, its source), failed and
  * cancelled siblings included.  cuFile and POSIX transfers are synchronous on
  * the worker; staging copies run on a reactor-owned stream and are
@@ -199,6 +204,15 @@ class cufile_io_object final : public io_object {
  * successful read are therefore visible from any stream without further CUDA
  * synchronization; the caller owns the destination (or source) memory until the
  * future settles.
+ *
+ * With async_engine.mode != legacy, device-only reads may resolve enqueued and
+ * joined onto the caller stream; routing is dynamic, so always synchronize that
+ * stream before host/foreign-stream access. Original PTDS callers remain
+ * host-complete. Do not graph-capture a stream with a read in flight. The reaper
+ * inserts joins later, from another thread; late copy errors surface at CUDA
+ * synchronization and cannot revoke an early success.
+ * Facade shutdown cancels pending engine pieces and waits for retirement tickets,
+ * not early futures. See io_context.hpp for the destination lifetime contract.
  *
  * Fragmented (cache-chunk) destinations are not served: the reactor's pinned
  * scratch is not shaped like cache chunks, so it opts out of the prefetching
@@ -221,19 +235,42 @@ class cufile_reactor {
  public:
   /// A read here is a syscall against NVMe (POSIX fallback) or a synchronous
   /// cuFile call (GDS fast path); batching either buys little.
-  static constexpr bool prefers_bulk_io = false;
+  static constexpr bool prefers_bulk_io    = false;
+  static constexpr bool wants_submit_fence = true;
 
-  /// Shared, immutable config for a pool of reactors.  A dedicated type so a
-  /// future iteration can add shared state (a registered-buffer cache, a stream
-  /// registry, ...) without changing the reactor constructor's shape.
-  class reactor_context {
+  /// Shared immutable configuration and asynchronously published per-device engines.
+  /// Bindings appear only after control-thread warm-up; legacy contexts never create them.
+  class reactor_context : public std::enable_shared_from_this<reactor_context> {
    public:
     explicit reactor_context(config cfg) : _config(cfg) {}
 
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
 
+    struct engine_binding {
+      device_engine* engine{};
+      device_arena* arena{};
+      std::shared_ptr<cufile_transport> transport;
+      std::string device_uuid;
+      std::uint64_t generation{};
+      bool simulated{false};
+      /// Injection only; production engines have process lifetime.
+      std::shared_ptr<device_engine> owner;
+    };
+    /// Control-thread publication; injecting a simulator never changes process runtime state.
+    void install_engine(int device, std::shared_ptr<engine_binding> binding);
+    [[nodiscard]] std::shared_ptr<engine_binding> engine_for_device(int device) const noexcept;
+    [[nodiscard]] bool has_simulated_engine() const noexcept { return _simulated_engine.load(); }
+    /// Per-active-device asynchronous warm-up; rejected submissions are logged and retried.
+    void ensure_engine(int device) noexcept;
+    void notify_engines() const noexcept;
+
    private:
     config _config;
+    mutable std::mutex _engine_mutex;
+    using engine_bindings = std::vector<std::shared_ptr<engine_binding>>;
+    std::atomic<std::shared_ptr<const engine_bindings>> _engines;
+    std::vector<int> _warming;
+    std::atomic<bool> _simulated_engine{false};
   };
 
   using native_handle_type   = int;
@@ -261,6 +298,10 @@ class cufile_reactor {
   /// Idempotent: a second call while the worker is running is a no-op.
   void start();
 
+  [[nodiscard]] bool submit_fence_enabled() const noexcept;
+  void record_submit_fences(std::vector<prepared_io_slice>& slices);
+  [[nodiscard]] std::shared_ptr<reactor_context> context() const noexcept { return _ctx; }
+
   /// Present for reactor-concept symmetry with the uring reactor; does nothing.
   void interrupt() noexcept;
 
@@ -269,7 +310,10 @@ class cufile_reactor {
   /// cancelled at once; a transfer already running finishes its current piece.
   /// The pinned scratch goes back to a process-wide pool rather than to
   /// @c cudaFreeHost, which would synchronize the device and make shutdown wait
-  /// for other callers' GPU work.  Idempotent.
+  /// for other callers' GPU work. Opt-in engine pieces use per-facade cancellation
+  /// and retirement tickets; a 30-second incomplete drain is logged, retaining all
+  /// live resources in the shared engine. The engine itself is never stopped here.
+  /// Idempotent; a repeated shutdown retries an incomplete engine drain.
   void shutdown();
 
   /// Synchronous buffered host read (pread on the buffered fd).  Blocks the
@@ -398,7 +442,8 @@ class cufile_reactor {
   void dispatch_slice(std::shared_ptr<const io_object> const& obj,
                       prepared_io_slice slice,
                       std::shared_ptr<grouped_coordinator> const& coordinator,
-                      bool stream_ready = false) noexcept;
+                      bool stream_ready = false,
+                      bool* handed_off  = nullptr) noexcept;
 
   /// When the slice's stream still has queued work, record an event on it and
   /// park the slice in @ref _waiting; returns whether it was parked.
@@ -479,6 +524,17 @@ class cufile_reactor {
   {
     return _inflight_copy.size() + _waiting.size();
   }
+
+  struct engine_admission {
+    std::shared_ptr<std::atomic<bool>> cancel{std::make_shared<std::atomic<bool>>(false)};
+    std::atomic<std::size_t> outstanding{0};
+  };
+  struct engine_retirement_ticket;
+  struct engine_route_result;
+  [[nodiscard]] engine_route_result engine_route(std::shared_ptr<const io_object> const& obj,
+                                                 prepared_io_slice const& slice) noexcept;
+  /// Shared tickets, not early AM-1 futures, determine facade drain completion.
+  std::shared_ptr<engine_admission> _engine_outstanding;
 
   std::shared_ptr<reactor_context> _ctx;
   reactor_config_type _config;

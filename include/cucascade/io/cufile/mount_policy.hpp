@@ -228,6 +228,10 @@ class mount_policy : public std::enable_shared_from_this<mount_policy> {
   /// Non-blocking timer service, also available to fake-clock tests / engine's timer loop.
   void poll_timers() noexcept;
   [[nodiscard]] mount_policy_gauges gauges() const;
+  [[nodiscard]] bool matches_config(async_engine_config const& value) const
+  {
+    return _config == value;
+  }
 
  private:
   void run_probe(mount_probe_context const&) noexcept;

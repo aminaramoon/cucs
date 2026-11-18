@@ -40,7 +40,8 @@ namespace cucascade::io::cufile {
  * A pool of @c cufile_reactor s serves device reads with synchronous
  * @c cuFileRead (or, when cuFile cannot or should not serve them, POSIX reads
  * staged through each reactor's pinned scratch) and host reads with POSIX
- * @c pread; the pool shares one @c reactor_context (config only).  Writes
+ * @c pread by default; the pool shares one @c reactor_context. Opt-in device-only
+ * reads hand off to a process-shared device engine after control-thread warm-up. Writes
  * (@c open_io_object_for_write and the write API) use @c cuFileWrite for large
  * aligned device bodies on a real GDS platform and staged / direct @c pwrite
  * otherwise (see @c cufile_reactor).
@@ -48,17 +49,18 @@ namespace cucascade::io::cufile {
  * like the uring / rest backends.
  *
  * Vectored reads (@c device_readv_async_io, @c host_device_readv_async_io and
- * the datasource's @c device_read_ranges_async on top of them) keep the generic
- * contract: the returned future settles only when every slice has stopped
- * touching its destination, failures and cancellations included, and a
- * successful device read is complete without further stream synchronization
- * (see @c cufile_reactor).
+ * the datasource's @c device_read_ranges_async on top of them) use the completion
+ * contract in io_context.hpp: legacy paths are host-complete; opt-in engine reads
+ * are enqueued and joined onto the caller stream (PTDS remains host-complete).
  */
 class cufile_ioctx : public templated_ioctx<cufile_reactor> {
  public:
   /// Build a pool of @p n_reactors reactors, all sharing @p ctx.  The ioctx
   /// config is sourced from the reactors themselves -- see @c templated_ioctx.
   cufile_ioctx(std::size_t n_reactors, std::shared_ptr<cufile_reactor::reactor_context> ctx);
+
+  /// Schedule optional arena/lane/submitter warm-up on the control executor.
+  void start() override;
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::cufile; }
 

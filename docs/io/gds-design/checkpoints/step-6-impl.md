@@ -26,4 +26,14 @@
       - AM-9: concurrent async reads into one shared arena registration failed in compat mode during review, then passed on rerun. The cause is unexplained, so registration granularity becomes a qualification dimension.
       - AM-10: compat-mode async submission does not block on libcufile 1.17.
     - Note: the `pre-commit` launcher has a stale `/mnt` shebang. Use `pixi run python -m pre_commit`.
-  - Phase 2 (resources and policy): running
+  - **Phase 2 (resources and policy): DONE**, commit `5f89013` (about 10.7k lines).
+    - Review: CHANGES-REQUIRED (22 findings). 21 fixed; P2-R19 (blocking cleanup pool) deferred to Phase 3.
+    - Tests: 784 cases, 783 passed, 1 skipped (lead verified; zero build warnings). Pre-commit clean.
+    - Key finding (P2-R1): on compat libcufile 1.17, a SHARED registration (whole arena or per slab) silently corrupts data under concurrent async reads.
+      - Example: 350 of 361 reads had wrong bytes, while `bytes_done` was correct.
+      - Per-slot registration is clean.
+      - Default granularity is `slot`. Shared layouts need an explicit unsafe opt-in.
+      - The harness now verifies content by default.
+    - AM-11 records the fit-order correction, evidence-source honesty (nvidia-fs parsing deferred to Phase 7), and immutable slot geometry.
+    - Process note: agents' own helper sub-agents ran concurrent builds and corrupted the ninja metadata (later repaired). Phase 3+ prompts forbid delegation.
+  - Phase 3 (async engine reads): running

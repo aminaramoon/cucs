@@ -18,6 +18,9 @@
 
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
+#include <cucascade/io/cufile/device_engine.hpp>
+#include <cucascade/io/cufile/runtime.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -35,6 +38,12 @@ cufile_ioctx::cufile_ioctx(std::size_t n_reactors,
       return std::make_unique<cufile_reactor>(ctx, "cufile-" + std::to_string(i++));
     })
 {
+}
+
+void cufile_ioctx::start()
+{
+  // Device resources are created only when a caller first uses that device.
+  templated_ioctx<cufile_reactor>::start();
 }
 
 std::shared_ptr<io_object> cufile_ioctx::create_io_object(std::string path)

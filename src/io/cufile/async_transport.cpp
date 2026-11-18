@@ -25,6 +25,11 @@
 
 namespace cucascade::io::cufile {
 
+ssize_t cufile_transport::read_sync(void*, void*, std::size_t, off_t, off_t) noexcept
+{
+  return -ENOSYS;
+}
+
 #ifdef CUCASCADE_HAS_CUFILE
 namespace {
 cufile_transport::status convert(CUfileError_t status) noexcept
@@ -34,6 +39,15 @@ cufile_transport::status convert(CUfileError_t status) noexcept
           status.err == CU_FILE_CUDA_DRIVER_ERROR ? static_cast<int>(status.cu_err) : 0};
 }
 }  // namespace
+
+ssize_t cufile_async_transport::read_sync(
+  void* handle, void* base, std::size_t size, off_t file_offset, off_t buffer_offset) noexcept
+{
+  if (_api == nullptr || _api->read == nullptr) return -ENOSYS;
+  errno           = 0;
+  auto const done = _api->read(handle, base, size, file_offset, buffer_offset);
+  return done == -1 && errno != 0 ? -errno : done;
+}
 
 cufile_transport::status cufile_async_transport::read_async(void* handle,
                                                             void* base,

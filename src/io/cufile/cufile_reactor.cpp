@@ -24,6 +24,7 @@
 #include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
+#include <cucascade/io/cufile/device_engine.hpp>
 #include <cucascade/io/cufile/mount_policy.hpp>
 #include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/cufile/runtime.hpp>
@@ -556,6 +557,16 @@ void run_cufile_transfer_hook() noexcept
 std::atomic<std::size_t> cufile_write_calls{0};
 std::atomic<std::int64_t> staging_copy_delay_us{0};
 std::atomic<bool> fail_copy_event_record{false};
+// Test-only gates are prepared by the setter, never allocated/destroyed on the reaper.
+// Event waits capture the latest record, so one persistent event per device can be reused.
+struct copy_delay_gate {
+  cudaStream_t stream{};
+  cudaEvent_t event{};
+};
+std::array<std::atomic<copy_delay_gate*>, 128> engine_copy_gates{};
+std::mutex engine_copy_gate_setup_mutex;
+std::atomic<void (*)(detail::completion_observation const&, void*) noexcept> completion_observer{};
+std::atomic<void*> completion_observer_arg{};
 
 /// Record @p event on @p stream after a copy was enqueued there; tests can make
 /// the record fail (@ref detail::set_copy_event_record_failure_for_testing).
@@ -802,6 +813,215 @@ cufile_io_object::~cufile_io_object()
 // cufile_reactor: lifecycle
 // ---------------------------------------------------------------------------
 
+// Caller-side event pool. Last users return metadata only; CUDA events live for the process.
+namespace {
+class submit_event_pool {
+ public:
+  static submit_event_pool& instance()
+  {
+    static auto* pool = new submit_event_pool;
+    return *pool;
+  }
+  std::shared_ptr<submit_fence> record(int device, cudaStream_t stream)
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    cudaEvent_t event{};
+    {
+      std::lock_guard lock(mutex);
+      auto& events = free[device];
+      if (!events.empty()) {
+        event = events.back();
+        events.pop_back();
+      }
+    }
+    if (!event) CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    auto owner = std::shared_ptr<void>(event, [device](void* handle) noexcept {
+      try {
+        auto& pool = instance();
+        std::lock_guard lock(pool.mutex);
+        pool.free[device].push_back(static_cast<cudaEvent_t>(handle));
+      } catch (...) { /* Retain rather than issue CUDA destruction on a retiring thread. */
+      }
+    });
+    CUCASCADE_CUDA_TRY(cudaEventRecord(event, stream));
+    return std::make_shared<submit_fence>(submit_fence{event, std::move(owner)});
+  }
+
+ private:
+  std::mutex mutex;
+  std::map<int, std::vector<cudaEvent_t>> free;
+};
+}  // namespace
+
+void cufile_reactor::reactor_context::install_engine(int device,
+                                                     std::shared_ptr<engine_binding> binding)
+{
+  if (device < 0 || !binding || !binding->engine || !binding->arena || !binding->transport)
+    throw std::invalid_argument("invalid cuFile engine binding");
+  std::lock_guard lock(_engine_mutex);
+  auto const index = static_cast<std::size_t>(device);
+  auto current     = _engines.load();
+  auto next        = std::make_shared<engine_bindings>(current ? *current : engine_bindings{});
+  if (next->size() <= index) next->resize(index + 1);
+  if (!(*next)[index]) {
+    if (binding->simulated) _simulated_engine.store(true);
+    (*next)[index] = std::move(binding);
+    _engines.store(std::move(next));
+  }
+}
+
+std::shared_ptr<cufile_reactor::reactor_context::engine_binding>
+cufile_reactor::reactor_context::engine_for_device(int device) const noexcept
+{
+  if (device < 0) return {};
+  auto bindings    = _engines.load();
+  auto const index = static_cast<std::size_t>(device);
+  return bindings && index < bindings->size() ? (*bindings)[index] : nullptr;
+}
+
+void cufile_reactor::reactor_context::notify_engines() const noexcept
+{
+  auto bindings = _engines.load();
+  if (bindings)
+    for (auto const& binding : *bindings)
+      if (binding) binding->engine->notify();
+}
+
+void cufile_reactor::reactor_context::ensure_engine(int device) noexcept
+{
+  if (device < 0 || _config.async_engine.mode == engine_mode::legacy ||
+      !_config.async_engine.async_reads || has_simulated_engine() || engine_for_device(device))
+    return;
+  try {
+    std::lock_guard lock(_engine_mutex);
+    if (std::find(_warming.begin(), _warming.end(), device) != _warming.end()) return;
+    _warming.push_back(device);
+    auto self = shared_from_this();
+    if (control_executor::process_instance()->submit([self, device] {
+          try {
+            auto& rt    = runtime::instance();
+            std::ignore = rt.ensure_initialized();
+            if (rt.engine_possible(self->_config.async_engine.mode)) {
+              auto binding = std::make_shared<engine_binding>();
+              cudaDeviceProp properties{};
+              CUCASCADE_CUDA_TRY(cudaGetDeviceProperties(&properties, device));
+              static constexpr char hex[] = "0123456789abcdef";
+              for (auto value : properties.uuid.bytes) {
+                auto byte = static_cast<unsigned char>(value);
+                binding->device_uuid += hex[byte >> 4];
+                binding->device_uuid += hex[byte & 15];
+              }
+              binding->engine     = &device_engine::for_device(device, self->_config.async_engine);
+              binding->arena      = &device_arena::for_device(device);
+              binding->transport  = make_cufile_transport();
+              binding->generation = rt.generation();
+              self->install_engine(device, std::move(binding));
+            }
+          } catch (std::exception const& error) {
+            CUCASCADE_LOG_WARN("cuFile engine device {} warm-up: {}; retaining legacy routing",
+                               device,
+                               error.what());
+          }
+          std::lock_guard done(self->_engine_mutex);
+          std::erase(self->_warming, device);
+        }))
+      return;
+    std::erase(_warming, device);
+    CUCASCADE_LOG_WARN("cuFile engine device {} warm-up queue rejected; will retry", device);
+  } catch (...) {
+    // Allocation failure must not poison the warming bit or prevent legacy I/O.
+    std::lock_guard lock(_engine_mutex);
+    std::erase(_warming, device);
+    CUCASCADE_LOG_WARN("cuFile engine device {} warm-up rejected; will retry", device);
+  }
+}
+
+bool cufile_reactor::submit_fence_enabled() const noexcept
+{
+  if (_config.async_engine.mode == engine_mode::legacy || !_config.async_engine.async_reads)
+    return false;
+  if (runtime::instance().engine_possible(_config.async_engine.mode)) return true;
+  // Explicit simulator injection may be used even without an installed libcufile.
+  return _ctx->has_simulated_engine();
+}
+
+void cufile_reactor::record_submit_fences(std::vector<prepared_io_slice>& slices)
+{
+  struct recorded {
+    int device;
+    cudaStream_t stream;
+    std::shared_ptr<submit_fence> fence;
+  };
+  std::vector<recorded> events;
+  for (auto& slice : slices) {
+    if (!slice.has_device_request() || slice.has_host_request() || slice.kind != io_op_kind::read ||
+        slice.on_complete || slice.d_buffer.original_stream_was_null)
+      continue;
+    _ctx->ensure_engine(slice.d_buffer.device_id);
+    if (!_ctx->engine_for_device(slice.d_buffer.device_id)) continue;
+    auto& buffer      = slice.d_buffer;
+    auto const stream = buffer.stream.get();
+    auto found        = std::find_if(events.begin(), events.end(), [&](auto const& event) {
+      return event.device == buffer.device_id && event.stream == stream;
+    });
+    if (found == events.end()) {
+      auto fence = submit_event_pool::instance().record(buffer.device_id, stream);
+      events.push_back({buffer.device_id, stream, fence});
+      buffer.fence = std::move(fence);
+    } else {
+      buffer.fence = found->fence;
+    }
+  }
+}
+
+struct cufile_reactor::engine_retirement_ticket {
+  explicit engine_retirement_ticket(std::shared_ptr<engine_admission> value)
+    : state(std::move(value))
+  {
+    state->outstanding.fetch_add(1);
+  }
+  ~engine_retirement_ticket() { state->outstanding.fetch_sub(1, std::memory_order_release); }
+  std::shared_ptr<engine_admission> state;
+};
+struct cufile_reactor::engine_route_result {
+  std::shared_ptr<reactor_context::engine_binding> binding;
+  std::shared_ptr<mount_policy> policy;
+};
+
+cufile_reactor::engine_route_result cufile_reactor::engine_route(
+  std::shared_ptr<const io_object> const& obj, prepared_io_slice const& slice) noexcept
+{
+  if (_config.async_engine.mode == engine_mode::legacy || !_config.async_engine.async_reads ||
+      slice.kind != io_op_kind::read || !slice.has_device_request() || slice.has_host_request() ||
+      !slice.d_buffer.fence || slice.d_buffer.original_stream_was_null || slice.on_complete ||
+      !_engine_outstanding || _engine_outstanding->cancel->load())
+    return {};
+  auto const* file = dynamic_cast<cufile_io_object const*>(obj.get());
+  if (!file || !file->cufile_registered() || file->direct_fd() < 0) return {};
+  auto binding = _ctx->engine_for_device(slice.d_buffer.device_id);
+  if (!binding || !binding->engine->ready()) return {};
+  try {
+    auto policy = mount_policy_registry::instance().get_or_create(
+      file->policy_key(binding->device_uuid, binding->generation),
+      file->mount_identity_info(),
+      _config.async_engine);
+    mount_probe_context probe;
+    probe.file      = std::static_pointer_cast<cufile_io_object const>(obj);
+    probe.arena     = binding->arena;
+    probe.transport = binding->transport;
+    probe.device    = slice.d_buffer.device_id;
+    probe.simulated = binding->simulated;
+    // A request that triggers qualification stays legacy even if the control task
+    // finishes while this worker is preempted inside ensure_probe.
+    bool const was_eligible = policy->read_eligible();
+    policy->ensure_probe(std::move(probe));  // Try-lock + bounded control queue; never waits.
+    if (!was_eligible || !policy->read_eligible()) return {};
+    return {std::move(binding), std::move(policy)};
+  } catch (...) {
+    return {};  // Policy/bootstrap metadata failure must retain the legacy path.
+  }
+}
+
 cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
   : _ctx(std::move(ctx)), _tname(tname)
 {
@@ -809,6 +1029,10 @@ cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx, std::string
     throw std::invalid_argument("cufile_reactor: reactor_context must be non-null");
   }
   _config = _ctx->cfg();
+  if (_config.async_engine.mode != engine_mode::legacy) {
+    _config.async_engine.validate();
+    _engine_outstanding = std::make_shared<engine_admission>();
+  }
   if (_config.max_inflight == 0) {
     throw std::invalid_argument("cufile_reactor: max_inflight must be non-zero");
   }
@@ -854,6 +1078,22 @@ void cufile_reactor::shutdown()
     _accepting.store(false, std::memory_order_release);
   }
 
+  if (_engine_outstanding) {
+    _engine_outstanding->cancel->store(true);
+    _ctx->notify_engines();
+  }
+  auto wait_engine = [this] {
+    if (!_engine_outstanding) return;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (_engine_outstanding->outstanding.load(std::memory_order_acquire) != 0) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        CUCASCADE_LOG_ERROR("cuFile facade: incomplete drain; engine resources retained");
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  };
+
   if (_worker.joinable()) {
     _stop_source.request_stop();
     _worker.join();
@@ -861,6 +1101,7 @@ void cufile_reactor::shutdown()
     // rather than with the reactor.
     _scratch.reset();
     _copy_streams.clear();
+    wait_engine();
     return;
   }
 
@@ -872,6 +1113,7 @@ void cufile_reactor::shutdown()
     _queued_bytes.fetch_sub(request->remaining_bytes(), std::memory_order_relaxed);
     request->cancel_remaining(canceled_error());
   }
+  wait_engine();
 }
 
 void cufile_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcept
@@ -1065,7 +1307,8 @@ std::size_t cufile_reactor::host_read(cufile_io_object const& file,
 void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
                                     prepared_io_slice slice,
                                     std::shared_ptr<grouped_coordinator> const& coordinator,
-                                    bool stream_ready) noexcept
+                                    bool stream_ready,
+                                    bool* handed_off) noexcept
 {
   // Every terminal path must either finish `request` (finish_success / finish_error,
   // exactly once) or, before `request` exists, settle the slice's completion and one
@@ -1076,6 +1319,33 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
     if (file == nullptr) {
       throw std::invalid_argument("cufile_reactor: io_object '" + obj->object_path() +
                                   "' was not created by this backend");
+    }
+
+    // A legacy-parked slice stays legacy even if its mount qualified meanwhile.
+    if (auto route = stream_ready ? engine_route_result{} : engine_route(obj, slice);
+        route.binding) {
+      engine_slice adopted;
+      adopted.logical                  = slice.rng;
+      adopted.user_ptr                 = slice.d_buffer.data;
+      adopted.device_id                = slice.d_buffer.device_id;
+      adopted.user_stream              = slice.d_buffer.stream.get();
+      adopted.stream_owner             = slice.d_buffer.stream_owner;
+      adopted.original_stream_was_ptds = slice.d_buffer.original_stream_was_ptds;
+      adopted.fence                    = slice.d_buffer.fence;
+      adopted.file                     = obj;
+      adopted.priority                 = slice.priority;
+      adopted.cancel                   = _engine_outstanding->cancel;
+      adopted.policy                   = std::move(route.policy);
+      adopted.retirement_owner = std::make_shared<engine_retirement_ticket>(_engine_outstanding);
+      // Last throwing allocation precedes credit adoption: catch still owns exactly one credit.
+      if (route.binding->engine->try_reserve_slice()) {
+        adopted.credit = operation_credit{coordinator};
+        route.binding->engine->hand_off(std::move(adopted), true);
+        if (handed_off) *handed_off = true;
+        return;
+      }
+      // Metadata pressure is a routing miss, not a failed read. The original
+      // coordinator credit is still owned here and is served by legacy below.
     }
 
     // A device-only slice (a read into or a write from device memory) must not
@@ -1893,8 +2163,7 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
       for (std::size_t dispatched = 0;
            dispatched < pass_slices && pass_bytes < _config.max_op_bytes &&
            scheduler.active != nullptr && !scheduler.active->empty() &&
-           inflight_count() < _config.max_inflight && !stop_token.stop_requested();
-           ++dispatched) {
+           inflight_count() < _config.max_inflight && !stop_token.stop_requested();) {
         if (!scheduler.active->coordinator->should_continue()) {
           cancel_request(scheduler.active, canceled_error());
           break;
@@ -1903,7 +2172,19 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
         pass_bytes += slice.size();
         _queued_bytes.fetch_sub(slice.size(), std::memory_order_relaxed);
         scheduler.on_slice_dispatched();
-        dispatch_slice(scheduler.active->obj, std::move(slice), scheduler.active->coordinator);
+        bool handed_off  = false;
+        auto const bytes = slice.size();
+        dispatch_slice(scheduler.active->obj,
+                       std::move(slice),
+                       scheduler.active->coordinator,
+                       false,
+                       &handed_off);
+        if (handed_off) {
+          pass_bytes -= bytes;
+          // Engine handoffs do not consume this synchronous worker's pass budget.
+        } else {
+          ++dispatched;
+        }
       }
       if (scheduler.active != nullptr && scheduler.active->empty()) { scheduler.active.reset(); }
 
@@ -1962,6 +2243,65 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
 }
 
 namespace detail {
+
+std::shared_ptr<void> lease_pinned_scratch()
+{
+  return {scratch_pool::instance().acquire(16UL << 20), [](void* memory) {
+            scratch_pool::instance().release(static_cast<std::uint8_t*>(memory));
+          }};
+}
+
+void before_engine_transfer_for_testing() noexcept { run_cufile_transfer_hook(); }
+cudaError_t delay_engine_copy_for_testing(cudaStream_t stream) noexcept
+{
+  auto const delay = staging_copy_delay_us.load(std::memory_order_relaxed);
+  if (delay <= 0) return cudaSuccess;
+  int device{};
+  auto status = cudaGetDevice(&device);
+  if (status != cudaSuccess) return status;
+  if (device < 0 || static_cast<std::size_t>(device) >= engine_copy_gates.size())
+    return cudaErrorInvalidDevice;
+  auto* gate = engine_copy_gates[static_cast<std::size_t>(device)].load(std::memory_order_acquire);
+  if (!gate) return cudaErrorNotReady;
+  // The callback is test-only, on an isolated gate stream, not on a production lane.
+  status = delay_staging_copy(gate->stream);
+  if (status == cudaSuccess) status = cudaEventRecord(gate->event, gate->stream);
+  if (status == cudaSuccess) status = cudaStreamWaitEvent(stream, gate->event, 0);
+  return status;
+}
+bool engine_copy_record_failure_for_testing() noexcept
+{
+  return fail_copy_event_record.load(std::memory_order_relaxed);
+}
+void set_completion_observer_for_testing(void (*observer)(completion_observation const&,
+                                                          void*) noexcept,
+                                         void* arg) noexcept
+{
+  completion_observer.store(nullptr, std::memory_order_release);
+  completion_observer_arg.store(arg, std::memory_order_release);
+  completion_observer.store(observer, std::memory_order_release);
+}
+void observe_engine_completion_for_testing(completion_observation const& observation) noexcept
+{
+  if (auto observer = completion_observer.load(std::memory_order_acquire))
+    observer(observation, completion_observer_arg.load(std::memory_order_acquire));
+}
+std::size_t persistent_registered_bytes_for_testing(int device) noexcept
+{
+  try {
+    return device_arena::for_device(device).gauges().registered_bytes;
+  } catch (...) {
+    return 0;
+  }
+}
+std::size_t arena_slab_counts_for_testing(int device) noexcept
+{
+  try {
+    return device_arena::for_device(device).gauges().slabs;
+  } catch (...) {
+    return 0;
+  }
+}
 
 std::size_t next_piece(std::size_t pos,
                        std::size_t end,
@@ -2024,6 +2364,30 @@ std::size_t cufile_write_calls_for_testing() noexcept
 
 void set_staging_copy_delay_for_testing(std::chrono::microseconds delay) noexcept
 {
+  if (delay.count() > 0) {
+    try {
+      std::lock_guard lock(engine_copy_gate_setup_mutex);
+      int count{}, previous{};
+      if (cudaGetDevice(&previous) == cudaSuccess && cudaGetDeviceCount(&count) == cudaSuccess) {
+        for (int device = 0;
+             device < count && static_cast<std::size_t>(device) < engine_copy_gates.size();
+             ++device) {
+          auto& entry = engine_copy_gates[static_cast<std::size_t>(device)];
+          if (entry.load() || cudaSetDevice(device) != cudaSuccess) continue;
+          auto gate = std::make_unique<copy_delay_gate>();
+          if (cudaStreamCreateWithFlags(&gate->stream, cudaStreamNonBlocking) != cudaSuccess)
+            continue;
+          if (cudaEventCreateWithFlags(&gate->event, cudaEventDisableTiming) != cudaSuccess) {
+            std::ignore = cudaStreamDestroy(gate->stream);
+            continue;
+          }
+          entry.store(gate.release(), std::memory_order_release);  // Process-lifetime test pool.
+        }
+        std::ignore = cudaSetDevice(previous);
+      }
+    } catch (...) { /* Missing test resources fail the injected copy, never block the reaper. */
+    }
+  }
   staging_copy_delay_us.store(delay.count(), std::memory_order_relaxed);
 }
 

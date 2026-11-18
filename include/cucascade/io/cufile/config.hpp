@@ -63,13 +63,14 @@ struct mount_override {
   mount_override_state state{mount_override_state::legacy};
   std::optional<unsigned> qd;
   std::optional<std::size_t> op_bytes;
+  bool operator==(mount_override const&) const = default;
 };
 
 /**
  * @brief Configuration for the opt-in per-device async engine.
  *
  * This is a configuration-only interface: construction and validation perform no probing,
- * CUDA work, or runtime initialization. The legacy reactor does not consult it yet.
+ * CUDA work, or runtime initialization. Only non-legacy contexts bootstrap the engine.
  */
 struct async_engine_config {
   engine_mode mode{engine_mode::legacy};
@@ -88,6 +89,9 @@ struct async_engine_config {
   /// targets are accepted as given; actual allocation/registration is a resource concern.
   std::size_t arena_bytes{0};
   unsigned device_lane_cap{160};
+  std::size_t max_pending_slices_per_device{4096};
+  unsigned low_service_interval{4};
+  unsigned max_short_reads{64};
 
   /// Routing precedence: fsid, then longest matching mount_prefix, then fs_type. Prefixes
   /// match whole path components of normalized absolute paths; the first entry in list order
@@ -99,6 +103,7 @@ struct async_engine_config {
     /// False permits non-blocking-submit-only qualification for simulator/compat tests.
     bool require_direct_evidence{true};
     std::size_t bytes{16UL << 20};
+    bool operator==(probe_config const&) const = default;
   } probe;
 
   struct demotion_config {
@@ -108,6 +113,7 @@ struct async_engine_config {
     unsigned stuck_ms{2};
     unsigned cooldown_s{30};
     unsigned cooldown_cap_s{960};
+    bool operator==(demotion_config const&) const = default;
   } demotion;
 
   struct poll_config {
@@ -116,7 +122,10 @@ struct async_engine_config {
     unsigned fence_hint_us{100};
     unsigned due_events_per_round{16};
     unsigned idle_health_ms{20};
+    bool operator==(poll_config const&) const = default;
   } poll;
+
+  bool operator==(async_engine_config const&) const = default;
 
   /**
    * @brief Check syntactic ranges without consulting device or filesystem capabilities.
@@ -150,6 +159,12 @@ struct async_engine_config {
       throw std::invalid_argument("submitters_per_device must be in [1, 8]");
     }
     positive(device_lane_cap, "device_lane_cap");
+    positive(max_pending_slices_per_device, "max_pending_slices_per_device");
+    positive(low_service_interval, "low_service_interval");
+    positive(max_short_reads, "max_short_reads");
+    if (device_lane_cap > 160 || max_pending_slices_per_device > (1UL << 20)) {
+      throw std::invalid_argument("engine metadata/lane capacity exceeds supported limit");
+    }
     positive(probe.submit_max_us, "probe.submit_max_us");
     aligned_bytes(probe.bytes, "probe.bytes");
     positive(demotion.slow_floor_us, "demotion.slow_floor_us");
@@ -345,7 +360,7 @@ struct config {
   /// 0 restores strict priority.
   std::size_t low_service_interval{4};
 
-  /// Configuration-only opt-in surface; no runtime path consults this field yet.
+  /// Opt-in staged device-read engine. Legacy preserves existing routing and completion.
   async_engine_config async_engine;
 
   /// cuFile can only DMA whole pages, so a read is widened to a page boundary

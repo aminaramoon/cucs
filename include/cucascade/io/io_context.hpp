@@ -499,12 +499,26 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// read instead of resolving with bytes that were never written to the
   /// destination (the uring and cuFile backends fail it with a @c std::system_error
   /// of @c std::errc::io_error; another backend may report its own exception type).
-  /// It settles only once every
-  /// slice has stopped touching its destination -- a failed or cancelled slice
-  /// does not settle the future while a sibling is still writing.  On success
-  /// the bytes are in place: no further synchronization of @p stream is needed
-  /// to finish the read (ordering later consumer work is the caller's
-  /// business).  The destinations must stay valid until the future settles.
+  /// With a cuFile context whose async_engine.mode != legacy, any device-only
+  /// read on an original non-PTDS stream may resolve enqueued rather than
+  /// host-complete: all I/O results are validated, copies are enqueued, and a
+  /// join is inserted into the caller's stream at a potentially later point.
+  /// Routing is dynamic; callers cannot infer completion semantics per slice.
+  /// Synchronize or wait on that stream before host or foreign-stream access,
+  /// keeping destinations valid through that wait. Do not capture that stream
+  /// in a CUDA graph while a read is in flight: the reaper inserts the join
+  /// from another thread. A later copy failure cannot revoke early success;
+  /// observe CUDA stream/context errors when synchronizing.
+  /// Legacy contexts and original cudaStreamPerThread (PTDS) callers remain
+  /// host-complete. Compat/POSIX fallback may give that stronger guarantee too.
+  /// Failed or cancelled work drains before its outstanding credits settle;
+  /// an already-successful enqueued read may still retain internal resources.
+  ///
+  /// @note AM-1 migration audit (engine stays off by default): synchronize
+  /// host-complete assumptions in src/cudf/disk_io.cpp's read path,
+  /// check_transferred, the benchmarks, datasource.hpp's scalar/vector contracts,
+  /// and test_cufile_reactor.cpp's
+  /// complete-at-resolve test (formerly line 660). No cudf caller is changed here.
   virtual exec::semi_future<size_t> device_readv_async_io(
     const io_object& obj,
     std::span<const slice> slices,

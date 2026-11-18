@@ -90,6 +90,10 @@ class operation_credit {
   }
   ~operation_credit() noexcept { cancel(); }
 
+  [[nodiscard]] std::shared_ptr<grouped_coordinator> coordinator() const noexcept
+  {
+    return _coordinator;
+  }
   [[nodiscard]] bool is_settled() const noexcept { return _settled.load(); }
   [[nodiscard]] bool finish_success() noexcept
   {

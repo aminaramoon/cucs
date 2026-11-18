@@ -717,7 +717,23 @@ class templated_ioctx : public ioctx {
   {
     // A device slice on the per-thread default stream must be ordered against
     // THIS thread's stream before a reactor worker sees it.
-    if (has_device_slice) detail::resolve_default_streams(slices);
+    if (has_device_slice) {
+      if constexpr (requires { requires Reactor::wants_submit_fence; }) {
+        bool const fence_enabled = !_reactors.empty() && _reactors.front()->submit_fence_enabled();
+        if (fence_enabled) {
+          for (auto& slice : slices) {
+            if (!slice.has_device_request()) continue;
+            slice.d_buffer.original_stream_was_ptds =
+              slice.d_buffer.stream.get() == cudaStreamPerThread;
+            slice.d_buffer.original_stream_was_null = slice.d_buffer.stream.get() == nullptr;
+          }
+        }
+        detail::resolve_default_streams(slices);
+        if (fence_enabled) _reactors.front()->record_submit_fences(slices);
+      } else {
+        detail::resolve_default_streams(slices);
+      }
+    }
 
     // One call site issues one priority, so the first slice speaks for the
     // request; stamp the resolved value on every slice so each queue entry
