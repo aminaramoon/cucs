@@ -52,6 +52,28 @@ TEST_CASE("engine large slice fills and slides the effective storage window",
   CHECK(stats.residence.count == 64);
 }
 
+TEST_CASE("engine drained submission tail is not storage eligible backlog",
+          "[cufile][engine][sched]")
+{
+  if (!has_device()) SKIP("CUDA unavailable");
+  fixture f(mib, configuration(1));
+  transport_simulator::fault fault;
+  fault.stuck_completion = true;
+  f.transport->add_fault(fault);
+  f.start();
+  auto group  = std::make_shared<grouped_coordinator>(mib, 1);
+  auto future = group->get_future();
+  f.engine->hand_off(f.slice(group, {0, mib}));
+  REQUIRE(until([&] { return f.transport->snapshot().blocked_completions == 1; }));
+  std::this_thread::sleep_for(10ms);
+  auto before = f.engine->gauges().backlog_ns;
+  std::this_thread::sleep_for(20ms);
+  auto after = f.engine->gauges().backlog_ns;
+  CHECK(after == before);
+  f.transport->unblock_all();
+  CHECK(std::move(future).get(5s) == mib);
+}
+
 TEST_CASE("engine priority is high first with bounded low service", "[cufile][engine][sched]")
 {
   if (!has_device()) SKIP("CUDA unavailable");

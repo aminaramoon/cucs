@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "engine_test_utils.hpp"
+#include "utils/allocation_counter.hpp"
 
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 
@@ -12,6 +13,28 @@
 using namespace cucascade::io;
 using namespace cucascade::io::cufile;
 using namespace cucascade::io::cufile::engine_test;
+
+TEST_CASE("allocation counter covers nothrow and array allocation families", "[io][allocation]")
+{
+  std::size_t count{};
+  void* scalar{};
+  void* array{};
+  void* failed{};
+  {
+    cucascade::test::scoped_allocation_counter counter;
+    scalar = ::operator new(32, std::nothrow);
+    array  = ::operator new[](32, std::nothrow);
+    counter.fail_at(3);
+    failed = ::operator new(32, std::nothrow);
+    count  = counter.count();
+  }
+  CHECK(count == 3);
+  CHECK(scalar != nullptr);
+  CHECK(array != nullptr);
+  CHECK(failed == nullptr);
+  ::operator delete(scalar, std::size_t{32});
+  ::operator delete[](array);
+}
 
 TEST_CASE("engine polling deadlines survive unrelated notifications with a fake clock",
           "[cufile][engine][hardening]")

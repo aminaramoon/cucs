@@ -1,0 +1,16 @@
+step	mount	fs_class	device	qd	op_mib	direction	variant	path	exit_code
+B-3	lvm	compat	0	32	1	read	registered	fix-B-3-t1-op1.log	0
+B-3	lvm	compat	0	32	1	read	registered	fix-B-3-t4-op1.log	0
+B-3	lvm	compat	0	32	2	read	registered	fix-B-3-t1-op2.log	0
+B-3	lvm	compat	0	32	2	read	registered	fix-B-3-t4-op2.log	0
+B-3	lvm	compat	0	32	4	read	registered	fix-B-3-t1-op4.log	124
+B-3	lvm	compat	0	32	4	read	registered	fix-B-3-t1-op4.log	0
+B-3	lvm	compat	0	32	4	read	registered	fix-B-3-t4-op4.log	0
+B-3	lvm	compat	0	32	8	read	registered	fix-B-3-t1-op8.log	0
+B-3	lvm	compat	0	32	8	read	registered	fix-B-3-t4-op8.log	0
+B-4	lvm	compat	0	32	4	read	registered	fix-B-4-t1-op4.log	0
+B-4	lvm	compat	0	32	4	read	registered	fix-B-4-t4-op4.log	0
+B-5	lvm	compat	0	32	4	read	registered	fix-B-5-t1-op4.log	0
+B-5	lvm	compat	0	32	4	read	registered	fix-B-5-t4-op4.log	0
+B-6	lvm	compat	0	32	4	write	registered	fix-B-6-t1-op4.log	0
+B-6	lvm	compat	0	32	4	write	registered	fix-B-6-t4-op4.log	0

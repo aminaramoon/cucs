@@ -64,7 +64,26 @@
       - filesystem profiles and `docs/io/cufile-profiles`
       - macro-independent ABI
       - `docs/io/cufile-reactor.md`
-  - Phase 7a (non-GDS qualification: runner/analysis tooling, B-10 compat regression, soak, sanitizers, B-1 here): after Phase 6
+  - **Phase 7a (non-GDS qualification): DONE** (commit follows).
+    - Added:
+      - `tools/gds/qualify.sh` (full Phase 7 matrix runner, with `--dry-run` and `--compat-smoke`)
+      - `analyze_gates.py` (34 unit tests)
+      - an engine-bench soak mode
+      - the B-10 legacy compat bench and the `run_b10.sh` script
+      - ASan/UBSan/TSan presets
+    - Product fixes, each with a regression test:
+      - cooldown decay
+      - spurious write EIO
+      - stage polling
+      - backlog accounting
+    - Tests: 934 cases, 933 passed, 1 skipped (lead verified). ASan+UBSan: full suite clean. TSan: 8 CUDA-ordering warnings remain.
+    - Gates measurable on this host:
+      - G-4: N/A as a full gate; the historical legacy reference is within CI.
+      - G-5a: met (15.5 to 20.7 queries per op).
+      - G-6: N/A, because TSan is not clean.
+      - G-7: N/A; only short diagnostics were run.
+      - All other gates need GDS.
+    - Results: `qualification/compat-dev-host/SUMMARY.md`.
   - **Phase 4 (coalescing + engine benchmark): DONE**, commit `d11c9de`.
     - Review: no BLOCKING findings; P4-R1 to R18 all fixed.
     - Tests: 860 cases, 859 passed, 1 skipped. Zero warnings.

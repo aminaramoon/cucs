@@ -583,21 +583,26 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
   {
     auto const elapsed = ns(now - last_account);
     qd_area += static_cast<long double>(stats.storage_qd) * elapsed;
-    bool backlog = false;
+    bool backlog = false, gap = false;
+    auto waiting = [&](mount const& m) {
+      backlog = true;
+      gap     = gap || m.in_io < m.effective.qd;
+    };
     for (auto const& r : requests)
-      if (r && !r->finished) {
-        backlog = true;
-        break;
-      }
+      if (r && !r->finished && r->publication_visible && r->next < r->slice.logical.end() &&
+          !r->cancelled() &&
+          (r->slice.write ? r->owner->policy->write_eligible() : r->owner->policy->read_eligible()))
+        waiting(*r->owner);
+    for (auto const* n : active_nodes)
+      if (n->op && n->pending == node::work::retry && !n->fallback && n->retry_at <= now &&
+          !n->request->cancelled() &&
+          (n->op->is_read() ? n->owner->policy->read_eligible()
+                            : n->staged && n->interval && n->owner->policy->write_eligible()))
+        waiting(*n->owner);
     if (backlog) {
       backlog_area += static_cast<long double>(stats.storage_qd) * elapsed;
       backlog_ns += elapsed;
-      for (auto const& m : mounts) {
-        if (m->in_io < m->effective.qd) {
-          stats.refill_gap_ns += elapsed;
-          break;
-        }
-      }
+      if (gap) stats.refill_gap_ns += elapsed;
     }
     last_account = now;
   }
@@ -660,8 +665,14 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
     // retain the 2-us first copy query and the configured floor for ordinary fast copies.
     auto const adaptive_cap = detail::io_poll_cap_us(
       median(completion_history(n)), io ? config.poll.io_cap_us : config.poll.copy_cap_us);
-    auto const cap =
-      io ? adaptive_cap : std::min(adaptive_cap, std::max(250U, config.poll.copy_cap_us));
+    bool const stage = n.event.phase == operation_phase::staging_copy;
+    // Cold stage events can wait behind application-stream work for arbitrarily
+    // long periods. Scale from elapsed latency too, not only prior I/O samples.
+    auto const elapsed_cap =
+      static_cast<unsigned>(std::min<std::uint64_t>(10000, ns(options.now() - n.started) / 8000));
+    auto const cap = stage ? std::max(adaptive_cap, elapsed_cap)
+                     : io  ? adaptive_cap
+                           : std::min(adaptive_cap, std::max(250U, config.poll.copy_cap_us));
     if (first) {
       auto const prediction = p50 / 2000;
       n.delay_us =
@@ -839,6 +850,7 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       fail(n, status);
       return;
     }
+    n.started   = options.now();
     n.host_copy = host;
     n.pending   = node::work::none;
     n.event     = op.track_event((*op.lane)->copy_event(), operation_phase::staging_copy, false);
@@ -986,7 +998,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
       deadlines.push(d);
       return;
     }
-    if (n.event.phase == operation_phase::copy_inflight && !n.request->fence_ready) {
+    if ((n.event.phase == operation_phase::copy_inflight ||
+         n.event.phase == operation_phase::staging_copy) &&
+        !n.request->fence_ready) {
       auto& r             = *n.request;
       auto const now      = options.now();
       auto const hint_due = r.fence_query_due;
@@ -994,13 +1008,14 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         deadlines.push({hint_due, &n, n.generation});
         return;
       }
-      r.fence_query_due = now + std::chrono::microseconds(config.poll.fence_hint_us);
+      auto const waited  = now - n.started;
+      auto const hint_us = std::max<std::uint64_t>(config.poll.fence_hint_us, ns(waited) / 8000);
+      r.fence_query_due  = now + std::chrono::microseconds(hint_us);
       ++stats.queries;
       ++stats.fence_hint_queries;
       r.fence_ready = options.query_event(r.slice.fence->event) != cudaErrorNotReady;
       if (!r.fence_ready) {
-        deadlines.push(
-          {now + std::chrono::microseconds(config.poll.fence_hint_us), &n, n.generation});
+        deadlines.push({r.fence_query_due, &n, n.generation});
         return;
       }
     }
@@ -1294,10 +1309,9 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
         n.owner->policy->observe_submit(value.elapsed);
         if (!n.owner->policy->read_eligible() && !n.owner->policy->write_eligible())
           n.owner->refuse.store(true);
-        if (!n.op->is_read() && n.unknown_progress) {
-          fail(n, std::make_error_code(std::errc::io_error));
-          break;
-        }
+        // A returned success plus a recorded event restores known progress even
+        // if the watchdog observed a slow call. Never replay; validate bytes_done.
+        n.unknown_progress = false;
         n.event = n.op->track_event((*n.op->lane)->io_event(), operation_phase::io_inflight, false);
         poll_later(n, true);
         break;

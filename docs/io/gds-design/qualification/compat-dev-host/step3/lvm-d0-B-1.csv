@@ -1,0 +1,14 @@
+# device=0 name="NVIDIA RTX 6000 Ada Generation"
+# CUDA-only microbench: host wall-clock us (includes timer overhead); D2D=1MiB
+kind,component,heads,samples,p50_us,p99_us,max_us,p50_us_per_head
+micro,timer_baseline,1,20000,0.010,0.011,0.052,0.010
+micro,event_query_ready,1,20000,0.058,0.068,0.620,0.058
+micro,poll_ready_heads,32,2000,1.592,1.629,3.128,0.050
+micro,poll_ready_heads,64,2000,3.212,3.254,5.129,0.050
+micro,poll_ready_heads,160,2000,8.003,8.419,10.441,0.050
+micro,event_query_not_ready,1,20000,0.059,0.102,0.376,0.059
+micro,poll_not_ready_heads,32,2000,1.586,1.866,2.847,0.050
+micro,poll_not_ready_heads,64,2000,3.190,3.920,5.385,0.050
+micro,poll_not_ready_heads,160,2000,8.001,9.294,16.543,0.050
+micro,event_record_enqueue,1,2000,0.108,0.110,0.206,0.108
+micro,d2d_enqueue_1mib,1,2000,1.474,1.898,7.803,1.474

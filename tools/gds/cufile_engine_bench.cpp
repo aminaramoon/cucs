@@ -2,6 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+#include "cache_residency.hpp"
 #include "transport_simulator.hpp"
 
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
@@ -17,6 +18,7 @@
 #include <bit>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -54,7 +56,14 @@ struct options {
   std::size_t op_bytes{4 * mib}, arena_bytes{256 * mib};
   int device{};
   bool create{}, verify{true}, sync_each{}, require_direct{true}, unsafe_arena{}, coalesce{true};
-  bool drop_cache{}, guarded_destinations{};
+  bool drop_cache{}, guarded_destinations{}, posix_only{};
+  double soak_minutes{}, recreate_seconds{60}, sample_seconds{5};
+  unsigned slow_floor_us{100}, stuck_ms{2};
+  // Internal epoch state: the driver recreates ALL context/engine resources between epochs.
+  double epoch_seconds{};
+  std::size_t epoch{};
+  clock_type::time_point soak_start{};
+  std::string soak_csv;
   std::vector<mount_override> overrides;
 };
 std::size_t number(std::string_view value)
@@ -82,6 +91,7 @@ options parse(int argc, char** argv)
         << "cucascade_cufile_engine_bench --file PATH [options]\n"
            "  --workload sustained|restore|single|spill (B-3/B-4/B-5/B-6; default sustained)\n"
            "  --engine legacy|async|simulated (default legacy)\n"
+           "  --posix-only (legacy engine only; bypass cuFile)\n"
            "  --create-file (NEW deterministic pattern file(s); refuses overwrite)\n"
            "  --size-mib 4096 --threads 1 --reactors 1 --tasks 4 --pipeline 2 --sync-each\n"
            "  --min-seconds 1 --repetitions 1 (whole passes; setup/verification untimed)\n"
@@ -95,8 +105,15 @@ options parse(int argc, char** argv)
            "  --require-direct-evidence 0|1 (default 1; 0 TEST ONLY)\n"
            "  --verify 0|1 (default 1: separate verified pass BEFORE timing)\n"
            "  --spill-mode new|overwrite --flush 0|1 (spill; defaults new, 0)\n"
-           "  --csv PATH (header + one row; '-' = stdout)\n";
+           "  --csv PATH (header + one row; '-' = stdout)\n"
+           "  --slow-floor-us N --stuck-ms N (recorded per-host calibration)\n"
+           "  --soak-minutes N --recreate-every-s K --sample-every-s S\n"
+           "    Samples at drained pass boundaries (intervals are lower bounds); requires --csv.\n";
       std::exit(0);
+    }
+    if (key == "--posix-only") {
+      o.posix_only = true;
+      continue;
     }
     if (key == "--create-file") {
       o.create = true;
@@ -131,7 +148,22 @@ options parse(int argc, char** argv)
       o.distribution = value;
     else if (key == "--csv")
       o.csv = value;
-    else if (key == "--threads")
+    else if (key == "--slow-floor-us")
+      o.slow_floor_us = static_cast<unsigned>(std::stoul(value));
+    else if (key == "--stuck-ms")
+      o.stuck_ms = static_cast<unsigned>(std::stoul(value));
+    else if (key == "--soak-minutes" || key == "--recreate-every-s" || key == "--sample-every-s") {
+      std::size_t end{};
+      auto n = std::stod(value, &end);
+      if (end != value.size() || !std::isfinite(n) || n <= 0 || n > 86400)
+        throw std::invalid_argument("invalid soak duration");
+      if (key == "--soak-minutes")
+        o.soak_minutes = n;
+      else if (key == "--recreate-every-s")
+        o.recreate_seconds = n;
+      else
+        o.sample_seconds = n;
+    } else if (key == "--threads")
       o.threads = number(value);
     else if (key == "--reactors")
       o.reactors = number(value);
@@ -209,6 +241,8 @@ options parse(int argc, char** argv)
        o.op_bytes != 8 * mib) ||
       o.arena_bytes % (16 * mib))
     throw std::invalid_argument("invalid sizes/counts (see --help)");
+  if (o.posix_only && o.engine != "legacy")
+    throw std::invalid_argument("--posix-only requires --engine legacy");
   if (o.engine != "legacy" && o.engine != "async" && o.engine != "simulated")
     throw std::invalid_argument("invalid engine");
   if (o.workload != "sustained" && o.workload != "restore" && o.workload != "single" &&
@@ -228,6 +262,8 @@ options parse(int argc, char** argv)
     entry.op_bytes     = o.op_bytes;
     entry.allow_writes = o.workload == "spill";
   }
+  if (o.soak_minutes && (o.csv.empty() || o.csv == "-" || !o.verify))
+    throw std::invalid_argument("soak requires --csv PATH and --verify 1");
   async_engine_config validation;
   validation.mount_overrides = o.overrides;
   validation.validate();  // Reject invalid selectors before --create-file can write anything.
@@ -488,6 +524,7 @@ int run(options const& o)
       create_file(o.file, o.file_bytes);
   }
   config cfg;
+  if (o.posix_only) cfg.compat_mode = compat::on;
   cfg.async_engine.mode = o.engine == "legacy" ? engine_mode::legacy
                           : o.engine == "async" && o.require_direct
                             ? engine_mode::async_auto
@@ -501,6 +538,8 @@ int run(options const& o)
   cfg.async_engine.probe.require_direct_evidence = o.require_direct;
   cfg.async_engine.coalesce                      = o.coalesce;
   cfg.async_engine.async_writes                  = o.workload == "spill";
+  cfg.async_engine.demotion.slow_floor_us        = o.slow_floor_us;
+  cfg.async_engine.demotion.stuck_ms             = o.stuck_ms;
   if (o.engine == "simulated") {
     // Synthetic CUDA/host scheduling is not a libcufile slow-submit qualification signal.
     cfg.async_engine.demotion.slow_floor_us = 100000;
@@ -564,7 +603,10 @@ int run(options const& o)
                     ? context->open_io_object_for_write(l.path, {write_mode::open_existing})
                   : o.workload != "restore" && !objects.empty() ? objects.front()
                                                                 : context->open_io_object(l.path);
-    if (object->size() < l.file_bytes) throw std::runtime_error("input file too small");
+    // Fresh spill passes deliberately truncate; their final unaligned edge can
+    // leave EOF below the allocation size. Recreated writers must accept that.
+    if (o.workload != "spill" && object->size() < l.file_bytes)
+      throw std::runtime_error("input file too small");
     if (simulator && !static_cast<cufile_io_object const&>(*object).cufile_registered())
       throw std::runtime_error(
         "simulated public routing requires a registered file (compat libcufile suffices)");
@@ -708,6 +750,7 @@ int run(options const& o)
       std::this_thread::sleep_for(100us);
     }
   };
+  std::size_t max_resident_pages{};
   auto evict = [&] {
     if (!o.drop_cache) return;
     for (std::size_t i = 0; i < objects.size(); ++i) {
@@ -716,7 +759,79 @@ int run(options const& o)
       if (fsync(file.buffered_fd())) throw std::runtime_error("cache-drop fsync failed");
       auto error = posix_fadvise(file.buffered_fd(), 0, 0, POSIX_FADV_DONTNEED);
       if (error) throw std::system_error(error, std::generic_category(), "cache-drop fadvise");
+      auto resident      = resident_pages(file.buffered_fd());
+      max_resident_pages = std::max(max_resident_pages, resident);
+      if (resident * static_cast<std::size_t>(sysconf(_SC_PAGESIZE)) > layouts[i].file_bytes / 100)
+        std::cerr << "WARNING: >1% file pages resident after eviction\n";
     }
+  };
+  auto policy_gauges = [&] {
+    auto const& file = static_cast<cufile_io_object const&>(*objects.front());
+    auto policy      = mount_policy_registry::instance().find(
+      file.policy_key("engine-benchmark-" + std::to_string(o.device), 1));
+    return policy ? policy->gauges() : mount_policy_gauges{};
+  };
+  std::uint64_t logged_demotions{};
+  auto policy_csv = [&] {
+    auto p = policy_gauges();
+    if (p.demotions > logged_demotions) {
+      auto reason = p.last_trigger == circuit_trigger::slow_of_eight ? "slow-of-eight"
+                    : p.last_trigger == circuit_trigger::stuck       ? "stuck"
+                                                                     : "failure";
+      std::cerr << "mount circuit trigger=" << reason
+                << " submit_elapsed_us=" << p.trigger_elapsed.count() / 1000
+                << " healthy_p99_us=" << p.healthy_p99.count() / 1000
+                << " demotions=" << p.demotions << '\n';
+      logged_demotions = p.demotions;
+    }
+    std::ostringstream out;
+    out << ',' << static_cast<int>(p.state) << ',' << p.demotions << ',' << p.cooldowns << ','
+        << p.cooldown.count() << ',' << static_cast<int>(p.last_trigger) << ','
+        << p.trigger_elapsed.count() / 1000 << ',' << p.healthy_p99.count() / 1000;
+    return out.str();
+  };
+  auto epoch_start          = clock_type::now();
+  auto last_sample          = epoch_start;
+  std::uint64_t sampled_ops = std::numeric_limits<std::uint64_t>::max();
+  auto soak_sample          = [&](bool force) {
+    if (o.soak_csv.empty()) return;
+    auto now = clock_type::now();
+    if (!force && std::chrono::duration<double>(now - last_sample).count() < o.sample_seconds)
+      return;
+    last_sample = now;
+    auto g      = snapshot();  // Quiescent samples distinguish resource leaks from varying backlog.
+    if (force && sampled_ops == g.completed_ops) return;
+    sampled_ops = g.completed_ops;
+    auto a      = arena ? arena->gauges() : arena_gauges{};
+    std::size_t free_device{}, total_device{}, fd_count{};
+    check(cudaMemGetInfo(&free_device, &total_device));
+    for ([[maybe_unused]] auto const& entry : std::filesystem::directory_iterator("/proc/self/fd"))
+      ++fd_count;
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    std::size_t thread_count{}, rss_kib{};
+    while (std::getline(status, line)) {
+      std::istringstream fields(line);
+      std::string key;
+      fields >> key;
+      if (key == "Threads:") fields >> thread_count;
+      if (key == "VmRSS:") fields >> rss_kib;
+    }
+    std::ofstream csv(o.soak_csv, std::ios::app);
+    csv << std::chrono::duration<double>(now - o.soak_start).count() << ',' << o.epoch
+        << ",quiescent," << a.total_bytes << ',' << a.registered_bytes << ','
+        << a.unregistered_bytes << ',' << g.live_operations << ','
+        << (lane_resources ? lane_resources->capacity() : 0) << ',' << thread_count << ','
+        << rss_kib * 1024 << ',' << g.pinned_write_scratch_pool_bytes << ','
+        << g.pinned_write_scratch_bytes << ',' << g.storage_qd << ',' << g.outstanding_slices << ','
+        << g.queries << ',' << g.completed_ops << ',' << g.quarantines << ','
+        << g.late_copy_failures << ',' << g.accounted_ns << ',' << g.storage_qd_ns << ','
+        << g.backlog_ns << ',' << g.backlog_storage_qd_ns << ',' << g.slot_waits << ','
+        << g.lane_waits << ',' << g.refill_gap_ns << ',' << g.reaper_active_ns << ','
+        << g.async_registered_bytes << ',' << g.async_unregistered_bytes << ',' << g.sync_bytes
+        << ',' << percentile(g.residence, 99) << policy_csv() << ',' << fd_count << ','
+        << total_device - free_device << ',' << o.verify << '\n';
+    if (!csv) throw std::runtime_error("soak CSV write failed");
   };
   auto before = snapshot();
   std::atomic<unsigned> effective_qd{}, min_qd{std::numeric_limits<unsigned>::max()};
@@ -782,7 +897,19 @@ int run(options const& o)
       measured_backlog_qd_ns +=
         pass_after.backlog_storage_qd_ns - pass_before.backlog_storage_qd_ns;
       measured_backlog_ns += pass_after.backlog_ns - pass_before.backlog_ns;
-    } while (passes < o.repetitions || seconds < static_cast<double>(o.min_seconds));
+      if (!o.soak_csv.empty() &&
+          std::chrono::duration<double>(clock_type::now() - last_sample).count() >=
+            o.sample_seconds) {
+        for (auto const& pipeline : pipelines)
+          for (auto const& slot : pipeline)
+            slot->verify_contents();
+        soak_sample(false);
+      }
+    } while (o.epoch_seconds > 0
+               ? std::chrono::duration<double>(clock_type::now() - epoch_start).count() <
+                   o.epoch_seconds
+               : passes < o.repetitions || seconds < static_cast<double>(o.min_seconds));
+    soak_sample(true);
   } catch (...) {
     done.store(true);
     gate.arrive_and_wait();
@@ -862,7 +989,10 @@ int run(options const& o)
     "repetitions,chunk_min_bytes,chunk_max_bytes,task_bytes,single_bytes,file_bytes,file,"
     "overrides,libcufile_version,gds_available,compat_only,forced_compat,Q_eff_min,S_eff_min,"
     "guarded_destinations,async_write_bytes,direct_pwrite_bytes,buffered_pwrite_bytes,spill_mode,"
-    "flush,NOT_GDS";
+    "flush,NOT_GDS,residence_p50_us,residence_p99_us,backlog_ns,storage_qd_ns,"
+    "accounted_ns,completed_ops,policy_state,policy_demotions,policy_cooldowns,policy_cooldown_s,"
+    "policy_trigger,policy_trigger_us,policy_healthy_p99_us,resident_pages,slow_floor_us,stuck_ms,"
+    "residence_mean_us";
   std::ostringstream row;
   row << std::fixed << std::setprecision(3) << o.engine << ',' << o.workload << ',' << o.threads
       << ',' << o.tasks << ',' << o.verify << ',' << (o.unsafe_arena ? "unsafe-arena" : "slot")
@@ -901,6 +1031,7 @@ int run(options const& o)
               : 0)
       << ',' << open_ms << ',' << admission << ','
       << (o.engine == "simulated" ? "simulator"
+          : o.posix_only          ? "posix"
           : o.engine == "legacy"  ? "legacy"
                                   : "libcufile")
       << ',' << o.coalesce << ',' << o.qd << ',' << o.op_bytes << ',' << o.arena_bytes << ','
@@ -914,7 +1045,14 @@ int run(options const& o)
       << o.guarded_destinations << ',' << after.async_write_bytes - before.async_write_bytes << ','
       << after.direct_write_bytes - before.direct_write_bytes << ','
       << after.buffered_write_bytes - before.buffered_write_bytes << ',' << o.spill_mode << ','
-      << o.flush << ",1";
+      << o.flush << ",1," << percentile(subtract(after.residence, before.residence), 50) << ','
+      << percentile(subtract(after.residence, before.residence), 99) << ',' << measured_backlog_ns
+      << ',' << measured_qd_ns << ',' << measured_accounted_ns << ',' << ops << policy_csv() << ','
+      << max_resident_pages << ',' << o.slow_floor_us << ',' << o.stuck_ms << ','
+      << (after.residence.count > before.residence.count
+            ? static_cast<double>(after.residence.total_ns - before.residence.total_ns) /
+                static_cast<double>(after.residence.count - before.residence.count) / 1000.0
+            : 0.0);
   std::cout << header << '\n' << row.str() << '\n';
   if (!o.csv.empty() && o.csv != "-") {
     std::ofstream csv(o.csv);
@@ -939,7 +1077,38 @@ int run(options const& o)
 int main(int argc, char** argv)
 {
   try {
-    return run(parse(argc, argv));
+    auto o = parse(argc, argv);
+    if (!o.soak_minutes) return run(o);
+    o.soak_csv = o.csv + ".soak.csv";
+    if (std::filesystem::exists(o.soak_csv) || std::filesystem::exists(o.csv + ".ok"))
+      throw std::runtime_error("use a fresh soak output path (no stale completion marker)");
+    std::ofstream samples(o.soak_csv);
+    samples << "elapsed_s,epoch,phase,arena_bytes,registered_bytes,unregistered_bytes,"
+               "op_pool_live,lane_count,thread_count,vmrss_bytes,pinned_host_bytes,"
+               "pinned_write_scratch_bytes,storage_qd,outstanding_slices,queries,completed_ops,"
+               "quarantines,late_copy_failures,accounted_ns,storage_qd_ns,backlog_ns,"
+               "backlog_storage_qd_ns,slot_waits,lane_waits,refill_gap_ns,reaper_active_ns,"
+               "async_registered_bytes,async_unregistered_bytes,sync_bytes,residence_p99_us,"
+               "policy_state,policy_demotions,policy_cooldowns,policy_cooldown_s,policy_trigger,"
+               "policy_trigger_us,policy_healthy_p99_us,fd_count,device_used_bytes,verify\n";
+    samples.close();
+    if (!samples) throw std::runtime_error("cannot create soak CSV");
+    auto base    = o.csv;
+    o.soak_start = clock_type::now();
+    do {
+      auto remaining = o.soak_minutes * 60 -
+                       std::chrono::duration<double>(clock_type::now() - o.soak_start).count();
+      o.epoch_seconds = std::min(o.recreate_seconds, remaining);
+      o.csv           = base + ".epoch-" + std::to_string(o.epoch) + ".csv";
+      run(o);
+      o.create = false;
+      ++o.epoch;
+    } while (std::chrono::duration<double>(clock_type::now() - o.soak_start).count() <
+             o.soak_minutes * 60);
+    std::ofstream complete(base + ".ok");
+    complete << "verified complete\n";
+    if (!complete) throw std::runtime_error("cannot write completion marker");
+    return 0;
   } catch (std::exception const& e) {
     std::cerr << "engine benchmark: " << e.what() << '\n';
     return 1;

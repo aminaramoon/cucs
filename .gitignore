@@ -33,6 +33,10 @@ pixi.lock
 logs/
 *.log
 
+# Qualification output and Python bytecode
+/results/
+__pycache__/
+
 # Testing artifacts
 Testing/
 .planning/

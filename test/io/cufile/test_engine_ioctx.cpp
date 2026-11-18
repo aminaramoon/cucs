@@ -764,6 +764,7 @@ TEST_CASE("ioctx coalescing routing preserves legacy mixed and large fan-out",
         (eligible ? 1 : 4));
   slices.back().d_buffer.original_stream_was_null = true;
   CHECK(context.select_reactors(object, slices, io_op_type::host_vector_async, 0).size() == 4);
-  slices.back() = prepared_io_slice(range{0, 1024}, host_buffer{nullptr});
+  std::uint8_t dummy{};  // Routing-only: host_buffer still requires a non-null address.
+  slices.back() = prepared_io_slice(range{0, 1024}, host_buffer{&dummy});
   CHECK(context.select_reactors(object, slices, io_op_type::host_vector_async, 0).size() == 4);
 }

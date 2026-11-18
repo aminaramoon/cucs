@@ -217,11 +217,14 @@ enum class probe_reason : std::uint8_t {
   slow_submit,
   unregistered
 };
+enum class circuit_trigger { none, slow_of_eight, stuck, failure };
 struct mount_policy_gauges {
   mount_state state{mount_state::unknown};
   std::uint64_t probes{}, probes_passed{}, probes_failed{}, demotions{}, cooldowns{};
   std::chrono::seconds cooldown{};
   probe_reason last_probe{probe_reason::none};
+  circuit_trigger last_trigger{circuit_trigger::none};
+  std::chrono::nanoseconds trigger_elapsed{};
   std::chrono::nanoseconds median_submit{}, median_completion{}, healthy_p99{};
 };
 
@@ -267,7 +270,8 @@ class mount_policy : public std::enable_shared_from_this<mount_policy> {
   /// Single-writer (device reaper): fixed histogram/ring, no allocation or blocking mutex.
   void observe_submit(std::chrono::nanoseconds elapsed) noexcept;
   void observe_stuck_call(std::chrono::nanoseconds elapsed) noexcept;
-  void open_circuit() noexcept;
+  void open_circuit(circuit_trigger trigger          = circuit_trigger::failure,
+                    std::chrono::nanoseconds elapsed = {}) noexcept;
   /// Called after submitted operations drain. New admission stopped at circuit_open already.
   void begin_cooldown() noexcept;
   /// Non-blocking timer service, also available to fake-clock tests / engine's timer loop.
@@ -311,6 +315,9 @@ class mount_policy : public std::enable_shared_from_this<mount_policy> {
   std::array<std::uint16_t, 1024> _healthy{};
   std::array<std::uint16_t, 1088> _histogram{};
   std::size_t _healthy_count{}, _healthy_next{}, _healthy_updates{};
+  std::atomic<unsigned> _healthy_since_resume{};
+  std::atomic<circuit_trigger> _last_trigger{circuit_trigger::none};
+  std::atomic<std::int64_t> _trigger_elapsed_ns{};
   std::uint64_t _observed_baseline_epoch{};
   std::atomic<std::uint64_t> _baseline_epoch{};
   std::atomic<std::int64_t> _healthy_p99_ns{};

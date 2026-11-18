@@ -1,0 +1,9 @@
+step,version,workload,iteration,reactors,logical_bytes,seconds,gib_s,drop_cache,mode,data_mismatches,device,task_bytes,file_bytes,verify,arm,writer_threads,inode_mode,resident_pages
+B-10,new,sustained,1,4,6442450944,1.05335273,5.69609764,1,legacy,0,0,67108864,268435456,1,legacy,8,shared,2
+B-10,new,spill,1,4,1610612736,1.02620709,1.46169327,1,legacy,0,0,67108864,268435456,1,legacy,8,shared,1
+B-10,new,sustained,1,4,6979321856,1.04122815,6.24262798,1,legacy,0,0,67108864,268435456,1,legacy,8,distinct,0
+B-10,new,spill,1,4,4831838208,1.07101743,4.2016123,1,legacy,0,0,67108864,268435456,1,legacy,8,distinct,0
+B-10,new,sustained,1,4,6979321856,1.0056034,6.46378084,1,async_auto,0,0,67108864,268435456,1,async_auto,8,shared,1
+B-10,new,spill,1,4,1610612736,1.03693548,1.44657024,1,async_auto,0,0,67108864,268435456,1,async_auto,8,shared,1
+B-10,new,sustained,1,4,5905580032,1.01528936,5.41717488,1,async_auto,0,0,67108864,268435456,1,async_auto,8,distinct,0
+B-10,new,spill,1,4,1610612736,1.04097167,1.44096141,1,async_auto,0,0,67108864,268435456,1,async_auto,8,distinct,0

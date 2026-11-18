@@ -824,6 +824,7 @@ void mount_policy::observe_submit(std::chrono::nanoseconds elapsed) noexcept
     (static_cast<unsigned>(_last8.load(std::memory_order_relaxed)) << 1) | (slow ? 1U : 0U));
   _last8.store(mask, std::memory_order_relaxed);
   if (!slow) {
+    _healthy_since_resume.fetch_add(1, std::memory_order_relaxed);
     if (_healthy_count == _healthy.size()) {
       --_histogram[_healthy[_healthy_next]];
     } else {
@@ -849,21 +850,25 @@ void mount_policy::observe_submit(std::chrono::nanoseconds elapsed) noexcept
     }
   }
   if (static_cast<unsigned>(std::popcount(mask)) >= _config.demotion.slow_of_last_eight)
-    open_circuit();
+    open_circuit(circuit_trigger::slow_of_eight, elapsed);
 }
 
 void mount_policy::observe_stuck_call(std::chrono::nanoseconds elapsed) noexcept
 {
-  if (elapsed >= std::chrono::milliseconds(_config.demotion.stuck_ms)) open_circuit();
+  if (elapsed >= std::chrono::milliseconds(_config.demotion.stuck_ms))
+    open_circuit(circuit_trigger::stuck, elapsed);
 }
 
-void mount_policy::open_circuit() noexcept
+void mount_policy::open_circuit(circuit_trigger trigger, std::chrono::nanoseconds elapsed) noexcept
 {
   // Unknown/probing have no engine traffic to drain. A watchdog cannot strand a
   // control-only probe in circuit_open; its own completion/timeout owns that decision.
   auto current = state();
-  if (active(current) && _state.compare_exchange_strong(current, mount_state::circuit_open))
+  if (active(current) && _state.compare_exchange_strong(current, mount_state::circuit_open)) {
+    _last_trigger.store(trigger, std::memory_order_relaxed);
+    _trigger_elapsed_ns.store(elapsed.count(), std::memory_order_relaxed);
     _demotions.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 void mount_policy::schedule_timer(policy_clock::time_point due) noexcept
@@ -896,10 +901,14 @@ void mount_policy::begin_cooldown() noexcept
     if (state() != mount_state::circuit_open) return;
     auto const initial = std::chrono::seconds(_config.demotion.cooldown_s);
     auto const cap     = std::chrono::seconds(_config.demotion.cooldown_cap_s);
-    _gauges.cooldown =
-      _gauges.cooldown.count() == 0 ? initial : std::min(cap, _gauges.cooldown * 2);
-    _retry_at = _now() + _gauges.cooldown;
-    _state    = mount_state::cooldown;
+    // Standing overrides have no passing re-probe to reset backoff. A full healthy
+    // rolling window since resumption earns the initial cooldown again.
+    bool const healthy = _healthy_since_resume.exchange(0, std::memory_order_relaxed) >= 1024;
+    _gauges.cooldown   = _gauges.cooldown.count() == 0 || (_operator_override && healthy)
+                           ? initial
+                           : std::min(cap, _gauges.cooldown * 2);
+    _retry_at          = _now() + _gauges.cooldown;
+    _state             = mount_state::cooldown;
     ++_gauges.cooldowns;
     schedule_timer(_retry_at);
   } catch (...) { /* Engine also services poll_timers if the bounded timer queue is full. */
@@ -957,10 +966,13 @@ void mount_policy::poll_timers() noexcept
 mount_policy_gauges mount_policy::gauges() const
 {
   std::lock_guard lock(_mutex);
-  auto result        = _gauges;
-  result.state       = state();
-  result.healthy_p99 = std::chrono::nanoseconds(_healthy_p99_ns.load(std::memory_order_relaxed));
-  result.demotions   = _demotions.load(std::memory_order_relaxed);
+  auto result         = _gauges;
+  result.state        = state();
+  result.healthy_p99  = std::chrono::nanoseconds(_healthy_p99_ns.load(std::memory_order_relaxed));
+  result.demotions    = _demotions.load(std::memory_order_relaxed);
+  result.last_trigger = _last_trigger.load(std::memory_order_relaxed);
+  result.trigger_elapsed =
+    std::chrono::nanoseconds(_trigger_elapsed_ns.load(std::memory_order_relaxed));
   return result;
 }
 

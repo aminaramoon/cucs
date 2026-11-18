@@ -721,6 +721,27 @@ TEST_CASE("mount policy cooldown waits for drain and doubles to its cap", "[cufi
   }
 }
 
+TEST_CASE("mount policy healthy override window resets cooldown backoff", "[cufile][mount_policy]")
+{
+  policy_fixture f;
+  f.policy->observe_stuck_call(5ms);
+  CHECK(f.policy->gauges().last_trigger == circuit_trigger::stuck);
+  CHECK(f.policy->gauges().trigger_elapsed == 5ms);
+  f.policy->begin_cooldown();
+  f.clock->now += 30s;
+  f.policy->poll_timers();
+  for (unsigned i = 0; i < 1024; ++i)
+    f.policy->observe_submit(10us);
+  f.policy->open_circuit();
+  f.policy->begin_cooldown();
+  CHECK(f.policy->gauges().cooldown == 30s);
+  f.clock->now += 30s;
+  f.policy->poll_timers();
+  f.policy->open_circuit();
+  f.policy->begin_cooldown();
+  CHECK(f.policy->gauges().cooldown == 60s);  // No healthy window: preserve escalation.
+}
+
 TEST_CASE("mount policy expired cooldown cannot bypass the drain gate", "[cufile][mount_policy]")
 {
   policy_fixture f;

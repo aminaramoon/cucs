@@ -1,5 +1,12 @@
 # GDS diagnostics
 
+## Phase 7 qualification tooling
+
+See [QUALIFICATION.md](QUALIFICATION.md) for `qualify.sh`, its example config,
+`analyze_gates.py`, verified soak/recreation sampling, the old/new B-10 runner,
+and separate ASan+UBSan/TSan build and run commands. All default product behavior
+remains legacy; compat smoke and raw nvidia-fs snapshots are not GDS evidence.
+
 ## Standalone cuFile async-QD harness
 
 Phase 1 / P0 (B-0 and initial B-1 components), per

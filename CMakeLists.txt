@@ -665,6 +665,16 @@ if(CUCASCADE_BUILD_IO AND CUCASCADE_CUFILE_INCLUDE_DIR)
                          PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
   set_target_properties(cucascade_cufile_async_qd PROPERTIES CXX_EXTENSIONS OFF)
 
+  add_executable(cucascade_legacy_compat_bench EXCLUDE_FROM_ALL
+                 tools/gds/legacy_compat_bench.cpp)
+  target_link_libraries(cucascade_legacy_compat_bench PRIVATE cucascade_io
+                                                              CUDA::cudart)
+  target_compile_features(cucascade_legacy_compat_bench PRIVATE cxx_std_20)
+  target_compile_definitions(cucascade_legacy_compat_bench
+                             PRIVATE B10_NEW_ENGINE)
+  target_compile_options(cucascade_legacy_compat_bench
+                         PRIVATE ${CUCASCADE_CXX_WARNING_FLAGS})
+
   add_executable(
     cucascade_cufile_engine_bench EXCLUDE_FROM_ALL
     tools/gds/cufile_engine_bench.cpp test/io/cufile/transport_simulator.cpp

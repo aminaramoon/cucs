@@ -670,7 +670,8 @@ bool run_case(cufile_api const& api,
             << measured.submit.maximum() << ',' << measured.completion.percentile(0.5) << ','
             << measured.completion.percentile(0.99) << ',' << measured.mismatches << ',' << blocking
             << ',' << measured.slow_submits << ',' << measured.queries << ','
-            << measured.ready_first_poll << ',' << measured.data_mismatches << std::endl;
+            << measured.ready_first_poll << ',' << measured.data_mismatches << ',' << config.verify
+            << std::endl;
   return measured.mismatches == 0 && measured.data_mismatches == 0;
 }
 
@@ -872,7 +873,7 @@ bool run_io(options const& config)
        "# sync mode is a single-host-thread serial baseline, not QD concurrent I/O\n"
        "kind,mode,device,registration,qd,op_mib,elapsed_s,completed,gib_per_s,submit_p50_us,"
        "submit_p99_us,submit_max_us,completion_p50_us,completion_p99_us,bytes_done_mismatches,"
-       "blocking_indicator,submits_over_100us,queries,ready_first_poll,data_mismatches\n";
+       "blocking_indicator,submits_over_100us,queries,ready_first_poll,data_mismatches,verify\n";
   bool success = true;
   for (auto const op_size : config.op_bytes) {
     for (auto const qd : config.queue_depths) {

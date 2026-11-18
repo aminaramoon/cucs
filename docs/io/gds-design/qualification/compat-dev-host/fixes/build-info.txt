@@ -1,0 +1,81 @@
+Wed Nov 18 09:38:54 AM UTC 2026
+io/cufile-async-engine
+6f6b82e3492209931870ae74bfa4bf95faf8d4ca
+ M .gitignore
+ M CMakeLists.txt
+ M CMakePresets.json
+ M docs/io/cufile-reactor.md
+ M docs/io/gds-design/06-design-amendments.md
+ M include/cucascade/io/cufile/mount_policy.hpp
+ M src/io/cufile/device_engine.cpp
+ M src/io/cufile/mount_policy.cpp
+ M test/io/cufile/test_cufile_write.cpp
+ M test/io/cufile/test_engine_hardening.cpp
+ M test/io/cufile/test_engine_ioctx.cpp
+ M test/io/cufile/test_engine_sched.cpp
+ M test/io/cufile/test_engine_write.cpp
+ M test/io/cufile/test_mount_policy.cpp
+ M test/io/rest/s3/test_sigv4_authorizer.cpp
+ M test/unittest.cpp
+ M test/utils/allocation_counter.cpp
+ M test/utils/allocation_counter.hpp
+ M tools/gds/README.md
+ M tools/gds/cufile_async_qd.cpp
+ M tools/gds/cufile_engine_bench.cpp
+?? docs/io/gds-design/qualification/
+?? docs/io/gds-design/reviews/phase-7a.md
+?? tools/gds/QUALIFICATION.md
+?? tools/gds/analyze_gates.py
+?? tools/gds/cache_residency.hpp
+?? tools/gds/legacy_compat_bench.cpp
+?? tools/gds/qualification_support.py
+?? tools/gds/qualify.example.conf
+?? tools/gds/qualify.sh
+?? tools/gds/run_b10.sh
+?? tools/gds/sanitizer.supp
+?? tools/gds/tests/
+
+Tracked source diff SHA256:
+2e0dcd5dbee21f9106454d531e13a961fb250ce880ac418e2c8ef4032b002294  -
+
+Tool source hashes (including new files):
+4b5d78b18ff4e35e3cabe8ae3c8eef0102e98fb37f106930c2e28af754e336e8  tools/gds/analyze_gates.py
+055814a95e93fb14527b5d61b6e07b3a67af3768873434afe35693cbd592f8ca  tools/gds/qualification_support.py
+e70f77de57617ae61a7aab390c80a295bcb478c22de4fc32ce82f61938761040  tools/gds/qualify.sh
+dd0e3780d50f671a88a3bc426d4b7480f37aa4ffd9ff3528fa68b658f22ccfc1  tools/gds/run_b10.sh
+e70bd2ec36079d1179e6d99c23de4276ddf37482ae94825c13a92449cfc6c923  tools/gds/legacy_compat_bench.cpp
+a74bd0e9e963cb010866899f242698e22c6373283f931ff2a9bdf9158c14af9d  tools/gds/cache_residency.hpp
+146b9ef79741e6a38be766e8e0547d65987e92f139301a7842aefb63fe959713  tools/gds/cufile_async_qd.cpp
+1e7e25e3463de7e5d414df0e80b81cae0bfc02aece081e314c0f906f1449f694  tools/gds/cufile_engine_bench.cpp
+
+Release binaries:
+0ec8468249d783d938539ea0abca9c75da7a23dc229d7f157f4e287621b37ff2  build/release/test/cucascade_io_tests
+457b4855dd3b7bb1766602b5ceb1eee038ca70cba5c30269769a173a47837887  build/release/cucascade_cufile_async_qd
+ce3e7078b2aa70648f91af8e20a11e0d1800c5dc9d97149c0fcfe92e897b4281  build/release/cucascade_cufile_engine_bench
+8157af42f5f4c85fbc5450cfe7c7bf39138277d709121229c0880bda0c123128  build/release/cucascade_legacy_compat_bench
+
+Release build flags:
+CMAKE_BUILD_TYPE:STRING=Release
+CMAKE_CUDA_ARCHITECTURES:STRING=75-real;80-real;86-real;90a-real;100f-real;120a-real;120
+CMAKE_CUDA_FLAGS:STRING=
+CMAKE_CUDA_FLAGS_DEBUG:STRING=-g
+CMAKE_CUDA_FLAGS_MINSIZEREL:STRING=-O1 -DNDEBUG
+CMAKE_CUDA_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+CMAKE_CUDA_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG
+CMAKE_CXX_FLAGS:STRING=-fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /home/aaramoon/workspace/oss/cucs/.pixi/envs/default/include  -I/home/aaramoon/workspace/oss/cucs/.pixi/envs/default/targets/x86_64-linux/include -I/home/aaramoon/workspace/oss/cucs/.pixi/envs/default/targets/x86_64-linux/include/cccl
+CMAKE_CXX_FLAGS_DEBUG:STRING=-g
+CMAKE_CXX_FLAGS_MINSIZEREL:STRING=-Os -DNDEBUG
+CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+CMAKE_CXX_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG
+CMAKE_CUDA_FLAGS-ADVANCED:INTERNAL=1
+CMAKE_CUDA_FLAGS_DEBUG-ADVANCED:INTERNAL=1
+CMAKE_CUDA_FLAGS_MINSIZEREL-ADVANCED:INTERNAL=1
+CMAKE_CUDA_FLAGS_RELEASE-ADVANCED:INTERNAL=1
+CMAKE_CUDA_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
+CMAKE_CXX_FLAGS-ADVANCED:INTERNAL=1
+CMAKE_CXX_FLAGS_DEBUG-ADVANCED:INTERNAL=1
+CMAKE_CXX_FLAGS_MINSIZEREL-ADVANCED:INTERNAL=1
+CMAKE_CXX_FLAGS_RELEASE-ADVANCED:INTERNAL=1
+CMAKE_CXX_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
+
+Old scratch worktree:

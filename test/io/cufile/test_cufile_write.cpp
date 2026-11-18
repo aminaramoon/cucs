@@ -181,14 +181,17 @@ class device_bytes {
   explicit device_bytes(std::vector<std::uint8_t> const& contents, std::size_t misalignment = 0)
     : _size(contents.size())
   {
-    REQUIRE(cudaMalloc(&_storage, std::max<std::size_t>(1, _size + misalignment)) == cudaSuccess);
+    if (cudaMalloc(&_storage, std::max<std::size_t>(1, _size + misalignment)) != cudaSuccess)
+      throw std::runtime_error("device_bytes allocation failed");
     _data = static_cast<std::uint8_t*>(_storage) + misalignment;
     if (_size != 0) {
-      REQUIRE(cudaMemcpy(_data, contents.data(), _size, cudaMemcpyHostToDevice) == cudaSuccess);
+      if (cudaMemcpy(_data, contents.data(), _size, cudaMemcpyHostToDevice) != cudaSuccess)
+        throw std::runtime_error("device_bytes upload failed");
     }
     // A pageable cudaMemcpy may return before its DMA landed, and the tests read
     // the bytes on non-blocking streams that do not wait for the legacy stream.
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    if (cudaDeviceSynchronize() != cudaSuccess)
+      throw std::runtime_error("device_bytes synchronization failed");
   }
 
   ~device_bytes() { std::ignore = cudaFree(_storage); }
@@ -209,7 +212,8 @@ class cuda_stream {
  public:
   cuda_stream()
   {
-    REQUIRE(cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking) == cudaSuccess);
+    if (cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking) != cudaSuccess)
+      throw std::runtime_error("cuda_stream creation failed");
   }
   ~cuda_stream() { std::ignore = cudaStreamDestroy(_stream); }
   cuda_stream(cuda_stream const&)            = delete;
@@ -990,18 +994,20 @@ TEST_CASE("cufile transfers of a context without registration still block others
   {
     bool tracked                 = false;
     std::size_t created_during_b = 0;
+    std::size_t written_during_b = 0;
     probe.check                  = [&] {
       tracked            = transfer_tracked_for_testing(src.get(), n);
       auto const before  = registrations_created_for_testing();
       auto const written = b->device_write_async(*object_b, 0, n, src.get(), stream.ref()).get(60s);
       created_during_b   = registrations_created_for_testing() - before;
-      CHECK(written == n);
+      written_during_b   = written;  // Check on the test thread after the future synchronizes.
     };
     probe.armed = true;
     REQUIRE(a->device_write_async(*object_a, 0, n, src.get(), stream.ref()).get(60s) == n);
     CHECK_FALSE(probe.armed.load());
     CHECK(tracked);
     CHECK(created_during_b == 0);
+    CHECK(written_during_b == n);
     // Once A's transfer is over, B registers the buffer again.
     CHECK_FALSE(transfer_tracked_for_testing(src.get(), n));
     auto const before = registrations_created_for_testing();

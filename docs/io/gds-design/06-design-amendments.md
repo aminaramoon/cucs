@@ -530,9 +530,9 @@ qualification or B-6 acceptance result is implied.
 - **Progress and completion.** Source reads wait for the caller fence; futures
   are host-complete, not durable. Unknown/zero/negative/oversized progress fails
   without replay and never advances `note_written`. A sentinel requires owned
-  lane recovery, not mere event observation. Watchdog-classified stuck writes
-  still fail after recovery even if their delayed submit eventually succeeds
-  (§7 #29); this conservative rule is intentionally retained.
+  lane recovery, not mere event observation. AM-18 supersedes the earlier
+  conservative watchdog rule: a delayed submit that returns success with a
+  recorded event follows normal event/bytes_done validation, without replay.
   Positive shorts reuse only the known suffix of the slot; unaligned suffixes
   and known-progress direct EINVAL/EOPNOTSUPP continuations go buffered under
   the same interval. Cleanup releases resources off-reaper.
@@ -604,3 +604,53 @@ qualification or B-6 acceptance result is implied.
   completion, gauge, troubleshooting and qualification guide. Commented,
   versioned libcufile templates are under `docs/io/cufile-profiles/`. The default
   remains legacy; no cuDF implementation or caller assumptions are changed here.
+
+## AM-18: Phase 7a routing integrity, submit outcomes and calibrated health
+
+- **Recorded write success is known progress.** A watchdog observation stops new
+  admission but cannot turn a later successful submit/event record into EIO.
+  Clear its unknown-progress marker, observe the owned event and validate
+  bytes_done. Failed submits and unproven quiescence still fail/quarantine
+  without replay. A permanently stuck call never releases its resources.
+- **Measured breaker trigger.** The instrumented four-minute compat repro fired
+  **slow-of-last-eight**, not stuck: triggering submits were 287–777 µs, with
+  healthy p99 48–81 µs. This disproves the claim that compat submits block for
+  the whole I/O; AM-10's fast-submit observation remains consistent. It also
+  shows that sampling is not required: the first trip preceded the first sample.
+  Healthy-only baseline sampling excludes tails, making the default 100-µs/4×
+  policy sensitive to compat host contention. It is not evidence of GDS failure.
+  The benchmark now records policy state, trigger/elapsed time, p99, demotions
+  and cooldowns. On this host only, a recorded 2-ms slow floor and 20-ms stuck
+  threshold produced four minutes with zero demotions, legacy or sync bytes.
+  **Product defaults are unchanged**; calibrate from B-0 per filesystem/client
+  before hardware sign-off, rather than weakening watchdogs globally.
+- **Override backoff decay.** Standing overrides have no successful re-probe to
+  reset cooldowns. After 1024 non-slow submits since the previous trip, the next
+  override trip uses the initial cooldown. Without a healthy window it still
+  doubles to the configured cap. Fake-clock regression covers reset/escalation.
+- **Polling and accounting.** Stage events share caller-fence hints, with
+  latency-adaptive elapsed-time backoff even before a history exists. A 100-ms
+  singleton caller-fence regression requires <=70 queries/op. Backlog now means
+  admitted unsubmitted work waiting for capacity, not an in-flight drain tail;
+  idle unrelated mounts cannot manufacture refill gaps. G-3 additionally
+  reports/refuses >10% refill-gap/backlog, but compat ratios remain INFO.
+- **Evidence and partial criteria.** Engine gates check actual engine/legacy/sync
+  bytes and verification. G-2 excludes legacy/simulated rows. G-3 and shared-arena
+  AM-9 require direct proof. G-5a is only the query ceiling; full G-5 stays N/A
+  pending NFR-3/NFR-4 measurements. Required coverage is explicit, not inferred
+  from successful rows. Soaks require per-epoch routing/progress, successful-exit
+  markers, exact arena/registration budgets and fd/device-memory observations.
+  Short or simulated soaks are not G-7 approval.
+- **Test infrastructure, not vendor blame.** Random Catch redirect aborts came
+  from worker-thread assertions hidden in URL/CUDA helpers and a transfer hook.
+  Results are now checked on the test thread, with a listener guarding that rule.
+  ASan allocator mismatches came from the test binary's incomplete global
+  allocation-counter replacements: ASan independently interposed nothrow new,
+  while the custom sized delete called free. Completing the unaligned overload
+  family removes both the presumed toolchain and vendor reports. Full ASan/UBSan
+  now passes without alloc_dealloc_mismatch=0. The counter intentionally uses
+  malloc/free, so custom scalar allocations do not carry standard C++ allocation
+  family tags; overflow/UAF checking remains enabled. TSan now runs using
+  per-process setarch -R, but CUDA-event happens-before is not modeled: its
+  callback/argument-lifetime reports are retained, not globally suppressed, and
+  G-6 is not signed off.

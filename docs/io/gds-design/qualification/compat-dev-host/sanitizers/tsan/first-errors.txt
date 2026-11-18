@@ -1,0 +1,3 @@
+224:/home/aaramoon/workspace/oss/cucs/.pixi/envs/default/include/rapids/cuda/std/__atomic/functions/host.h:77:24: error: 'atomic_thread_fence' is not supported with '-fsanitize=thread' [-Werror=tsan]
+237:/home/aaramoon/workspace/oss/cucs/.pixi/envs/default/include/rapids/cuda/std/__atomic/functions/host.h:77:24: error: 'atomic_thread_fence' is not supported with '-fsanitize=thread' [-Werror=tsan]
+272:/home/aaramoon/workspace/oss/cucs/.pixi/envs/default/include/rapids/cuda/std/__atomic/functions/host.h:77:24: error: 'atomic_thread_fence' is not supported with '-fsanitize=thread' [-Werror=tsan]

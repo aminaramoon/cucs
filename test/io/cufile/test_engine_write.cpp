@@ -468,7 +468,7 @@ TEST_CASE("engine breaker returns queued writes as not submitted and preserves t
   CHECK(w.r.transport->snapshot().write_calls == 1);
 }
 
-TEST_CASE("engine stuck write call has unknown progress and is never replayed",
+TEST_CASE("engine watchdog delayed write success validates progress without replay",
           "[cufile][engine][write]")
 {
   if (!has_device()) SKIP("CUDA unavailable");
@@ -485,12 +485,43 @@ TEST_CASE("engine stuck write call has unknown progress and is never replayed",
   REQUIRE(until([&] { return w.r.policy->state() == mount_state::circuit_open; }));
   CHECK_FALSE(std::move(future).wait(1ms));
   w.r.transport->unblock_all();
-  CHECK_THROWS(std::move(future).get(5s));
+  CHECK(std::move(future).get(5s) == mib);
   REQUIRE(w.r.engine->drain(5s));
   CHECK(w.r.transport->snapshot().write_calls == 1);
-  CHECK(w.r.engine->gauges().direct_write_bytes == 0);
-  CHECK(w.r.engine->gauges().buffered_write_bytes == 0);
-  CHECK(w.native->size() == 0);
+  CHECK(w.disk(mib) == w.r.image);
+  CHECK(w.native->size() == mib);
+}
+
+TEST_CASE("engine delayed five millisecond write submit succeeds", "[cufile][engine][write]")
+{
+  if (!has_device()) SKIP("CUDA unavailable");
+  write_fixture w(mib);
+  w.r.config.demotion.stuck_ms = 2;
+  w.r.policy                   = w.r.make_policy(1);
+  transport_simulator::fault f;
+  f.submit_latency = 5ms;
+  w.r.transport->add_fault(f);
+  w.r.start();
+  CHECK(w.write({0, mib}).get(5s) == mib);
+  REQUIRE(w.r.engine->drain(5s));
+  CHECK(w.disk(mib) == w.r.image);
+  CHECK(w.r.transport->snapshot().write_calls == 1);
+}
+
+TEST_CASE("engine stage polling backs off across a long caller fence", "[cufile][engine][write]")
+{
+  if (!has_device()) SKIP("CUDA unavailable");
+  write_fixture w(mib);
+  w.r.start();
+  // CUDA callback performs no CUDA calls; the fence follows 100 ms of application work.
+  REQUIRE(cudaLaunchHostFunc(
+            w.r.stream, [](void*) { std::this_thread::sleep_for(100ms); }, nullptr) == cudaSuccess);
+  CHECK(w.write({0, mib}).get(5s) == mib);
+  REQUIRE(w.r.engine->drain(5s));
+  auto g = w.r.engine->gauges();
+  INFO("queries per op=" << g.queries_per_op);
+  CHECK(g.queries_per_op <= 70);
+  CHECK(w.disk(mib) == w.r.image);
 }
 
 TEST_CASE("engine write failure waits for every submitted sibling to become quiescent",

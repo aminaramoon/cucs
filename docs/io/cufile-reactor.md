@@ -376,7 +376,7 @@ A mount snapshot includes `mount_id`, requested `profile`, fitted `effective`
 | Host memory/flush | `pinned_write_scratch_bytes`; `pinned_write_scratch_pool_bytes` and `flush_waits` are **process-wide**, not additive across devices |
 | Logical completion | `enqueued_logical_bytes`: exact successful target bytes, not physical widened/coalesced I/O bytes |
 | Placement | `reaper_affinity`, `submitter_affinity[]`: `cpu`, `node`, `nic`, `nic_bdf`, `pinned`, `reason`; submitter entry describes its most recently selected mount plan |
-| Mount policy | `state`, `probes`, `probes_passed`, `probes_failed`, `demotions`, `cooldowns`, `cooldown`, `last_probe`, `median_submit`, `median_completion`, `healthy_p99` |
+| Mount policy | `state`, `probes`, `probes_passed`, `probes_failed`, `demotions`, `cooldowns`, `cooldown`, `last_probe`, `last_trigger`, `trigger_elapsed`, `median_submit`, `median_completion`, `healthy_p99` |
 | Arena | `total_bytes`, `registered_bytes`, `unregistered_bytes`, `reserved_bytes`, `slabs`, `registered_slabs`, `partially_registered_slabs`, `live_leases`, `live_probe_leases`, `draining_slabs`, `pending_slabs`, `reclassifications` |
 | Runtime | library/open/property statuses, optional async/read/write/stream/batch/parameter groups, forced compat, frozen parameters, per-parameter status/reason, generation and conflicting-request flag |
 
@@ -439,8 +439,14 @@ remains opt-in; enabling it does not silently upgrade their assumptions.
   eligibility. Non-file-local non-transient failures, rolling slow-submit
   observations or the stuck watchdog move to
   `circuit_open`; drain precedes `cooldown`, with exponential bounded retries.
-  Inspect `last_probe`, histograms and per-inode demotion before widening limits.
+  Standing overrides reset backoff to its initial value after 1024 healthy submits
+  since the previous trip; without that window it still doubles to the cap.
+  Inspect `last_trigger` (slow-of-eight / stuck / failure), `trigger_elapsed`,
+  `last_probe`, histograms and per-inode demotion before calibrating limits.
   Submitted work is not safely cancellable merely because a watchdog fired.
+  A delayed write submit that returns success with a recorded event still follows
+  normal event/bytes_done validation; a watchdog observation alone does not fail
+  that known-successful submission or authorize replay (AM-18).
 - **Arena lifetime:** an explicitly supplied `device_engine_options::arena` is
   non-owning and must outlive the engine, including incomplete drain/quarantine.
   Destroying the facade first can make final-owner nonblocking lease returns
