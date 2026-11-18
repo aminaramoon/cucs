@@ -32,8 +32,6 @@ constexpr std::array required_symbols{"cuFileDriverOpen",
                                       "cuFileDriverGetProperties",
                                       "cuFileHandleRegister",
                                       "cuFileHandleDeregister",
-                                      "cuFileBufRegister",
-                                      "cuFileBufDeregister",
                                       "cuFileRead",
                                       "cuFileWrite"};
 

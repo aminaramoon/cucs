@@ -17,6 +17,7 @@
  */
 
 #include <cucascade/io/cufile/cufile_api.hpp>
+#include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/log/logging.hpp>
 
 #include <dlfcn.h>
@@ -76,7 +77,25 @@ struct loaded_library {
   return loaded;
 }
 
+/// The table tests substitute for libcufile (see detail::set_cufile_api_for_testing).
+std::atomic<cufile_api const*> api_for_testing{nullptr};
+/// The substitute's generation (0 while libcufile serves); see cufile_api::generation.
+std::atomic<std::uint64_t> api_generation{0};
+std::atomic<std::uint64_t> next_generation{1};
+
+
 }  // namespace
+
+namespace detail {
+
+void set_cufile_api_for_testing(cufile_api const* api) noexcept
+{
+  api_generation.store(api == nullptr ? 0 : next_generation.fetch_add(1),
+                       std::memory_order_release);
+  api_for_testing.store(api, std::memory_order_release);
+}
+
+}  // namespace detail
 
 std::optional<cufile_api> cufile_api::resolve_symbols(symbol_resolver resolver,
                                                       void* context) noexcept
@@ -94,8 +113,6 @@ std::optional<cufile_api> cufile_api::resolve_symbols(symbol_resolver resolver,
   need(api.driver_get_properties, "cuFileDriverGetProperties");
   need(api.handle_register, "cuFileHandleRegister");
   need(api.handle_deregister, "cuFileHandleDeregister");
-  need(api.buf_register, "cuFileBufRegister");
-  need(api.buf_deregister, "cuFileBufDeregister");
   need(api.read, "cuFileRead");
   need(api.write, "cuFileWrite");
   if (!complete) { return std::nullopt; }
@@ -103,6 +120,15 @@ std::optional<cufile_api> cufile_api::resolve_symbols(symbol_resolver resolver,
   auto resolve_optional = [&](auto& member, char const* name) noexcept {
     return resolve(member, resolver, context, name);
   };
+  bool const has_register = resolve_optional(api.buf_register, "cuFileBufRegister");
+  bool const has_deregister = resolve_optional(api.buf_deregister, "cuFileBufDeregister");
+  if (!has_register || !has_deregister) {
+    api.buf_register = nullptr;
+    api.buf_deregister = nullptr;
+  }
+  std::ignore = resolve_optional(api.get_size_parameter, "cuFileGetParameterSizeT");
+  std::ignore = resolve_optional(api.get_bool_parameter, "cuFileGetParameterBool");
+  std::ignore = resolve_optional(api.get_string_parameter, "cuFileGetParameterString");
   api.has_async_read  = resolve_optional(api.read_async, "cuFileReadAsync");
   api.has_async_write = resolve_optional(api.write_async, "cuFileWriteAsync");
 
@@ -187,8 +213,22 @@ std::size_t cufile_api::abi_size() noexcept { return sizeof(cufile_api); }
 
 cufile_api const* cufile_api::get() noexcept
 {
-  auto const& loaded = library();
-  return loaded.api.has_value() ? &*loaded.api : nullptr;
+  if (auto const* substitute = api_for_testing.load(std::memory_order_acquire);
+      substitute != nullptr) {
+    return substitute;
+  }
+  return loaded();
+}
+
+std::uint64_t cufile_api::generation() noexcept
+{
+  return api_generation.load(std::memory_order_acquire);
+}
+
+cufile_api const* cufile_api::loaded() noexcept
+{
+  auto const& library_state = library();
+  return library_state.api.has_value() ? &*library_state.api : nullptr;
 }
 
 driver_open_state& driver_open_state::process() noexcept
@@ -231,7 +271,16 @@ driver_open_state::result driver_open_state::transaction::open(cufile_api const*
   return _state._result;
 }
 
-bool cufile_api::open_driver() noexcept { return driver_open_state::process().open(get()); }
+bool cufile_api::open_driver() noexcept
+{
+  if (auto* substitute = api_for_testing.load(std::memory_order_acquire); substitute)
+    return substitute->driver_open && substitute->driver_open().err == CU_FILE_SUCCESS;
+  return open_loaded_driver();
+}
+bool cufile_api::open_loaded_driver() noexcept
+{
+  return driver_open_state::process().open(loaded());
+}
 
 int cufile_api::version() noexcept
 {

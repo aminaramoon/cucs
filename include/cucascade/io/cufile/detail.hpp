@@ -28,18 +28,36 @@
 #include <cucascade/io/cufile/platform.hpp>
 
 #include <cuda_runtime_api.h>
-
+#include <memory>
+#include <cstdint>
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
-#include <memory>
+#include <optional>
+
+namespace cucascade::io::cufile {
+struct cufile_api;
+}  // namespace cucascade::io::cufile
 
 namespace cucascade::io::cufile::detail {
-
 [[nodiscard]] std::uint64_t submit_fence_records_for_testing() noexcept;
 
 /// Lease a portable 16 MiB scratch; return to the process pool, never cudaFreeHost.
 [[nodiscard]] std::shared_ptr<void> lease_pinned_scratch();
+
+
+
+/// Serve every cuFile call of the process from @p api instead of libcufile
+/// (null restores libcufile), so tests can script reads, failures and short
+/// returns.  Process-wide; install it before opening the objects it should
+/// serve and remove it after they are closed, since handles registered by one
+/// table mean nothing to the other.  @c cufile_api::open_driver() then reports
+/// @p api's @c driver_open outcome.
+void set_cufile_api_for_testing(cufile_api const* api) noexcept;
+
+/// Make @c gds_available() report @p value (unset restores the platform probe),
+/// so tests can run automatic staging on a host without a GDS stack.
+/// Process-wide.
+void set_gds_available_for_testing(std::optional<bool> value) noexcept;
 
 /**
  * @brief The verdict of @ref probe_path from the evidence already in @p info.
@@ -71,6 +89,21 @@ void decide_path_capability(path_info& info) noexcept;
                                      std::size_t file_size,
                                      std::size_t max_op) noexcept;
 
+/**
+ * @brief How many @c cuFileRead calls a staged read of [@p begin, @p end) makes
+ *        into a slot of @p slot_bytes, absent short reads.
+ *
+ * Each call widens its piece to 4 KiB boundaries and covers at most
+ * @p slot_bytes; a piece reaching into the file's partial last block reads the
+ * aligned body and the tail separately, never past @p file_size.
+ *
+ * @pre end <= file_size; @p slot_bytes a multiple of 4 KiB.
+ */
+[[nodiscard]] std::size_t staged_calls(std::size_t begin,
+                                       std::size_t end,
+                                       std::size_t file_size,
+                                       std::size_t slot_bytes) noexcept;
+
 /// Let aligned device-write bodies use @c cuFileWrite even on a platform without
 /// a real GDS mode, so hosts without GDS still cover that path.  Process-wide.
 void set_cufile_writes_in_compat_for_testing(bool enabled) noexcept;
@@ -88,10 +121,6 @@ void set_copy_event_record_failure_for_testing(bool enabled) noexcept;
 
 /// @c cuFileWrite calls issued by every cuFile reactor so far.
 [[nodiscard]] std::size_t cufile_write_calls_for_testing() noexcept;
-
-/// Buffers currently registered with cuFile through the reactors' registration
-/// table (@c config::register_min_bytes).
-[[nodiscard]] std::size_t live_registrations_for_testing() noexcept;
 
 /// Run @p hook(@p arg) on the worker just before every @c cuFileRead /
 /// @c cuFileWrite call (null removes it).  Process-wide.
@@ -120,12 +149,5 @@ void before_engine_transfer_for_testing() noexcept;
 [[nodiscard]] cudaError_t delay_engine_copy_for_testing(cudaStream_t stream) noexcept;
 [[nodiscard]] bool engine_copy_record_failure_for_testing() noexcept;
 void observe_engine_completion_for_testing(completion_observation const&) noexcept;
-
-/// Whether [@p base, @p base + @p bytes) overlaps a live registration or a
-/// cuFile transfer in flight, as the registration table sees it.
-[[nodiscard]] bool transfer_tracked_for_testing(void const* base, std::size_t bytes) noexcept;
-
-/// Buffer registrations the reactors' registration table has created so far.
-[[nodiscard]] std::size_t registrations_created_for_testing() noexcept;
 
 }  // namespace cucascade::io::cufile::detail

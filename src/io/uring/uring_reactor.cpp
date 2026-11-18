@@ -356,6 +356,18 @@ struct io_slot {
   }
 };
 
+[[nodiscard]] range staged_physical_range(range logical,
+                                          std::size_t file_size,
+                                          bool use_odirect) noexcept
+{
+  if (!use_odirect) return logical;
+
+  auto const start = align_down(logical.offset, IO_BLOCK_SIZE);
+  auto const end =
+    std::min(align_up(logical.end(), IO_BLOCK_SIZE), align_up(file_size, IO_BLOCK_SIZE));
+  return end > start ? range{start, end - start} : range{start, 0};
+}
+
 void attach_common(uring_io_op& op,
                    std::shared_ptr<const io_object> const& object,
                    prepared_io_slice const& slice,
@@ -505,7 +517,7 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
     }
   };
 
-  for (auto const& piece : range_plan::split_write_range(slice.rng, granule)) {
+  for (auto const& piece : detail::split_write_range(slice.rng, granule)) {
     if (piece.empty()) continue;
     bool const body = is_granule_aligned(piece, granule);
     if (device) {
@@ -556,9 +568,7 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
 
     bool const direct = detail::odirect_available(cfg.use_odirect, file->odirect_handle()) &&
                         block_size % IO_BLOCK_SIZE == 0;
-    auto const physical =
-      direct ? range_plan::staged_physical_range(slice.rng, IO_BLOCK_SIZE, file->size())
-             : slice.rng;
+    auto const physical = staged_physical_range(slice.rng, file->size(), direct);
     if (physical.empty()) {
       throw std::out_of_range("uring_reactor: staged range is outside the object");
     }
@@ -951,7 +961,7 @@ std::size_t uring_reactor::host_write(local_io_object const& file,
 
   bool const direct_fd = detail::odirect_available(_config.use_odirect, file.odirect_handle());
   auto const granule   = write_granule();
-  for (auto const& piece : range_plan::split_write_range(range{offset, bytes}, granule)) {
+  for (auto const& piece : detail::split_write_range(range{offset, bytes}, granule)) {
     if (piece.empty()) continue;
     auto const* src   = source + (piece.offset - offset);
     bool const direct = direct_fd && is_granule_aligned(piece, granule) && is_block_aligned(src);
@@ -1080,6 +1090,17 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
     std::vector<int> staging;
     staging.reserve(slot_count);
     std::vector<std::unique_ptr<uring_io_op>> pending;
+    // Device-write slices whose source stream still had work queued when they
+    // were taken, oldest first: parked holding no staging slot (their D2H copies
+    // would otherwise reserve slots that cannot fill until the stream moves) and
+    // still counted in _queued_bytes, until the event recorded then has fired.
+    struct gated_write {
+      std::shared_ptr<const io_object> obj;
+      std::shared_ptr<grouped_coordinator> coordinator;
+      prepared_io_slice slice;
+      std::unique_ptr<cucascade::cuda::cuda_event> ready;
+    };
+    std::vector<gated_write> gated;
     std::unique_ptr<grouped_io_request> active;
     // A low-priority request set aside, part-expanded, while high requests run.
     // Holds at most one: only a low active request is parked, and it is resumed
@@ -1520,6 +1541,115 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
       }
     };
 
+    // An event marking the work queued on @p slice's source stream before now,
+    // or null when that work has finished.  The legacy default stream orders
+    // after every blocking stream, which a query of it does not report, so it is
+    // checked through the event.
+    auto write_gate = [&](prepared_io_slice const& slice)
+      -> std::unique_ptr<cucascade::cuda::cuda_event> {
+      int device = slice.d_buffer.device_id;
+      if (device < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device)); }
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+      auto const stream = slice.d_buffer.stream.get();
+      bool const legacy = stream == nullptr || stream == cudaStreamLegacy;
+      if (!legacy) {
+        auto const state = cudaStreamQuery(stream);
+        if (state == cudaSuccess) return nullptr;
+        std::ignore = cudaGetLastError();
+        if (state != cudaErrorNotReady) {
+          throw cucascade::cuda_error(std::string{"uring_reactor: cudaStreamQuery failed: "} +
+                                      cudaGetErrorString(state));
+        }
+      }
+      auto event = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
+      CUCASCADE_CUDA_TRY(cudaEventRecord(event->get(), legacy ? cudaStreamLegacy : stream));
+      if (legacy) {
+        auto const state = event->query_raw_status();
+        if (state == cudaSuccess) return nullptr;
+        std::ignore = cudaGetLastError();
+        if (state != cudaErrorNotReady) {
+          throw cucascade::cuda_error(std::string{"uring_reactor: cudaEventQuery failed: "} +
+                                      cudaGetErrorString(state));
+        }
+      }
+      return event;
+    };
+
+    // Plan @p slice into pending (empty on entry: pending ops share one slice).
+    auto plan_into_pending = [&](std::shared_ptr<const io_object> const& obj,
+                                 prepared_io_slice const& slice,
+                                 std::shared_ptr<grouped_coordinator> const& coordinator,
+                                 std::size_t backlog) {
+      auto planned = plan_slice(obj,
+                                slice,
+                                coordinator,
+                                _config,
+                                _bounce_slot_size,
+                                backlog,
+                                available_slots.approx_free());
+      if (planned.empty()) {
+        throw std::logic_error("uring_reactor: slice produced no physical operations");
+      }
+      pending.reserve(pending.size() + planned.size());
+      for (auto it = planned.rbegin(); it != planned.rend(); ++it) {
+        pending.push_back(std::move(*it));
+      }
+      coordinator->add_tasks(planned.size() - 1);
+    };
+
+    // Settle a slice that never reached pending.
+    auto settle_unplanned = [](prepared_io_slice const& slice,
+                               grouped_coordinator& coordinator,
+                               grouped_coordinator::error_type error) noexcept {
+      if (slice.on_complete != nullptr) { (*slice.on_complete)(slice.h_buffer.fragments(), false); }
+      coordinator.report_error(std::move(error));
+    };
+
+    // With nothing pending, plan the oldest gated write whose stream is ready;
+    // settle the ones whose request stopped or whose gate failed.
+    auto release_gated = [&]() {
+      for (std::size_t i = 0; i < gated.size() && pending.empty();) {
+        auto& entry = gated[i];
+        auto status = cudaSuccess;
+        if (entry.coordinator->should_continue()) {
+          status = entry.ready->query_raw_status();
+          if (status == cudaErrorNotReady) {
+            ++i;
+            continue;
+          }
+        }
+        auto released = std::move(entry);
+        gated.erase(gated.begin() + static_cast<std::ptrdiff_t>(i));
+        _queued_bytes.fetch_sub(released.slice.size(), std::memory_order_relaxed);
+        if (!released.coordinator->should_continue()) {
+          settle_unplanned(released.slice, *released.coordinator, canceled_error());
+          continue;
+        }
+        if (status != cudaSuccess) {
+          std::ignore = cudaGetLastError();
+          settle_unplanned(released.slice, *released.coordinator, status);
+          continue;
+        }
+        try {
+          plan_into_pending(released.obj,
+                            released.slice,
+                            released.coordinator,
+                            _queued_bytes.load(std::memory_order_relaxed));
+          may_expand = true;
+        } catch (...) {
+          settle_unplanned(released.slice, *released.coordinator, std::current_exception());
+        }
+      }
+    };
+
+    auto cancel_gated = [&](grouped_coordinator::error_type const& error) noexcept {
+      for (auto& entry : gated) {
+        _queued_bytes.fetch_sub(entry.slice.size(), std::memory_order_relaxed);
+        settle_unplanned(entry.slice, *entry.coordinator, error);
+      }
+      gated.clear();
+    };
+
     auto dispatch_pending = [&]() {
       while (!pending.empty()) {
         auto& candidate = pending.back();
@@ -1640,6 +1770,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
           cancel_request(parked, canceled_error());
         }
 
+        release_gated();
         dispatch_pending();
         submit_prepared();
 
@@ -1671,22 +1802,16 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
             _queued_bytes.fetch_sub(slice.size(), std::memory_order_relaxed);
 
             try {
-              auto planned = plan_slice(active->obj,
-                                        slice,
-                                        active->coordinator,
-                                        _config,
-                                        _bounce_slot_size,
-                                        backlog,
-                                        available_slots.approx_free());
-              if (planned.empty()) {
-                throw std::logic_error("uring_reactor: slice produced no physical operations");
+              std::unique_ptr<cucascade::cuda::cuda_event> gate;
+              if (slice.is_write() && slice.has_device_request()) gate = write_gate(slice);
+              if (gate != nullptr) {
+                gated.reserve(gated.size() + 1);  // the push below then cannot throw
+                gated.push_back(
+                  gated_write{active->obj, active->coordinator, std::move(slice), std::move(gate)});
+                _queued_bytes.fetch_add(gated.back().slice.size(), std::memory_order_relaxed);
+              } else {
+                plan_into_pending(active->obj, slice, active->coordinator, backlog);
               }
-
-              pending.reserve(pending.size() + planned.size());
-              for (auto it = planned.rbegin(); it != planned.rend(); ++it) {
-                pending.push_back(std::move(*it));
-              }
-              active->coordinator->add_tasks(planned.size() - 1);
             } catch (...) {
               if (slice.on_complete != nullptr) {
                 (*slice.on_complete)(slice.h_buffer.fragments(), false);
@@ -1706,7 +1831,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         if (active == nullptr && pending.empty() && take_next()) continue;
 
         publish_gauges();
-        bool const copies_pending = !staging.empty() || !copying.empty();
+        bool const copies_pending = !staging.empty() || !copying.empty() || !gated.empty();
         if (inflight != 0) {
           may_expand = false;
           auto const timeout =
@@ -1717,8 +1842,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
           }
           reap_completions();
         } else if (copies_pending) {
-          // Nothing in the kernel; device copies on callers' streams are what
-          // remains.  Never block on them (a stalled caller stream would stall
+          // Nothing in the kernel; device copies on callers' streams (or writes
+          // gated on them) are what remains.  Never block on them (a stalled caller stream would stall
           // every request of this reactor): wait for a new request for one poll
           // interval instead, and let the next pass poll the copies.  Work that
           // waits for a slot backs off for the interval; an active request that
@@ -1761,6 +1886,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
       fatal_error != nullptr ? grouped_coordinator::error_type{fatal_error}
                              : grouped_coordinator::error_type{cancellation};
     cancel_pending(terminal_error);
+    cancel_gated(terminal_error);
     cancel_active(terminal_error);
     cancel_request(parked, terminal_error);
     cancel_queued(terminal_error);

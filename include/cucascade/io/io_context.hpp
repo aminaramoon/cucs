@@ -75,6 +75,16 @@ namespace cucascade::io {
  *
  * Holds resources that are shared across all datasources (cache, reactor
  * threads, ...). Extend this class to provide a concrete I/O backend.
+ *
+ * @warning A transfer's future settles on a reactor's worker thread, so a
+ *          continuation that runs inline there (e.g. through
+ *          @c exec::inline_executor) may drop the last reference to the ioctx.
+ *          A worker cannot join itself: a @c templated_ioctx destroyed there
+ *          leaves its reactors to a detached thread that joins and destroys
+ *          them, so whatever they borrow must outlive them, and an armed
+ *          prefetching cache must already be shut down (see
+ *          @ref shutdown_cache).  Keeping a reference elsewhere until the
+ *          continuation has run avoids both.
  */
 class ioctx : public std::enable_shared_from_this<ioctx> {
  public:
@@ -302,10 +312,10 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// (e.g. a parquet footer) park it here so a later scan of the same
   /// path can skip the parse without depending on whether the
   /// prefetching machinery has been wired up.
-  [[nodiscard]] cache::metadata_store& metadata_store() noexcept { return _metadata_store; }
+  [[nodiscard]] cache::metadata_store& metadata_store() noexcept { return *_metadata_store; }
   [[nodiscard]] cache::metadata_store const& metadata_store() const noexcept
   {
-    return _metadata_store;
+    return *_metadata_store;
   }
 
   // -- Physical range alignment ------------------------------------------------
@@ -499,26 +509,19 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// read instead of resolving with bytes that were never written to the
   /// destination (the uring and cuFile backends fail it with a @c std::system_error
   /// of @c std::errc::io_error; another backend may report its own exception type).
-  /// With a cuFile context whose async_engine.mode != legacy, any device-only
-  /// read on an original non-PTDS stream may resolve enqueued rather than
-  /// host-complete: all I/O results are validated, copies are enqueued, and a
-  /// join is inserted into the caller's stream at a potentially later point.
-  /// Routing is dynamic; callers cannot infer completion semantics per slice.
-  /// Synchronize or wait on that stream before host or foreign-stream access,
-  /// keeping destinations valid through that wait. Do not capture that stream
-  /// in a CUDA graph while a read is in flight: the reaper inserts the join
-  /// from another thread. A later copy failure cannot revoke early success;
-  /// observe CUDA stream/context errors when synchronizing.
-  /// Legacy contexts and original cudaStreamPerThread (PTDS) callers remain
-  /// host-complete. Compat/POSIX fallback may give that stronger guarantee too.
-  /// Failed or cancelled work drains before its outstanding credits settle;
-  /// an already-successful enqueued read may still retain internal resources.
+  /// It settles only once every
+  /// slice has stopped touching its destination -- a failed or cancelled slice
+  /// does not settle the future while a sibling is still writing.  On success
+  /// the bytes are in place: no further synchronization of @p stream is needed
+  /// to finish the read (ordering later consumer work is the caller's
+  /// business).  The destinations must stay valid until the future settles.
   ///
-  /// @note AM-1 migration audit (engine stays off by default): synchronize
-  /// host-complete assumptions in src/cudf/disk_io.cpp's read path,
-  /// check_transferred, the benchmarks, datasource.hpp's scalar/vector contracts,
-  /// and test_cufile_reactor.cpp's
-  /// complete-at-resolve test (formerly line 660). No cudf caller is changed here.
+  /// Exception: a cuFile context with async_engine.mode != legacy may return a
+  /// successful device-only read once copies are enqueued and joined onto the
+  /// original non-PTDS stream. Keep destinations alive and synchronize that
+  /// stream before host or foreign-stream access. Do not graph-capture it while
+  /// reads are in flight; late copy errors surface at stream synchronization.
+  /// Original PTDS callers and legacy/POSIX fallback remain host-complete.
   virtual exec::semi_future<size_t> device_readv_async_io(
     const io_object& obj,
     std::span<const slice> slices,
@@ -602,8 +605,10 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// reactors stay alive while workers drain).
   std::unique_ptr<cache::fs_cache> _cache;
 
-  /// Independent of the prefetching machinery — exposed via @c metadata_store().
-  cache::metadata_store _metadata_store;
+  /// Independent of the prefetching machinery — exposed via @c metadata_store().  Shared with
+  /// the completions of asynchronous writes, which can outlive the ioctx (see
+  /// @c ~templated_ioctx).
+  std::shared_ptr<cache::metadata_store> _metadata_store{std::make_shared<cache::metadata_store>()};
 
  private:
   /// Shared body of the asynchronous write forms: validate, build the write
@@ -622,7 +627,7 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Stamp a freshly opened object with its path's metadata epoch.
   std::shared_ptr<io_object> stamped(std::shared_ptr<io_object> object) noexcept
   {
-    if (object != nullptr) _metadata_store.stamp(*object);
+    if (object != nullptr) _metadata_store->stamp(*object);
     return object;
   }
 };

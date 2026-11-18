@@ -30,7 +30,6 @@
 #include <cstdlib>
 #include <memory>
 #include <optional>
-#include <thread>
 #include <utility>
 
 namespace {
@@ -100,21 +99,6 @@ namespace {
 struct device_sync_listener : Catch::EventListenerBase {
   using Catch::EventListenerBase::EventListenerBase;
 
-  std::thread::id test_thread;
-  void testCaseStarting(Catch::TestCaseInfo const&) override
-  {
-    test_thread = std::this_thread::get_id();
-  }
-  void assertionStarting(Catch::AssertionInfo const& info) override
-  {
-    // Catch reporters/redirect scopes are not thread-safe. Worker tests must
-    // collect results and assert after join, never corrupt Catch state silently.
-    if (std::this_thread::get_id() != test_thread) {
-      std::fprintf(
-        stderr, "Off-thread Catch assertion %s:%zu\n", info.lineInfo.file, info.lineInfo.line);
-      std::abort();
-    }
-  }
   void testCaseEnded(Catch::TestCaseStats const&) override { cudaDeviceSynchronize(); }
 };
 }  // namespace

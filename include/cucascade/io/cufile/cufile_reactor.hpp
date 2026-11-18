@@ -42,10 +42,10 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace cucascade::io::cufile {
-
 struct mount_identity;
 struct file_async_policy;
 struct mount_policy_key;
@@ -54,6 +54,8 @@ class device_engine;
 class file_write_state;
 class device_arena;
 class cufile_transport;
+
+
 
 // ---------------------------------------------------------------------------
 // cufile_io_object
@@ -152,6 +154,7 @@ class cufile_io_object final : public io_object {
   mutable std::atomic<bool> _mount_identity_ready{false};
   mutable std::unique_ptr<mount_identity> _mount_identity;
   mutable std::shared_ptr<file_async_policy> _async_policy;
+
 };
 
 // ---------------------------------------------------------------------------
@@ -159,24 +162,102 @@ class cufile_io_object final : public io_object {
 // ---------------------------------------------------------------------------
 
 /**
+ * @brief Where a cuFile reactor runs: the GPU it mainly serves, the CPUs its
+ *        worker is pinned to, and the NUMA node its host scratch comes from.
+ */
+struct reactor_placement {
+  int device{-1};         ///< Home GPU (CUDA ordinal); -1 = serves any device.
+  std::vector<int> cpus;  ///< CPUs the worker is pinned to; empty = not pinned.
+  int numa_node{-1};      ///< The home GPU's NUMA node; -1 = unknown.
+};
+
+/**
+ * @brief How a cuFile reactor (or a pool, summed) served its reads and the
+ *        cuFile parts of its writes.
+ *
+ * Counted when a transfer settles successfully, except @c cufile_failures and
+ * @c parked_slices.  A test or a deployment check can tell from them which path
+ * served the bytes: a GDS-capable file whose device reads all land in
+ * @c posix_device_bytes is not using cuFile at all.
+ */
+struct reactor_stats {
+  std::uint64_t staged_reads{0};  ///< Device reads cuFile served into a staging slot (+ scatter).
+  std::uint64_t staged_bytes{0};  ///< Their bytes.
+  /// Of @c staged_reads, those read before the caller's stream had finished the
+  /// work queued ahead of them (only their scatter copy waited for it).
+  std::uint64_t early_staged_reads{0};
+  /// Caller slices served through fused staged reads (several per read).
+  std::uint64_t fused_slices{0};
+  std::uint64_t direct_reads{0};        ///< Device reads cuFile served into the destination.
+  std::uint64_t direct_bytes{0};        ///< Their bytes.
+  std::uint64_t posix_device_reads{0};  ///< Device reads served by POSIX + host-to-device copy.
+  std::uint64_t posix_device_bytes{0};  ///< Their bytes.
+  std::uint64_t host_reads{0};          ///< Host-only reads.
+  std::uint64_t host_bytes{0};          ///< Their bytes.
+  std::uint64_t cufile_failures{0};     ///< cuFile errors that sent a transfer to POSIX.
+  std::uint64_t parked_slices{0};       ///< Device slices that waited for their stream to start.
+  /// Device-write bodies cuFile wrote from a staging slot (after a device copy).
+  std::uint64_t staged_writes{0};
+  std::uint64_t staged_write_bytes{0};  ///< Their bytes.
+  /// Device-write bodies cuFile wrote from the caller's source directly.
+  std::uint64_t direct_writes{0};
+  std::uint64_t direct_write_bytes{0};  ///< Their bytes.
+
+  reactor_stats& operator+=(reactor_stats const& other) noexcept
+  {
+    staged_reads += other.staged_reads;
+    staged_bytes += other.staged_bytes;
+    early_staged_reads += other.early_staged_reads;
+    fused_slices += other.fused_slices;
+    direct_reads += other.direct_reads;
+    direct_bytes += other.direct_bytes;
+    posix_device_reads += other.posix_device_reads;
+    posix_device_bytes += other.posix_device_bytes;
+    host_reads += other.host_reads;
+    host_bytes += other.host_bytes;
+    cufile_failures += other.cufile_failures;
+    parked_slices += other.parked_slices;
+    staged_writes += other.staged_writes;
+    staged_write_bytes += other.staged_write_bytes;
+    direct_writes += other.direct_writes;
+    direct_write_bytes += other.direct_write_bytes;
+    return *this;
+  }
+};
+
+/**
  * @brief Single-threaded local-file I/O reactor that speaks cuFile / GDS.
  *
  * Owns one worker thread and a two-tier request queue (see @ref io_priority).
- * A contiguous device destination of at least @ref config::gds_threshold bytes
- * is served by synchronous @c cuFileRead calls of at most
- * @ref config::max_op_bytes each, issued on the worker once the work already
- * queued on the caller's stream has finished (so a stream-ordered allocation or
- * a kernel still using the buffer is never overwritten); the read completes
- * host-observed, like every other backend.  Everything else (host reads, small
- * reads, dual host+device requests) falls back to POSIX @c pread on the
- * buffered fd, with a host-to-device copy when a device destination was also
- * requested.  A cuFile read that fails degrades to the same fallback instead of
- * failing the read.
+ * The worker keeps one storage read in flight, so a pool's queue depth per GPU
+ * is the number of reactors serving it (see @c cufile_ioctx and
+ * @c plan_cufile_pool).
+ *
+ * Device destinations of at least @ref config::gds_threshold bytes of a file
+ * registered with cuFile are read by synchronous @c cuFileRead calls:
+ * - staged (see @ref staging): the range is widened to 4 KiB boundaries and read
+ *   with one call per @ref config::staging_piece_bytes into a registered, aligned
+ *   slot the reactor holds, then the wanted bytes are copied device-to-device into
+ *   the destination.  Only that copy has to follow the work queued on the
+ *   caller's stream before the read: when the stream is still busy, a one-piece
+ *   read is issued at once into a spare slot and its copy waits on the GPU
+ *   (@c cudaStreamWaitEvent), so the I/O overlaps the caller's compute.
+ * - direct: cuFile reads into the destination itself, after the caller's
+ *   stream has finished the work queued before the call; cuFile bounces an
+ *   unaligned or unregistered read through its own buffers.
+ * Everything else (host reads, small reads, dual host+device requests, files
+ * cuFile does not serve) falls back to POSIX @c pread, with a host-to-device copy
+ * when a device destination was also requested.  A cuFile read that fails
+ * degrades to that fallback instead of failing the read.
  *
  * Writes (on objects from @ref create_io_object_for_write) are split at the
  * write granule like the uring reactor's: the granule-aligned body of a device
  * source of at least @ref config::gds_threshold bytes goes to synchronous
- * @c cuFileWrite calls (after the work queued on the source's stream), while
+ * @c cuFileWrite calls (after the work queued on the source's stream) --
+ * staged like a read when the reactor holds slots on the source's GPU: copied
+ * device-to-device into a registered slot a piece at a time and written from
+ * there, so cuFile can DMA it rather than bounce the unregistered source --
+ * while
  * the sub-granule head and tail, smaller bodies and host sources are written
  * with @c pwrite -- O_DIRECT for aligned pieces, buffered otherwise -- device
  * bytes being staged through the reactor's pinned scratch by D2H copies.  A
@@ -188,55 +269,52 @@ class cufile_io_object final : public io_object {
  * transiently occupy the page cache (clean and reclaimable once written back;
  * durability still needs a flush).
  * Host-only reads go O_DIRECT, through the scratch when not block-aligned.  A
- * flush is an @c fdatasync.  On a platform where cuFile
+ * flush is an @c fdatasync.  A transfer's pinned host scratch is borrowed from
+ * the HOST memory space pool of the reactor's NUMA node when one is registered
+ * (@c memory::find_host_pool), so it counts against that space only while the
+ * transfer runs; otherwise the reactor keeps scratch of its own.  On a platform where cuFile
  * runs only in compatibility mode (@c probe_platform().compat_only) aligned
  * device bodies are staged too: cuFile then bounces through host memory itself,
  * and its 1 MiB writes measured about half as fast as the staged path when they
  * extend a file.
  *
- * This legacy reactor deliberately uses the synchronous API. Async cuFile keeps
- * per-stream state that this reactor does not own. Compat behaviour is version-dependent:
- * libcufile 1.17 submits asynchronously on the development host (AM-10), so compat mode
- * alone must not be interpreted as evidence of blocking async submission.
+ * The synchronous API is deliberate (it is what NVIDIA's own consumers use, with
+ * one thread per read in flight): @c cuFileReadAsync serialises a stream's
+ * operations, runs synchronously in the submitting thread in compatibility mode,
+ * and keeps per-stream state keyed by caller stream handles the reactor neither
+ * registers nor deregisters.
+ *
+ * Ordering against the caller's stream: @c cufile_ioctx records, on the
+ * submitting thread, an event on the caller's stream (@c device_buffer::ready_gate)
+ * and the worker waits on that event, never on the stream handle itself (a
+ * per-thread default stream names a different stream on the worker).  A slice
+ * without one (enqueued on the reactor directly) has its stream checked on the
+ * worker at dispatch, the null stream meaning the legacy default stream.  A
+ * device slice that must wait is parked rather than blocking the worker; parked
+ * slices hold nothing and never stop the reactor from serving other requests.
  *
  * The worker takes a high-priority request before a low one and parks an active
  * low request at a slice boundary while high requests wait.  Priority is bounded
  * (see @ref config::low_service_interval) so waiting low work is never starved.
  *
- * A device slice never blocks the worker on its caller's stream: when work is
- * still queued there, the slice is parked behind an event recorded at dispatch
- * and served once that event completed, while the worker keeps serving other
- * requests.  Staging copies then run on a reactor-owned stream per device.
- *
- * Legacy completion (mode=legacy, the default): a request's future settles only
- * once every one of its slices has
+ * Completion: a request's future settles only once every one of its slices has
  * stopped touching its destination (or, for a write, its source), failed and
  * cancelled siblings included.  cuFile and POSIX transfers are synchronous on
- * the worker; staging copies run on a reactor-owned stream and are
+ * the worker; scatter and staging copies run on reactor-owned streams and are
  * host-complete (their event completed) before their slice settles; a parked or
  * cancelled slice settles without having issued anything.  The bytes of a
  * successful read are therefore visible from any stream without further CUDA
  * synchronization; the caller owns the destination (or source) memory until the
  * future settles.
  *
- * With async_engine.mode != legacy, device-only reads may resolve enqueued and
- * joined onto the caller stream; routing is dynamic, so always synchronize that
- * stream before host/foreign-stream access. Original PTDS callers remain
- * host-complete. Do not graph-capture a stream with a read in flight. The reaper
- * inserts joins later, from another thread; late copy errors surface at CUDA
- * synchronization and cannot revoke an early success.
- * Facade shutdown cancels pending engine pieces and waits for retirement tickets,
- * not early futures. See io_context.hpp for the destination lifetime contract.
- *
  * Fragmented (cache-chunk) destinations are not served: the reactor's pinned
  * scratch is not shaped like cache chunks, so it opts out of the prefetching
  * cache (@c reactor_traits::supports_vector_host_read is false).
  *
- * @note By default the reactor does not register device buffers with cuFile
- *       (see @ref config::register_min_bytes).  Per cuFile, an unregistered
- *       buffer is bounced through cuFile's own GPU buffers rather than DMA'd
- *       peer to peer; NVIDIA advises against registering a one-shot destination,
- *       and in compatibility mode registration buys nothing measurable.
+ * @note Destinations and sources are never registered: registering a one-shot
+ *       buffer costs about as much as reading it, and its 4 KiB phase rarely
+ *       matches the file offset anyway.  The staging slots are registered once and reused by the
+ *       whole process (see @c reserve_staging).
  *
  * @note Known gap: a device read below @ref config::gds_threshold, or of a file
  *       without a cuFile handle, is a synchronous @c pread plus H2D copy, so a
@@ -249,14 +327,23 @@ class cufile_reactor {
  public:
   /// A read here is a syscall against NVMe (POSIX fallback) or a synchronous
   /// cuFile call (GDS fast path); batching either buys little.
-  static constexpr bool prefers_bulk_io    = false;
+  static constexpr bool prefers_bulk_io = false;
   static constexpr bool wants_submit_fence = true;
 
-  /// Shared immutable configuration and asynchronously published per-device engines.
-  /// Bindings appear only after control-thread warm-up; legacy contexts never create them.
+  /// Shared, immutable config for a pool of reactors.  A dedicated type so a
+  /// future iteration can add shared state (a registered-buffer cache, a stream
+  /// registry, ...) without changing the reactor constructor's shape.
   class reactor_context : public std::enable_shared_from_this<reactor_context> {
    public:
-    explicit reactor_context(config cfg) : _config(cfg) {}
+    explicit reactor_context(config cfg) : _config(std::move(cfg)) {}
+
+    /// @p staging_caps: registered-staging cap per device (bytes, indexed by
+    /// device id, 0 = none), as a pool plan bounded it by BAR1 and cuFile's
+    /// pinned-memory limit; devices past its end use the config's cap.
+    reactor_context(config cfg, std::vector<std::size_t> staging_caps)
+      : _config(std::move(cfg)), _staging_caps(std::move(staging_caps))
+    {
+    }
 
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
 
@@ -278,13 +365,23 @@ class cufile_reactor {
     void ensure_engine(int device) noexcept;
     void notify_engines() const noexcept;
 
+    /// The registered-staging cap of @p device, in bytes (0 = none).
+    [[nodiscard]] std::size_t staging_cap(int device) const noexcept
+    {
+      auto const index = static_cast<std::size_t>(device);
+      return device >= 0 && index < _staging_caps.size() ? _staging_caps[index]
+                                                         : _config.max_staging_bytes_per_device;
+    }
+
    private:
     config _config;
+    std::vector<std::size_t> _staging_caps;
     mutable std::mutex _engine_mutex;
     using engine_bindings = std::vector<std::shared_ptr<engine_binding>>;
     std::atomic<std::shared_ptr<const engine_bindings>> _engines;
     std::vector<int> _warming;
     std::atomic<bool> _simulated_engine{false};
+
   };
 
   using native_handle_type   = int;
@@ -293,7 +390,8 @@ class cufile_reactor {
   using reactor_context_type = reactor_context;
 
   explicit cufile_reactor(std::shared_ptr<reactor_context> ctx,
-                          std::string_view tname = "cufile_reactor");
+                          std::string_view tname      = "cufile_reactor",
+                          reactor_placement placement = {});
 
   ~cufile_reactor();
 
@@ -327,10 +425,7 @@ class cufile_reactor {
   /// cancelled at once; a transfer already running finishes its current piece.
   /// The pinned scratch goes back to a process-wide pool rather than to
   /// @c cudaFreeHost, which would synchronize the device and make shutdown wait
-  /// for other callers' GPU work. Opt-in engine pieces use per-facade cancellation
-  /// and retirement tickets; a 30-second incomplete drain is logged, retaining all
-  /// live resources in the shared engine. The engine itself is never stopped here.
-  /// Idempotent; a repeated shutdown retries an incomplete engine drain.
+  /// for other callers' GPU work.  Idempotent.
   void shutdown();
 
   /// Synchronous buffered host read (pread on the buffered fd).  Blocks the
@@ -343,11 +438,25 @@ class cufile_reactor {
 
   void enqueue(std::unique_ptr<grouped_io_request> request) noexcept;
 
-  /// Approximate bytes not yet dispatched to a physical operation.
+  /// Approximate bytes queued on this reactor plus those of the transfer its worker is running
+  /// (a transfer is synchronous on the worker, so the reactor is busy until it is done).  Slices
+  /// parked behind a busy stream are not counted.
   [[nodiscard]] std::size_t queued_bytes() const noexcept
   {
     return _queued_bytes.load(std::memory_order_relaxed);
   }
+
+  /// Whether the calling thread is this reactor's worker.
+  [[nodiscard]] bool on_worker_thread() const noexcept
+  {
+    return _worker.get_id() == std::this_thread::get_id();
+  }
+
+  /// How this reactor has served its reads so far (relaxed snapshot).
+  [[nodiscard]] reactor_stats stats() const noexcept;
+
+  /// The GPU this reactor mainly serves and the CPUs its worker is pinned to.
+  [[nodiscard]] reactor_placement const& placement() const noexcept { return _placement; }
 
   /// Whether @p path can be served by this reactor: true iff it names an
   /// existing, accessible regular file.  Routing between this and the uring
@@ -424,8 +533,9 @@ class cufile_reactor {
     std::optional<std::size_t> alignment = std::nullopt) noexcept;
 
  private:
-  /// A device-only slice parked until the work queued on its stream before
-  /// dispatch has finished (@c event fires).
+  /// A device-only slice parked until the work queued on its stream before the
+  /// read has finished (@c gate fires): the submission-time event, or one the
+  /// worker recorded at dispatch for a slice that came without one.
   struct pending_write {
     std::shared_ptr<const io_object> obj;
     prepared_io_slice slice;
@@ -441,8 +551,15 @@ class cufile_reactor {
     std::shared_ptr<const io_object> obj;
     prepared_io_slice slice;
     std::shared_ptr<grouped_coordinator> coordinator;
-    cucascade::cuda::cuda_event event;
+    std::shared_ptr<cucascade::cuda::cuda_event> gate;
   };
+
+  /// Registered staging slots and their copy streams for one device (defined in
+  /// the source).
+  struct device_staging;
+
+  /// Where a slice stands against the work queued on its caller's stream.
+  enum class gate_state : std::uint8_t { ready, pending, unchecked };
 
   /// A non-blocking stream owned by the reactor, destroyed with it.
   struct owned_stream {
@@ -496,32 +613,70 @@ class cufile_reactor {
   void dispatch_slice(std::shared_ptr<const io_object> const& obj,
                       prepared_io_slice slice,
                       std::shared_ptr<grouped_coordinator> const& coordinator,
-                      bool stream_ready               = false,
-                      bool* handed_off                = nullptr,
+                      bool stream_ready = false,
+                      bool* handed_off = nullptr,
                       engine_publication* publication = nullptr) noexcept;
 
   /// When the slice's stream still has queued work, record an event on it and
-  /// park the slice in @ref _waiting; returns whether it was parked.
+  /// park the slice in @ref _waiting; returns whether it was parked.  For a slice
+  /// enqueued without a submission-time gate only.
   /// @throws cucascade::cuda_error when the stream cannot be queried / recorded.
   [[nodiscard]] bool park_if_stream_busy(std::shared_ptr<const io_object> const& obj,
                                          prepared_io_slice& slice,
                                          std::shared_ptr<grouped_coordinator> const& coordinator);
 
+  /// Where @p slice stands against its submission-time gate (@c unchecked when it
+  /// has none).  @throws cucascade::cuda_error when the gate cannot be queried.
+  [[nodiscard]] static gate_state gate_of(prepared_io_slice const& slice);
+
+  /// Park @p slice until its submission-time gate fires.
+  void park_on_gate(std::shared_ptr<const io_object> const& obj,
+                    prepared_io_slice&& slice,
+                    std::shared_ptr<grouped_coordinator> const& coordinator);
+
+  /// This reactor's staging for @p device, set up on first use; null when
+  /// staging is off or no slot could be had.  The calling thread's current
+  /// device must be @p device.
+  [[nodiscard]] device_staging* staging_for(int device);
+
+  /// Read @p request's range through registered staging (see the class
+  /// comment).  @p gate_pending: the caller's stream had not reached the gate at
+  /// dispatch, so the scatter copy must wait on the GPU.  Returns true when
+  /// @p request was settled or handed to a pending copy, false when cuFile failed
+  /// and the caller must take the POSIX path for the whole range (by then the
+  /// gate has passed).
+  [[nodiscard]] bool read_cufile_staged(cufile_io_object const& file,
+                                        prepared_io_slice const& slice,
+                                        std::unique_ptr<io_op_request>& request,
+                                        device_staging& staging,
+                                        bool gate_pending);
+
   /// The reactor-owned stream of @p device_id for staging copies, created on
   /// first use.  The calling thread's current device must be @p device_id.
   [[nodiscard]] cudaStream_t copy_stream(int device_id);
 
-  /// Read @p request's range into the slice's device buffer with synchronous
-  /// @c cuFileRead calls, after the slice's stream has drained the work queued
-  /// before this call.  Returns true when @p request was settled (success or a
-  /// definite error), false when cuFile failed and the caller must take the
+  /// The reactor-owned stream of @p device_id for the copies of host+device
+  /// pairs, which wait there for their caller's gate: kept apart from
+  /// @ref copy_stream, which the worker synchronizes on, so a busy caller stream
+  /// never stalls the worker.  Created on first use, like @ref copy_stream.
+  [[nodiscard]] cudaStream_t pair_stream(int device_id);
+
+  /// The stream of @p device_id in @p streams, created non-blocking on first use.
+  [[nodiscard]] static cudaStream_t device_stream(std::vector<owned_stream>& streams,
+                                                  int device_id);
+
+  /// Read @p request's range straight into the slice's device buffer with
+  /// synchronous @c cuFileRead calls, once the slice's stream has drained the work
+  /// queued before the read.  Returns true when @p request was settled (success or
+  /// a definite error), false when cuFile failed and the caller must take the
   /// POSIX path for the whole range.
   [[nodiscard]] bool read_cufile(cufile_io_object const& file,
                                  prepared_io_slice const& slice,
                                  std::unique_ptr<io_op_request>& request);
 
   /// Serve a write slice: host sources by @c pwrite, device sources by
-  /// @c cuFileWrite for the aligned body and staged @c pwrite for the rest.
+  /// @c cuFileWrite for the aligned body (from a registered staging slot when
+  /// the reactor has one) and staged @c pwrite for the rest.
   void dispatch_write(cufile_io_object const& file,
                       prepared_io_slice const& slice,
                       io_op_request& request);
@@ -539,8 +694,28 @@ class cufile_reactor {
                                   std::uint8_t const* source,
                                   range piece);
 
-  /// The scratch, allocated on first use.
+  /// Write the 4 KiB-aligned @p piece from device memory @p source through a
+  /// free slot of @p staging: a device copy into the slot, then @c cuFileWrite
+  /// from it, a slot at a time.  Writes directly (@ref write_cufile) when no slot
+  /// is free.  Returns false when cuFile failed and the caller must stage the
+  /// piece through POSIX instead.
+  [[nodiscard]] bool write_cufile_staged(cufile_io_object const& file,
+                                         std::uint8_t const* source,
+                                         range piece,
+                                         device_staging& staging);
+
+  /// The reactor's own scratch, allocated on first use.
   [[nodiscard]] std::uint8_t* scratch();
+
+  /// Pinned host memory one transfer stages through (see @ref lease_scratch).
+  struct scratch_lease;
+
+  /// Up to @p slots slots of at least @p bytes each (capped at the scratch slot
+  /// size) for one transfer: borrowed from the HOST memory space pool of this
+  /// reactor's NUMA node (@c memory::find_host_pool), so the bytes count against
+  /// that space and are back in it before the transfer settles; or the reactor's
+  /// own scratch when no pool is registered or it cannot lend them.
+  [[nodiscard]] scratch_lease lease_scratch(std::size_t bytes, std::size_t slots);
 
   /// POSIX pread into the slice's host buffer, then the H2D copy when a device
   /// destination was asked for too; a device-only slice goes to
@@ -565,8 +740,13 @@ class cufile_reactor {
                           io_op_request& request);
 
   /// Dispatch every parked slice whose stream gate opened, then settle every
-  /// in-flight H2D copy whose CUDA event has completed.
+  /// in-flight H2D copy and staged scatter copy whose CUDA event has completed.
   void poll_completions() noexcept;
+
+  /// Settle every staged scatter copy whose event completed; with @p wait, wait
+  /// for each first and settle it with @p error (shutdown).  Then, with @p wait,
+  /// give every slot back to the process-wide pool.
+  void poll_staged(bool wait, grouped_coordinator::error_type const* error) noexcept;
 
   /// Synchronize and settle every outstanding copy with @p terminal_error, so no
   /// coordinator promise is stranded at shutdown.
@@ -575,9 +755,11 @@ class cufile_reactor {
   /// Settle every parked slice with @p error; nothing was issued for them.
   void cancel_waiting(grouped_coordinator::error_type const& error) noexcept;
 
+  /// Asynchronous items holding copy resources (see @ref config::max_inflight);
+  /// parked slices hold none and are not counted.
   [[nodiscard]] std::size_t inflight_count() const noexcept
   {
-    return _inflight_copy.size() + _waiting.size();
+    return _inflight_copy.size() + _staged_inflight;
   }
 
   struct engine_admission {
@@ -594,6 +776,29 @@ class cufile_reactor {
   std::shared_ptr<reactor_context> _ctx;
   reactor_config_type _config;
   std::string _tname;
+  reactor_placement _placement;
+
+  /// Transfer counters (see @ref reactor_stats); written by the worker, read by any
+  /// thread.
+  struct counters {
+    std::atomic<std::uint64_t> staged_reads{0};
+    std::atomic<std::uint64_t> staged_bytes{0};
+    std::atomic<std::uint64_t> early_staged_reads{0};
+    std::atomic<std::uint64_t> fused_slices{0};
+    std::atomic<std::uint64_t> direct_reads{0};
+    std::atomic<std::uint64_t> direct_bytes{0};
+    std::atomic<std::uint64_t> posix_device_reads{0};
+    std::atomic<std::uint64_t> posix_device_bytes{0};
+    std::atomic<std::uint64_t> host_reads{0};
+    std::atomic<std::uint64_t> host_bytes{0};
+    std::atomic<std::uint64_t> cufile_failures{0};
+    std::atomic<std::uint64_t> parked_slices{0};
+    std::atomic<std::uint64_t> staged_writes{0};
+    std::atomic<std::uint64_t> staged_write_bytes{0};
+    std::atomic<std::uint64_t> direct_writes{0};
+    std::atomic<std::uint64_t> direct_write_bytes{0};
+  };
+  counters _counters;
 
   std::stop_source _stop_source;
   std::jthread _worker;
@@ -622,10 +827,18 @@ class cufile_reactor {
   std::vector<pending_write> _write_waiting;
   /// Staging-copy streams, indexed by device id.
   std::vector<owned_stream> _copy_streams;
-  /// Pinned (portable) staging for device-only POSIX reads and writes, taken from
-  /// a process-wide pool on first use (so a reactor that never stages holds no
-  /// pinned memory) and given back at shutdown.
+  /// Gated pair-copy streams, indexed by device id.
+  std::vector<owned_stream> _pair_streams;
+  /// Pinned (portable) staging for device-only POSIX reads and writes and
+  /// unaligned host reads when no HOST memory space pool can lend it (see
+  /// @ref lease_scratch), taken from a process-wide pool on first use (so a
+  /// reactor that never stages holds no pinned memory) and given back to it at
+  /// shutdown.
   pinned_scratch _scratch;
+  /// Registered device staging, indexed by device id (null until first used).
+  std::vector<std::unique_ptr<device_staging>> _staging;
+  /// Staged scatter copies still waiting for their caller's stream.
+  std::size_t _staged_inflight{0};
 };
 
 }  // namespace cucascade::io::cufile

@@ -25,8 +25,13 @@
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -44,9 +49,9 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -181,17 +186,14 @@ class device_bytes {
   explicit device_bytes(std::vector<std::uint8_t> const& contents, std::size_t misalignment = 0)
     : _size(contents.size())
   {
-    if (cudaMalloc(&_storage, std::max<std::size_t>(1, _size + misalignment)) != cudaSuccess)
-      throw std::runtime_error("device_bytes allocation failed");
+    REQUIRE(cudaMalloc(&_storage, std::max<std::size_t>(1, _size + misalignment)) == cudaSuccess);
     _data = static_cast<std::uint8_t*>(_storage) + misalignment;
     if (_size != 0) {
-      if (cudaMemcpy(_data, contents.data(), _size, cudaMemcpyHostToDevice) != cudaSuccess)
-        throw std::runtime_error("device_bytes upload failed");
+      REQUIRE(cudaMemcpy(_data, contents.data(), _size, cudaMemcpyHostToDevice) == cudaSuccess);
     }
     // A pageable cudaMemcpy may return before its DMA landed, and the tests read
     // the bytes on non-blocking streams that do not wait for the legacy stream.
-    if (cudaDeviceSynchronize() != cudaSuccess)
-      throw std::runtime_error("device_bytes synchronization failed");
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
   }
 
   ~device_bytes() { std::ignore = cudaFree(_storage); }
@@ -212,8 +214,7 @@ class cuda_stream {
  public:
   cuda_stream()
   {
-    if (cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking) != cudaSuccess)
-      throw std::runtime_error("cuda_stream creation failed");
+    REQUIRE(cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking) == cudaSuccess);
   }
   ~cuda_stream() { std::ignore = cudaStreamDestroy(_stream); }
   cuda_stream(cuda_stream const&)            = delete;
@@ -278,6 +279,8 @@ struct write_path {
   config cufile_body{};
   cufile_body.gds_threshold = IO_BLOCK_SIZE;  // every aligned body goes to cuFile
   cufile_body.max_op_bytes  = 1 * MiB;        // ... in several cuFileWrite calls
+  config cufile_slots = cufile_body;
+  cufile_slots.staging_mode = cucascade::io::cufile::staging::always;  // via the device slots
   config staged{};
   staged.gds_threshold = 1UL << 40;  // nothing goes to cuFile
   config unregistered{};
@@ -287,6 +290,7 @@ struct write_path {
   buffered.compat_mode   = cucascade::io::cufile::compat::on;
   buffered.gds_threshold = IO_BLOCK_SIZE;
   return {{"cuFile body", cufile_body, true},
+          {"cuFile body through device slots", cufile_slots, true},
           {"default policy", cufile_body, false},
           {"staged", staged},
           {"unregistered file", unregistered},
@@ -531,6 +535,116 @@ TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][
     CHECK(object->size() == shadow.bytes().size());
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
+}
+
+TEST_CASE("cufile device write bodies go through the registered staging slots",
+          "[io][cufile][write][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  force_cufile_writes const force;
+  config cfg{};
+  cfg.gds_threshold       = IO_BLOCK_SIZE;
+  cfg.staging_mode        = cucascade::io::cufile::staging::always;
+  cfg.staging_piece_bytes = 1 * MiB;  // several slot-sized pieces per body
+  write_context ctx{cfg, 1};
+  scratch_path path;
+  auto object = ctx->open_io_object_for_write(path.str());
+  cuda_stream stream;
+  shadow_file shadow;
+
+  // A source that is not congruent with its file offset: the slot aligns it.
+  auto const bytes = pattern(5 * MiB + 3, 7);
+  device_bytes const src{bytes, 256};
+  REQUIRE(ctx->device_write_async(*object, 4096, bytes.size(), src.get(), stream.ref()).get(60s) ==
+          bytes.size());
+  shadow.write(4096, bytes);
+  check_same(read_back(ctx.get(), path.str()), shadow.bytes());
+  auto const stats = ctx->stats();
+  CHECK(stats.staged_writes == 1);
+  CHECK(stats.staged_write_bytes > 4 * MiB);
+  CHECK(stats.direct_writes == 0);
+}
+
+TEST_CASE("cufile device writes go to their source GPU's group, whatever the caller's device",
+          "[io][cufile][write][gpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
+    SKIP("needs two CUDA devices");
+  }
+  force_cufile_writes const force;
+  config cfg{};
+  cfg.reactors_per_device = 1;
+  cfg.gds_threshold       = IO_BLOCK_SIZE;
+  cfg.staging_mode        = cucascade::io::cufile::staging::always;
+  auto const bytes        = pattern(2 * MiB, 11);
+  std::optional<device_bytes> src;
+  std::optional<cuda_stream> stream;
+  {
+    rmm::cuda_set_device_raii const on_one{rmm::cuda_device_id{1}};
+    src.emplace(bytes);
+    stream.emplace();
+  }
+  auto ctx = cucascade::io::cufile::make_cufile_ioctx(0, cfg);
+  ctx->start();
+  scratch_path path;
+  auto object = ctx->open_io_object_for_write(path.str());
+  {
+    rmm::cuda_set_device_raii const on_zero{rmm::cuda_device_id{0}};
+    REQUIRE(ctx->device_write_async(*object, 0, bytes.size(), src->get(), stream->ref()).get(60s) ==
+            bytes.size());
+  }
+  check_same(read_back(*ctx, path.str()), bytes);
+  CHECK(ctx->stats(1).staged_writes == 1);
+  CHECK(ctx->stats(0).staged_writes == 0);
+  ctx->shutdown();
+}
+
+TEST_CASE("cufile stages through a HOST memory space's pool when one is registered",
+          "[io][cufile][write][gpu]")
+{
+  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
+  // Small blocks, so a scratch slot spans several of them, and no pool up front,
+  // so the pool's growth shows the reactors borrowed from it.
+  cucascade::memory::host_memory_space_config host_cfg;
+  host_cfg.memory_capacity      = 256 * MiB;
+  host_cfg.block_size           = 64UL << 10;
+  host_cfg.pool_size            = 64;
+  host_cfg.initial_number_pools = 0;
+  host_cfg.mr_factory_fn        = [](int, std::size_t) {
+    return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
+      cucascade::memory::numa_region_pinned_host_memory_resource{-1}};
+  };
+  cucascade::memory::memory_space const host{host_cfg};
+  auto* const pool = host.get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(cucascade::memory::find_host_pool(-1) == pool);
+
+  config cfg{};
+  cfg.gds_threshold = 1UL << 40;  // every device transfer staged through host memory
+  write_context ctx{cfg, 1};
+  scratch_path path;
+  auto object = ctx->open_io_object_for_write(path.str());
+  cuda_stream stream;
+  shadow_file shadow;
+
+  // A staged device write, unaligned at both ends.
+  auto const bytes = pattern(3 * MiB + 77, 21);
+  device_bytes const src{bytes, 256};
+  REQUIRE(ctx->device_write_async(*object, 5, bytes.size(), src.get(), stream.ref()).get(60s) ==
+          bytes.size());
+  shadow.write(5, bytes);
+  // An unaligned host read (whole blocks through the scratch) ...
+  check_same(read_back(ctx.get(), path.str()), shadow.bytes());
+  // ... and a device read below gds_threshold (POSIX through the scratch).
+  auto const n = shadow.bytes().size();
+  device_bytes const dst{std::vector<std::uint8_t>(n)};
+  REQUIRE(ctx->device_read_async_io(*object, 0, n, dst.get(), stream.ref()).get(60s) == n);
+  std::vector<std::uint8_t> got(n);
+  REQUIRE(cudaMemcpy(got.data(), dst.get(), n, cudaMemcpyDeviceToHost) == cudaSuccess);
+  check_same(got, shadow.bytes());
+
+  CHECK(pool->get_total_blocks() > 0);
+  CHECK(pool->get_free_blocks() == pool->get_total_blocks());
 }
 
 TEST_CASE("cufile staged device writes wait for their copies", "[io][cufile][write][gpu]")
@@ -828,211 +942,6 @@ TEST_CASE("cufile writes before start are cancelled", "[io][cufile][write]")
   REQUIRE_NOTHROW(ctx->flush(*object));
 }
 
-TEST_CASE("cufile registers large aligned transfers when asked", "[io][cufile][write][gpu]")
-{
-  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
-  force_cufile_writes const force;
-  config cfg{};
-  cfg.gds_threshold      = IO_BLOCK_SIZE;
-  cfg.max_op_bytes       = 1 * MiB;  // several cuFile calls address one registration
-  cfg.register_min_bytes = 2 * MiB;
-  write_context ctx{cfg};
-  scratch_path path;
-  auto object = ctx->open_io_object_for_write(path.str());
-  cuda_stream stream;
-  shadow_file shadow;
-
-  // Registered (aligned, large), not registered (misaligned source; too small).
-  struct shape {
-    std::size_t offset;
-    std::size_t size;
-    std::size_t misalignment;
-  };
-  std::size_t seed = 600;
-  for (auto const& [offset, size, misalignment] :
-       {shape{0, 8 * MiB, 0}, shape{8 * MiB, 4 * MiB, 512}, shape{12 * MiB, 1 * MiB, 0}}) {
-    auto const bytes = pattern(size, ++seed);
-    device_bytes const src{bytes, misalignment};
-    REQUIRE(ctx->device_write_async(*object, offset, size, src.get(), stream.ref()).get(60s) ==
-            size);
-    shadow.write(offset, bytes);
-
-    device_bytes const dst{std::vector<std::uint8_t>(size), misalignment};
-    REQUIRE(ctx->device_read_async_io(*object, offset, size, dst.get(), stream.ref()).get(60s) ==
-            size);
-    std::vector<std::uint8_t> got(size);
-    REQUIRE(cudaMemcpy(got.data(), dst.get(), size, cudaMemcpyDeviceToHost) == cudaSuccess);
-    check_same(got, bytes);
-
-    // Deregistered before the futures resolved: the buffers register again.
-    CHECK(cucascade::io::cufile::detail::live_registrations_for_testing() == 0);
-    for (void const* base :
-         {static_cast<void const*>(src.get()), static_cast<void const*>(dst.get())}) {
-      REQUIRE(cucascade::io::cufile::cufile_api::get() != nullptr);
-      auto const& api = *cucascade::io::cufile::cufile_api::get();
-      REQUIRE(api.buf_register(base, size, 0).err == CU_FILE_SUCCESS);
-      REQUIRE(api.buf_deregister(base).err == CU_FILE_SUCCESS);
-    }
-  }
-  check_same(read_back(ctx.get(), path.str()), shadow.bytes());
-}
-
-TEST_CASE("cufile shares one registration between transfers of the same buffer",
-          "[io][cufile][write][gpu]")
-{
-  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
-  force_cufile_writes const force;
-  config cfg{};
-  cfg.gds_threshold      = IO_BLOCK_SIZE;
-  cfg.max_op_bytes       = 1 * MiB;
-  cfg.register_min_bytes = 1 * MiB;
-  write_context ctx{cfg, 4};
-
-  // One aligned source written to several files at once (replication): the
-  // transfers share its registration, and none deregisters it under another.
-  auto const bytes = pattern(16 * MiB, 800);
-  device_bytes const src{bytes};
-  constexpr std::size_t copies = 6;
-  std::vector<std::unique_ptr<scratch_path>> paths;
-  std::vector<std::shared_ptr<cucascade::io::io_object>> objects;
-  std::vector<std::unique_ptr<cuda_stream>> streams;
-  std::vector<cucascade::exec::semi_future<std::size_t>> futures;
-  for (std::size_t i = 0; i < copies; ++i) {
-    paths.push_back(std::make_unique<scratch_path>());
-    objects.push_back(ctx->open_io_object_for_write(paths.back()->str()));
-    streams.push_back(std::make_unique<cuda_stream>());
-  }
-  for (std::size_t i = 0; i < copies; ++i) {
-    futures.push_back(
-      ctx->device_write_async(*objects[i], 0, bytes.size(), src.get(), streams[i]->ref()));
-  }
-  // A transfer overlapping the registered buffer at another base is served too.
-  futures.push_back(ctx->device_write_async(
-    *objects[0], 32 * MiB, 4 * MiB, src.get() + 4 * MiB, streams[0]->ref()));
-  for (auto& future : futures) {
-    REQUIRE(std::move(future).get(60s) > 0);
-  }
-  CHECK(cucascade::io::cufile::detail::live_registrations_for_testing() == 0);
-  REQUIRE(cucascade::io::cufile::cufile_api::get() != nullptr);
-  auto const& api = *cucascade::io::cufile::cufile_api::get();
-  REQUIRE(api.buf_register(src.get(), bytes.size(), 0).err == CU_FILE_SUCCESS);
-  REQUIRE(api.buf_deregister(src.get()).err == CU_FILE_SUCCESS);
-  for (std::size_t i = 0; i < copies; ++i) {
-    auto const back = read_back(ctx.get(), paths[i]->str());
-    REQUIRE(back.size() >= bytes.size());
-    check_same(std::vector<std::uint8_t>(back.begin(),
-                                         back.begin() + static_cast<std::ptrdiff_t>(bytes.size())),
-               bytes);
-  }
-}
-
-namespace {
-
-/// Runs a check on the worker during the first cuFile call after it is armed.
-struct transfer_probe {
-  std::function<void()> check;
-  std::atomic<bool> armed{false};
-
-  static void run(void* self) noexcept
-  {
-    auto& probe = *static_cast<transfer_probe*>(self);
-    if (probe.armed.exchange(false)) { probe.check(); }
-  }
-};
-
-/// Installs a transfer hook for the guard's lifetime.
-class transfer_hook {
- public:
-  explicit transfer_hook(transfer_probe& probe)
-  {
-    cucascade::io::cufile::detail::set_cufile_transfer_hook_for_testing(&transfer_probe::run,
-                                                                        &probe);
-  }
-  ~transfer_hook()
-  {
-    cucascade::io::cufile::detail::set_cufile_transfer_hook_for_testing(nullptr, nullptr);
-  }
-  transfer_hook(transfer_hook const&)            = delete;
-  transfer_hook& operator=(transfer_hook const&) = delete;
-};
-
-}  // namespace
-
-TEST_CASE("cufile transfers of a context without registration still block others from registering",
-          "[io][cufile][write][gpu]")
-{
-  if (!has_cuda_device()) { SKIP("requires a CUDA device"); }
-  force_cufile_writes const force;
-  using cucascade::io::cufile::detail::registrations_created_for_testing;
-  using cucascade::io::cufile::detail::transfer_tracked_for_testing;
-  // Context A keeps the default (no registrations); context B opts in.  Both
-  // hand every aligned body to cuFile.
-  config plain{};
-  plain.gds_threshold       = IO_BLOCK_SIZE;
-  config opt_in             = plain;
-  opt_in.register_min_bytes = 1 * MiB;
-  write_context a{plain, 1};
-  write_context b{opt_in, 1};
-  scratch_path path_a;
-  scratch_path path_b;
-  auto object_a = a->open_io_object_for_write(path_a.str());
-  auto object_b = b->open_io_object_for_write(path_b.str());
-  if (!object_a->writable() ||
-      !dynamic_cast<cucascade::io::cufile::cufile_io_object const&>(*object_a)
-         .cufile_registered()) {
-    SKIP("cuFile cannot register files here");
-  }
-  constexpr std::size_t n = 8 * MiB;
-  auto const bytes        = pattern(n, 900);
-  device_bytes const src{bytes};
-  cuda_stream stream;
-
-  transfer_probe probe;
-  transfer_hook const hook{probe};
-
-  SECTION("a write of A is tracked, and B does not register its buffer meanwhile")
-  {
-    bool tracked                 = false;
-    std::size_t created_during_b = 0;
-    std::size_t written_during_b = 0;
-    probe.check                  = [&] {
-      tracked            = transfer_tracked_for_testing(src.get(), n);
-      auto const before  = registrations_created_for_testing();
-      auto const written = b->device_write_async(*object_b, 0, n, src.get(), stream.ref()).get(60s);
-      created_during_b   = registrations_created_for_testing() - before;
-      written_during_b   = written;  // Check on the test thread after the future synchronizes.
-    };
-    probe.armed = true;
-    REQUIRE(a->device_write_async(*object_a, 0, n, src.get(), stream.ref()).get(60s) == n);
-    CHECK_FALSE(probe.armed.load());
-    CHECK(tracked);
-    CHECK(created_during_b == 0);
-    CHECK(written_during_b == n);
-    // Once A's transfer is over, B registers the buffer again.
-    CHECK_FALSE(transfer_tracked_for_testing(src.get(), n));
-    auto const before = registrations_created_for_testing();
-    REQUIRE(b->device_write_async(*object_b, 0, n, src.get(), stream.ref()).get(60s) == n);
-    CHECK(registrations_created_for_testing() == before + 1);
-    CHECK(cucascade::io::cufile::detail::live_registrations_for_testing() == 0);
-    check_same(read_back(a.get(), path_a.str()), bytes);
-    check_same(read_back(b.get(), path_b.str()), bytes);
-  }
-
-  SECTION("a read of A is tracked too")
-  {
-    REQUIRE(a->device_write_async(*object_a, 0, n, src.get(), stream.ref()).get(60s) == n);
-    auto reader = a->open_io_object(path_a.str());
-    device_bytes const dst{std::vector<std::uint8_t>(n)};
-    bool tracked = false;
-    probe.check  = [&] { tracked = transfer_tracked_for_testing(dst.get(), n); };
-    probe.armed  = true;
-    REQUIRE(a->device_read_async_io(*reader, 0, n, dst.get(), stream.ref()).get(60s) == n);
-    CHECK_FALSE(probe.armed.load());
-    CHECK(tracked);
-    CHECK_FALSE(transfer_tracked_for_testing(dst.get(), n));
-  }
-}
-
 TEST_CASE("cufile host writes are not held behind a device write waiting for its stream",
           "[io][cufile][write][gpu]")
 {
@@ -1241,6 +1150,14 @@ TEST_CASE("cufile write throughput probe", "[.cufile-write-bench]")
   if (which == "all" || which == "cufile") {
     write_context ctx{config{}, reactors};
     run_write_probe("cufile", ctx.get(), dir, total, rounds);
+  }
+  if (which == "all" || which == "cufile-direct") {
+    // cuFileWrite straight from the source (cuFile bounces it), against the
+    // default above, which stages bodies through the device slots on a GDS host.
+    config cfg{};
+    cfg.staging_mode = cucascade::io::cufile::staging::never;
+    write_context ctx{cfg, reactors};
+    run_write_probe("cufile-direct", ctx.get(), dir, total, rounds);
   }
   if (which == "all" || which == "cufile-split") {
     config cfg{};

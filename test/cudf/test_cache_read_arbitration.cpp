@@ -17,6 +17,7 @@
  */
 
 #include "cache_test_fixture.hpp"
+#include "launched_read.hpp"
 #include "utils/child_test_runner.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -170,7 +171,7 @@ TEST_CASE("an overlapping cache read waits for prefetch and reuses its chunk",
   prefetch.request = fixture.context->backend().wait_take(2s);
   REQUIRE(prefetch.request != nullptr);
   read_call = std::async(std::launch::async, [&] {
-    return fixture.datasource->host_read_async(0, destination.size(), destination.data());
+    return launched(fixture.datasource->host_read_async(0, destination.size(), destination.data()));
   });
   CHECK(read_call.wait_for(50ms) == std::future_status::timeout);
   CHECK(fixture.context->backend().pending_count() == 0);
@@ -209,8 +210,8 @@ TEST_CASE("a cached device read retires its pin through the stream completion po
   rmm::cuda_stream stream;
   rmm::device_buffer destination(read_size, stream);
   stream_cleanup drain{stream};
-  auto read = fixture.datasource->device_read_async(
-    0, read_size, static_cast<std::uint8_t*>(destination.data()), stream);
+  auto read = launched(fixture.datasource->device_read_async(
+    0, read_size, static_cast<std::uint8_t*>(destination.data()), stream));
   REQUIRE(read.wait_for(2s) == std::future_status::ready);
   CHECK(read.get() == read_size);
   CHECK(fixture.context->backend().pending_count() == 0);
@@ -289,10 +290,10 @@ TEST_CASE("cached device reads on two threads' per-thread default streams retire
     }
   } release{blocked, slow_thread};
 
-  auto slow = slow_submitted.get_future().get();
+  auto slow = launched(slow_submitted.get_future().get());
   // The main thread's per-thread stream is idle: its read completes at once.
-  auto fast = fixture.datasource->device_read_async(
-    0, read_size, static_cast<std::uint8_t*>(fast_destination.data()), per_thread);
+  auto fast = launched(fixture.datasource->device_read_async(
+    0, read_size, static_cast<std::uint8_t*>(fast_destination.data()), per_thread));
   REQUIRE(fast.wait_for(2s) == std::future_status::ready);
   CHECK(fast.get() == read_size);
   // ... and its completion does not retire the read still held on the other thread.
@@ -308,6 +309,85 @@ TEST_CASE("cached device reads on two threads' per-thread default streams retire
             cudaSuccess);
     CHECK(std::ranges::all_of(host, [](auto byte) { return byte == 0x6c; }));
   }
+}
+
+TEST_CASE("cached reads held on two per-thread streams do not keep a ready one waiting",
+          "[cache][cache_handle][completion-poll][gpu_execution]")
+{
+  if (run_in_child("CUCASCADE_CACHE_ARBITRATION_CHILD", 30s)) { return; }
+  // The cache has two completion waiters.  Two cache-hit reads behind held
+  // per-thread streams occupy both; a third read whose copies are done must
+  // still settle (its pins released, its future resolved) while they wait.
+  arbitration_fixture fixture;
+  fixture.advise(0);
+  std::atomic<bool> prefetched{false};
+  held_request prefetch;
+  read_cleanup cleanup{*fixture.context, {&prefetch, nullptr}};
+  REQUIRE(fixture.datasource->prefetch_async([&](prefetch_result result) noexcept {
+    prefetched.store(result.ok, std::memory_order_release);
+  }) == prefetch_refusal::issued);
+  prefetch.request = fixture.context->backend().wait_take(2s);
+  REQUIRE(prefetch.request != nullptr);
+  prefetch.complete(0x6c);
+  REQUIRE(prefetched.load(std::memory_order_acquire));
+
+  rmm::cuda_stream allocation_stream;
+  std::array<rmm::device_buffer, 3> destinations{
+    rmm::device_buffer(read_size, allocation_stream),
+    rmm::device_buffer(read_size, allocation_stream),
+    rmm::device_buffer(read_size, allocation_stream)};
+  allocation_stream.synchronize();
+  auto const per_thread = ::cuda::stream_ref{cudaStreamPerThread};
+
+  struct gate {
+    std::atomic<bool> released{false};
+  } blocked;
+  std::array<std::promise<std::future<std::size_t>>, 2> submitted;
+  std::array<std::thread, 2> held_threads;
+  for (std::size_t i = 0; i < held_threads.size(); ++i) {
+    held_threads[i] = std::thread{[&, i] {
+      // Hold THIS thread's per-thread stream, then read behind it.
+      REQUIRE(cudaLaunchHostFunc(
+                cudaStreamPerThread,
+                [](void* ptr) {
+                  auto& ready = static_cast<gate*>(ptr)->released;
+                  while (!ready.load()) {
+                    std::this_thread::sleep_for(1ms);
+                  }
+                },
+                &blocked) == cudaSuccess);
+      submitted[i].set_value(fixture.datasource->device_read_async(
+        0, read_size, static_cast<std::uint8_t*>(destinations[i].data()), per_thread));
+      std::ignore = cudaStreamSynchronize(cudaStreamPerThread);
+    }};
+  }
+  struct release_on_exit {
+    gate& g;
+    std::array<std::thread, 2>& threads;
+    ~release_on_exit()
+    {
+      g.released.store(true);
+      for (auto& t : threads) {
+        if (t.joinable()) t.join();
+      }
+    }
+  } release{blocked, held_threads};
+
+  auto held_a = launched(submitted[0].get_future().get());
+  auto held_b = launched(submitted[1].get_future().get());
+  std::this_thread::sleep_for(100ms);  // both waiters are now on the held reads
+  auto ready = launched(fixture.datasource->device_read_async(
+    0, read_size, static_cast<std::uint8_t*>(destinations[2].data()), per_thread));
+  REQUIRE(ready.wait_for(2s) == std::future_status::ready);
+  CHECK(ready.get() == read_size);
+  CHECK(held_a.wait_for(0ms) != std::future_status::ready);
+  CHECK(held_b.wait_for(0ms) != std::future_status::ready);
+
+  blocked.released.store(true);
+  REQUIRE(held_a.wait_for(2s) == std::future_status::ready);
+  REQUIRE(held_b.wait_for(2s) == std::future_status::ready);
+  CHECK(held_a.get() == read_size);
+  CHECK(held_b.get() == read_size);
 }
 
 TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
@@ -327,8 +407,8 @@ TEST_CASE("a cache read does not wait for unrelated chunks in the same handle",
   REQUIRE(prefetch.request != nullptr);
   CHECK(prefetch.request->priority == cucascade::io::io_priority::low);
   read_call           = std::async(std::launch::async, [&] {
-    return fixture.datasource->host_read_async(
-      2 * controlled_chunk_bytes, destination.size(), destination.data());
+    return launched(fixture.datasource->host_read_async(
+      2 * controlled_chunk_bytes, destination.size(), destination.data()));
   });
   auto const returned = read_call.wait_for(100ms) == std::future_status::ready;
   CHECK(returned);
@@ -361,7 +441,7 @@ TEST_CASE("a cached multi-range host read sends its backend work on the high tie
   held_request first;
   held_request second;
   read_cleanup cleanup{*fixture.context, {&first, &second}};
-  auto read     = fixture.datasource->host_read_ranges_async(ranges);
+  auto read     = launched(fixture.datasource->host_read_ranges_async(ranges));
   first.request = fixture.context->backend().wait_take(2s);
   REQUIRE(first.request != nullptr);
   CHECK(first.request->priority == cucascade::io::io_priority::high);
@@ -389,20 +469,20 @@ TEST_CASE("a demand-owned loading chunk uses reactor bounce staging",
   held_request bounced;
   std::future<std::future<std::size_t>> second_call;
   read_cleanup cleanup{*fixture.context, {&cache_load, &bounced}};
-  auto first =
+  auto first = launched(
     fixture.datasource->device_read_async(controlled_chunk_bytes,
                                           read_size,
                                           static_cast<std::uint8_t*>(first_destination.data()),
-                                          stream);
+                                          stream));
   cache_load.request = fixture.context->backend().wait_take(2s);
   REQUIRE(cache_load.request != nullptr);
   CHECK(cache_load.request->front().h_buffer.is_fragmented());
   second_call         = std::async(std::launch::async, [&] {
-    return fixture.datasource->device_read_async(
-      controlled_chunk_bytes,
-      read_size,
-      static_cast<std::uint8_t*>(second_destination.data()),
-      stream);
+    return launched(
+      fixture.datasource->device_read_async(controlled_chunk_bytes,
+                                            read_size,
+                                            static_cast<std::uint8_t*>(second_destination.data()),
+                                            stream));
   });
   auto const returned = second_call.wait_for(100ms) == std::future_status::ready;
   CHECK(returned);
@@ -474,7 +554,7 @@ TEST_CASE("raw cache validates identities across opens", "[cache][object_identit
   fill.complete(0x5a);
   auto reopened = fixture.open_version("controlled://versioned", mode == 1 ? "v2" : version);
   std::array<std::uint8_t, read_size> bytes{};
-  auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
+  auto read = launched(reopened->host_read_async(0, bytes.size(), bytes.data()));
   if (mode != 0) {
     miss.request = fixture.context->backend().wait_take(2s);
     REQUIRE(miss.request != nullptr);
@@ -504,11 +584,11 @@ TEST_CASE("a late old raw-cache fill cannot overwrite the new version", "[cache]
   old_fill.complete(0x5a);
   auto reopened = fixture.open_version("controlled://versioned", "v2");
   std::array<std::uint8_t, read_size> bytes{};
-  auto read = reopened->host_read_async(0, bytes.size(), bytes.data());
+  auto read = launched(reopened->host_read_async(0, bytes.size(), bytes.data()));
   REQUIRE(read.wait_for(2s) == std::future_status::ready);
   CHECK(read.get() == bytes.size());
   CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x7b; }));
-  read = old_source->host_read_async(0, bytes.size(), bytes.data());
+  read = launched(old_source->host_read_async(0, bytes.size(), bytes.data()));
   REQUIRE(read.wait_for(2s) == std::future_status::ready);
   CHECK(read.get() == bytes.size());
   CHECK(std::ranges::all_of(bytes, [](auto b) { return b == 0x5a; }));
@@ -606,8 +686,8 @@ TEST_CASE("retired raw arena survives a cache-hit CUDA copy without a prefetch h
               }
             },
             &blocked) == cudaSuccess);
-  auto read =
-    reader->device_read_async(0, read_size, static_cast<std::uint8_t*>(destination.data()), stream);
+  auto read = launched(reader->device_read_async(
+    0, read_size, static_cast<std::uint8_t*>(destination.data()), stream));
   reader.reset();
   fixture.datasource = fixture.open_version("controlled://retirement", "v2");
   fixture.advise(0);
@@ -712,10 +792,10 @@ TEST_CASE("a prefetch beaten to a chunk by a demand read completes uncovered",
   claim_hook_reset const hook_reset{*fixture.context->cache()};
   fixture.context->cache()->set_before_prefetch_claim_for_testing([&] {
     if (!std::exchange(first, false)) { return; }
-    read = device_read
-             ? fixture.datasource->device_read_async(
-                 0, read_size, static_cast<std::uint8_t*>(device_destination.data()), stream)
-             : fixture.datasource->host_read_async(0, read_size, destination.data());
+    read = launched(
+      device_read ? fixture.datasource->device_read_async(
+                      0, read_size, static_cast<std::uint8_t*>(device_destination.data()), stream)
+                  : fixture.datasource->host_read_async(0, read_size, destination.data()));
   });
   std::promise<prefetch_result> done;
   auto result = done.get_future();

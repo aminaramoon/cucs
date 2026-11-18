@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 
+#include "io/cufile/staging_pool.hpp"
 #include "io/detail/local_descriptor.hpp"
 
 #include <cucascade/cuda/event.hpp>
@@ -26,27 +27,35 @@
 #include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/cufile/device_engine.hpp>
 #include <cucascade/io/cufile/mount_policy.hpp>
-#include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/cufile/runtime.hpp>
+#include <cucascade/io/range_plan.hpp>
+#include <array>
+#include <map>
+#include <cucascade/io/cufile/platform.hpp>
+#include <cucascade/io/cufile/staging.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
 #include <cucascade/io/object_identity.hpp>
-#include <cucascade/io/range_plan.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/types.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 #include <cucascade/log/logging.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime.h>
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -57,7 +66,6 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -139,6 +147,24 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
   return value & ~(IO_BLOCK_SIZE - 1);
 }
 
+/// Round @p value up to a multiple of @c IO_BLOCK_SIZE.  File offsets and sizes
+/// are far below the wrap-around point.
+[[nodiscard]] constexpr std::size_t align_up_block(std::size_t value) noexcept
+{
+  return align_down_block(value + IO_BLOCK_SIZE - 1);
+}
+
+/// The stream the worker may name for a caller's @p stream: the null handle is
+/// the legacy default stream on the caller's side, but would mean the worker's
+/// per-thread default stream in a per-thread-default build.
+[[nodiscard]] cudaStream_t worker_view_of(cudaStream_t stream) noexcept
+{
+  return stream == nullptr ? cudaStreamLegacy : stream;
+}
+
+/// Log a failed cuFileRead once per process.
+void log_cufile_failure_once(cufile_io_object const& file, ssize_t got, int saved_errno) noexcept;
+
 /// Human-readable cause of a failed synchronous cuFile call: @c -1 carries the
 /// cause in @c errno (a POSIX errno or a cuFile code above 5000); a value below
 /// @c -1 is a negated @c CUfileOpError.
@@ -151,6 +177,21 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
            std::to_string(code) + ")";
   }
   return std::string{std::strerror(code)} + " (errno " + std::to_string(code) + ")";
+}
+
+void log_cufile_failure_once(cufile_io_object const& file, ssize_t got, int saved_errno) noexcept
+{
+  static std::atomic<bool> logged{false};
+  if (logged.exchange(true, std::memory_order_relaxed)) return;
+  try {
+    CUCASCADE_LOG_WARN(
+      "cufile_reactor: cuFileRead of '{}' failed: {}; serving such reads through POSIX "
+      "(logged once per process; see the reactor's cufile_failures count)",
+      file.object_path(),
+      describe_cufile_failure(got, saved_errno));
+  } catch (...) {
+    // Logging is best effort.
+  }
 }
 
 /**
@@ -223,8 +264,7 @@ void deregister_cufile(CUfileHandle_t handle) noexcept
   // Automatic mode registers only when the cuFile driver opened, so a host without
   // libcufile goes straight to POSIX instead of failing a registration per file.
   CUfileHandle_t handle{nullptr};
-  bool const driver_open =
-    direct && mode != compat::on && runtime::instance().ensure_initialized().driver_opened;
+  bool const driver_open  = direct && mode != compat::on && cufile_api::open_driver();
   bool const try_register = direct && (mode == compat::off || driver_open);
   if (try_register) {
     std::string failure;
@@ -292,6 +332,62 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
   }
 }
 
+/// Drop @p bytes from the front of @p iov, starting at @p iov[first].
+void advance_iov(std::vector<iovec>& iov, std::size_t& first, std::size_t bytes) noexcept
+{
+  while (bytes > 0 && first < iov.size()) {
+    auto const step     = std::min(bytes, iov[first].iov_len);
+    iov[first].iov_base = static_cast<std::uint8_t*>(iov[first].iov_base) + step;
+    iov[first].iov_len -= step;
+    bytes -= step;
+    if (iov[first].iov_len == 0) ++first;
+  }
+}
+
+/// Vectored @ref pread_all: fills @p iov from @p offset, retrying partial reads
+/// and EINTR; returns the bytes read, which is short only at EOF.
+[[nodiscard]] std::size_t preadv_all(int fd, std::vector<iovec> iov, std::size_t offset)
+{
+  std::size_t completed = 0;
+  std::size_t first     = 0;
+  while (first < iov.size()) {
+    auto const count = static_cast<int>(std::min<std::size_t>(iov.size() - first, IOV_MAX));
+    auto const result =
+      ::preadv(fd, iov.data() + first, count, static_cast<off_t>(offset + completed));
+    if (result < 0) {
+      if (errno == EINTR) continue;
+      throw std::system_error(errno, std::generic_category(), "cufile_reactor::preadv_all");
+    }
+    if (result == 0) break;
+    completed += static_cast<std::size_t>(result);
+    advance_iov(iov, first, static_cast<std::size_t>(result));
+  }
+  return completed;
+}
+
+/// Vectored @ref pwrite_all: writes all of @p iov at @p offset, retrying EINTR
+/// and short writes; a 0-byte write is EIO.
+void pwritev_all(int fd, std::vector<iovec> iov, std::size_t offset)
+{
+  std::size_t completed = 0;
+  std::size_t first     = 0;
+  while (first < iov.size()) {
+    auto const count = static_cast<int>(std::min<std::size_t>(iov.size() - first, IOV_MAX));
+    auto const result =
+      ::pwritev(fd, iov.data() + first, count, static_cast<off_t>(offset + completed));
+    if (result < 0) {
+      if (errno == EINTR) continue;
+      throw std::system_error(errno, std::generic_category(), "cufile_reactor: pwritev");
+    }
+    if (result == 0) {
+      throw std::system_error(std::make_error_code(std::errc::io_error),
+                              "cufile_reactor: pwritev wrote nothing");
+    }
+    completed += static_cast<std::size_t>(result);
+    advance_iov(iov, first, static_cast<std::size_t>(result));
+  }
+}
+
 /// Whether @p piece starts and ends on a multiple of @p granule.
 [[nodiscard]] bool is_granule_aligned(range piece, std::size_t granule) noexcept
 {
@@ -304,243 +400,37 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
 }
 
 /**
- * @brief Write @p piece from host memory @p source to @p file.
+ * @brief Write a piece of @p file with @p write(fd).
  *
  * Through the O_DIRECT fd when @p direct is set (the caller checked the piece is
- * granule-aligned and the source block-aligned), falling back to the buffered fd
+ * granule-aligned and its source block-aligned), falling back to the buffered fd
  * when the filesystem refuses O_DIRECT at run time; through the buffered fd
  * otherwise.
  */
+template <typename Write>
+void write_piece(cufile_io_object const& file, bool direct, Write const& write)
+{
+  if (!direct) {
+    write(file.buffered_fd());
+    return;
+  }
+  try {
+    write(file.direct_fd());
+  } catch (std::system_error const& error) {
+    if (!uring::detail::is_odirect_runtime_error(error.code().value())) throw;
+    write(file.buffered_fd());
+  }
+}
+
+/// Write @p piece from host memory @p source to @p file (see @ref write_piece).
 void write_host_piece(cufile_io_object const& file,
                       bool direct,
                       std::uint8_t const* source,
                       range piece)
 {
-  if (!direct) {
-    pwrite_all(file.buffered_fd(), source, piece.size, piece.offset);
-    return;
-  }
-  try {
-    pwrite_all(file.direct_fd(), source, piece.size, piece.offset);
-  } catch (std::system_error const& error) {
-    if (!uring::detail::is_odirect_runtime_error(error.code().value())) throw;
-    pwrite_all(file.buffered_fd(), source, piece.size, piece.offset);
-  }
+  write_piece(
+    file, direct, [&](int fd) { pwrite_all(fd, source, piece.size, piece.offset); });
 }
-
-/**
- * @brief Process-wide table of the device ranges the reactors registered with
- *        @c cuFileBufRegister, keyed by base address.
- *
- * cuFile identifies a registered buffer by its base pointer, so two transfers
- * that pass the same base share one registration; deregistering it while the
- * other transfer's I/O runs would pull it from under that I/O.  The table makes
- * the sharing explicit (reference counted, the last user deregisters) and
- * refuses a transfer whose range overlaps a live registration any other way.
- */
-class registration_table {
- public:
-  /// What a transfer may do with its buffer.
-  enum class grant {
-    unregistered,  ///< pass the exact pointer, cuFile bounces it
-    registered,    ///< pass the base and an offset; release() when done
-    conflict       ///< overlaps a live registration: do not use cuFile at all
-  };
-
-  static registration_table& instance()
-  {
-    static registration_table table;
-    return table;
-  }
-
-  /// Decide for a transfer of [@p base, @p base + @p bytes); register it when
-  /// @p want_registration and nothing overlaps.  An unregistered grant is
-  /// recorded too (release it with @ref release_unregistered), so a later
-  /// registration never covers memory an unregistered transfer is using.
-  grant acquire(void const* base, std::size_t bytes, bool want_registration)
-  {
-    auto const begin = reinterpret_cast<std::uintptr_t>(base);
-    auto const end   = begin + bytes;
-    std::lock_guard lock(_mutex);
-    if (auto it = _live.find(begin); it != _live.end()) {
-      if (end > it->first + it->second.bytes) return grant::conflict;
-      ++it->second.users;
-      return grant::registered;
-    }
-    if (overlaps(begin, end)) return grant::conflict;
-    if (!want_registration || overlaps_unregistered(begin, end)) {
-      _unregistered.emplace(begin, bytes);
-      return grant::unregistered;
-    }
-    auto const* api = cufile_api::get();
-    if (api == nullptr) return grant::unregistered;
-    auto const status = api->buf_register(base, bytes, 0);
-    if (status.err != CU_FILE_SUCCESS) {
-      static std::atomic<bool> logged{false};
-      if (!logged.exchange(true, std::memory_order_relaxed)) {
-        CUCASCADE_LOG_WARN(
-          "cufile_reactor: cuFileBufRegister of {} bytes failed (err={}); transferring "
-          "unregistered (logged once per process)",
-          bytes,
-          static_cast<int>(status.err));
-      }
-      // Registered by someone outside the table: its owner may deregister it at
-      // any time, so keep cuFile away from it.
-      if (status.err == CU_FILE_MEMORY_ALREADY_REGISTERED) return grant::conflict;
-      _unregistered.emplace(begin, bytes);
-      return grant::unregistered;
-    }
-    try {
-      _live.emplace(begin, entry{bytes, 1});
-    } catch (...) {
-      // Never leave a registration the table does not know about.
-      std::ignore = api->buf_deregister(base);
-      throw;
-    }
-    ++_created;
-    return grant::registered;
-  }
-
-  /// Drop one user of the registration at @p base; the last one deregisters.
-  void release(void const* base) noexcept
-  {
-    std::lock_guard lock(_mutex);
-    auto it = _live.find(reinterpret_cast<std::uintptr_t>(base));
-    if (it == _live.end() || --it->second.users != 0) return;
-    _live.erase(it);
-    // A live registration implies the library loaded, so the table is present.
-    if (auto const* api = cufile_api::get(); api != nullptr) {
-      std::ignore = api->buf_deregister(base);
-    }
-  }
-
-  /// End an unregistered transfer of [@p base, @p base + @p bytes).
-  void release_unregistered(void const* base, std::size_t bytes) noexcept
-  {
-    std::lock_guard lock(_mutex);
-    auto const range = _unregistered.equal_range(reinterpret_cast<std::uintptr_t>(base));
-    for (auto it = range.first; it != range.second; ++it) {
-      if (it->second == bytes) {
-        _unregistered.erase(it);
-        return;
-      }
-    }
-  }
-
-  [[nodiscard]] std::size_t live() const
-  {
-    std::lock_guard lock(_mutex);
-    return _live.size();
-  }
-
-  /// Registrations created so far (tests).
-  [[nodiscard]] std::size_t created() const
-  {
-    std::lock_guard lock(_mutex);
-    return _created;
-  }
-
-  /// Whether [base, base + bytes) overlaps a live registration or an
-  /// unregistered transfer in flight (tests).
-  [[nodiscard]] bool tracked(void const* base, std::size_t bytes) const
-  {
-    auto const begin = reinterpret_cast<std::uintptr_t>(base);
-    std::lock_guard lock(_mutex);
-    return overlaps(begin, begin + bytes) || overlaps_unregistered(begin, begin + bytes);
-  }
-
- private:
-  struct entry {
-    std::size_t bytes;
-    std::size_t users;
-  };
-
-  /// Whether [begin, end) overlaps a live registration (caller holds the lock).
-  [[nodiscard]] bool overlaps(std::uintptr_t begin, std::uintptr_t end) const
-  {
-    auto it = _live.lower_bound(begin);
-    if (it != _live.end() && it->first < end) return true;
-    if (it == _live.begin()) return false;
-    --it;
-    return it->first + it->second.bytes > begin;
-  }
-
-  /// Whether [begin, end) overlaps an unregistered transfer in flight (caller
-  /// holds the lock).  Few transfers are in flight at once: a scan is enough.
-  [[nodiscard]] bool overlaps_unregistered(std::uintptr_t begin, std::uintptr_t end) const
-  {
-    return std::any_of(_unregistered.begin(), _unregistered.end(), [&](auto const& transfer) {
-      return transfer.first < end && transfer.first + transfer.second > begin;
-    });
-  }
-
-  mutable std::mutex _mutex;
-  std::map<std::uintptr_t, entry> _live;
-  std::multimap<std::uintptr_t, std::size_t> _unregistered;
-  std::size_t _created{0};
-};
-
-/**
- * @brief The registration decision for one cuFile transfer, released on
- *        destruction -- before the transfer's request settles, so the caller may
- *        free the buffer as soon as its future resolves.
- *
- * Every non-empty transfer consults the table, whatever @p min_bytes: the table
- * is process-wide, so another context with registration enabled must see this
- * transfer before it registers (and later deregisters) memory it uses.  One
- * that is at least @p min_bytes (0 = never) and whose buffer is 4 KiB-aligned
- * registers (or shares a live registration at the same base); one that
- * overlaps a live registration otherwise is a conflict the caller serves
- * without cuFile; any other is recorded as an unregistered transfer.
- */
-class transfer_registration {
- public:
-  transfer_registration(void const* base,
-                        std::size_t bytes,
-                        bool aligned,
-                        std::size_t min_bytes) noexcept
-  {
-    if (bytes == 0) return;
-    bool const want = min_bytes != 0 && aligned && bytes >= min_bytes &&
-                      reinterpret_cast<std::uintptr_t>(base) % IO_BLOCK_SIZE == 0;
-    try {
-      _grant = registration_table::instance().acquire(base, bytes, want);
-    } catch (...) {
-      _grant = registration_table::grant::conflict;
-    }
-    if (_grant != registration_table::grant::conflict) {
-      _base  = base;
-      _bytes = bytes;
-    }
-  }
-
-  ~transfer_registration()
-  {
-    if (_base == nullptr) return;
-    if (registered()) {
-      registration_table::instance().release(_base);
-    } else {
-      registration_table::instance().release_unregistered(_base, _bytes);
-    }
-  }
-
-  transfer_registration(transfer_registration const&)            = delete;
-  transfer_registration& operator=(transfer_registration const&) = delete;
-
-  [[nodiscard]] bool registered() const noexcept
-  {
-    return _grant == registration_table::grant::registered;
-  }
-  [[nodiscard]] bool conflict() const noexcept
-  {
-    return _grant == registration_table::grant::conflict;
-  }
-
- private:
-  registration_table::grant _grant{registration_table::grant::unregistered};
-  void const* _base{nullptr};  ///< set when the table recorded this transfer
-  std::size_t _bytes{0};
-};
 
 /// Test seams (see cufile/detail.hpp).
 std::atomic<bool> cufile_writes_in_compat{false};
@@ -567,6 +457,8 @@ std::array<std::atomic<copy_delay_gate*>, 128> engine_copy_gates{};
 std::mutex engine_copy_gate_setup_mutex;
 std::atomic<void (*)(detail::completion_observation const&, void*) noexcept> completion_observer{};
 std::atomic<void*> completion_observer_arg{};
+
+
 
 /// Record @p event on @p stream after a copy was enqueued there; tests can make
 /// the record fail (@ref detail::set_copy_event_record_failure_for_testing).
@@ -651,8 +543,8 @@ void start_writeback(int fd, range rng) noexcept
     fd, static_cast<off_t>(rng.offset), static_cast<off_t>(rng.size), SYNC_FILE_RANGE_WRITE);
 }
 
-/// Short reads tolerated in a row before a device slice is declared failed.
-constexpr int max_short_reads = 64;
+/// Short writes tolerated in a row before a write slice is declared failed.
+constexpr int max_short_writes = 64;
 
 /**
  * @brief Request selection for the worker: strict priority with bounded low service.
@@ -758,6 +650,150 @@ class request_scheduler {
 
 }  // namespace
 
+/// One device's registered staging slots as a reactor holds them.  A slot is
+/// free unless @c owner is set: a staged read whose caller's stream was busy at
+/// dispatch has completed into it and its scatter copy, on the slot's own stream,
+/// waits on the GPU for that stream (one stream per slot, so a waiting copy never
+/// holds up another slot's).  Slices whose stream is ready use a free slot and
+/// finish their copy before they settle, so the slot is free again at once.
+struct cufile_reactor::device_staging {
+  struct slot_entry {
+    detail::staging_slot slot;
+    owned_stream stream;
+    cucascade::cuda::cuda_event done{cudaEventDisableTiming};
+    /// The read whose scatter copy is pending in this slot; null when free.
+    std::unique_ptr<io_op_request> owner;
+    std::size_t owner_bytes{0};
+    std::size_t owner_parts{0};  ///< Caller slices of a fused read; 0 for an ordinary one.
+  };
+
+  std::vector<slot_entry> slots;
+  /// Set up already; when @c slots is empty, staging is unavailable here.
+  bool initialized{false};
+
+  [[nodiscard]] std::size_t free_count() const noexcept
+  {
+    std::size_t count = 0;
+    for (auto const& entry : slots) {
+      if (entry.owner == nullptr) ++count;
+    }
+    return count;
+  }
+
+  [[nodiscard]] slot_entry* free_slot() noexcept
+  {
+    for (auto& entry : slots) {
+      if (entry.owner == nullptr) return &entry;
+    }
+    return nullptr;
+  }
+};
+
+/**
+ * @brief Pinned host memory one transfer stages through: @c slot count slots of
+ *        @c slot_bytes, each made of contiguous runs of @c run_bytes.
+ *
+ * Borrowed blocks of a HOST memory space's pool (4 KiB-aligned, so O_DIRECT
+ * vectored I/O can use them) are given back when the lease goes; the reactor's
+ * own scratch is one run per slot and stays with the reactor.
+ */
+struct cufile_reactor::scratch_lease {
+  memory::fixed_size_host_memory_resource::fixed_multiple_blocks_allocation blocks;
+  std::uint8_t* own{nullptr};  ///< The reactor's scratch, when not borrowed.
+  std::size_t slot_bytes{0};
+  std::size_t run_bytes{0};
+
+  /// Start of run @p index of slot @p slot.
+  [[nodiscard]] std::uint8_t* run(std::size_t slot, std::size_t index) const
+  {
+    if (own != nullptr) return own + slot * slot_bytes;
+    auto const per_slot = slot_bytes / run_bytes;
+    return reinterpret_cast<std::uint8_t*>((*blocks)[slot * per_slot + index].data());
+  }
+
+  /// Call @p fn(pointer, bytes) for each run of [@p from, @p from + @p bytes) of slot @p slot.
+  template <typename Fn>
+  void for_each_run(std::size_t slot, std::size_t from, std::size_t bytes, Fn&& fn) const
+  {
+    while (bytes > 0) {
+      auto const in   = from % run_bytes;
+      auto const step = std::min(bytes, run_bytes - in);
+      fn(run(slot, from / run_bytes) + in, step);
+      from += step;
+      bytes -= step;
+    }
+  }
+
+  /// Read up to @p bytes at file @p offset into slot @p slot; short only at EOF.
+  [[nodiscard]] std::size_t read(int fd, std::size_t slot, std::size_t bytes, std::size_t offset) const
+  {
+    if (own != nullptr) return pread_all(fd, run(slot, 0), bytes, offset);
+    return preadv_all(fd, iov(slot, bytes), offset);
+  }
+
+  /// Write the first @p bytes of slot @p slot at file @p offset.
+  void write(int fd, std::size_t slot, std::size_t bytes, std::size_t offset) const
+  {
+    if (own != nullptr) {
+      pwrite_all(fd, run(slot, 0), bytes, offset);
+      return;
+    }
+    pwritev_all(fd, iov(slot, bytes), offset);
+  }
+
+  /// Copy [@p from, @p from + @p bytes) of slot @p slot to device @p dst on @p stream.
+  [[nodiscard]] cudaError_t to_device(std::uint8_t* dst,
+                                      std::size_t slot,
+                                      std::size_t from,
+                                      std::size_t bytes,
+                                      cudaStream_t stream) const
+  {
+    auto status = cudaSuccess;
+    for_each_run(slot, from, bytes, [&](std::uint8_t* run_start, std::size_t n) {
+      if (status == cudaSuccess) {
+        status = cudaMemcpyAsync(dst, run_start, n, cudaMemcpyHostToDevice, stream);
+      }
+      dst += n;
+    });
+    return status;
+  }
+
+  /// Copy @p bytes from device @p src into the start of slot @p slot on @p stream.
+  [[nodiscard]] cudaError_t from_device(std::size_t slot,
+                                        std::uint8_t const* src,
+                                        std::size_t bytes,
+                                        cudaStream_t stream) const
+  {
+    auto status = cudaSuccess;
+    for_each_run(slot, 0, bytes, [&](std::uint8_t* run_start, std::size_t n) {
+      if (status == cudaSuccess) {
+        status = cudaMemcpyAsync(run_start, src, n, cudaMemcpyDeviceToHost, stream);
+      }
+      src += n;
+    });
+    return status;
+  }
+
+  /// Copy [@p from, @p from + @p bytes) of slot @p slot to host memory @p dst.
+  void to_host(std::uint8_t* dst, std::size_t slot, std::size_t from, std::size_t bytes) const
+  {
+    for_each_run(slot, from, bytes, [&](std::uint8_t* run_start, std::size_t n) {
+      std::memcpy(dst, run_start, n);
+      dst += n;
+    });
+  }
+
+ private:
+  [[nodiscard]] std::vector<iovec> iov(std::size_t slot, std::size_t bytes) const
+  {
+    std::vector<iovec> out;
+    for_each_run(slot, 0, bytes, [&](std::uint8_t* run_start, std::size_t n) {
+      out.push_back(iovec{run_start, n});
+    });
+    return out;
+  }
+};
+
 // ---------------------------------------------------------------------------
 // cufile_io_object
 // ---------------------------------------------------------------------------
@@ -784,11 +820,6 @@ cufile_io_object::cufile_io_object(std::string path,
   }
 }
 
-object_identity cufile_io_object::identity() const
-{
-  return _identity ? *_identity : io_object::identity();
-}
-
 mount_identity const& cufile_io_object::mount_identity_info() const
 {
   std::call_once(_mount_identity_once, [this] {
@@ -811,6 +842,11 @@ mount_policy_key cufile_io_object::policy_key(std::string device_uuid,
                                               std::uint64_t generation) const
 {
   return make_mount_policy_key(mount_identity_info(), std::move(device_uuid), generation);
+}
+
+object_identity cufile_io_object::identity() const
+{
+  return _identity ? *_identity : io_object::identity();
 }
 
 cufile_io_object::~cufile_io_object()
@@ -997,8 +1033,7 @@ void cufile_reactor::record_submit_fences(cufile_io_object const& file,
   } catch (...) {
     return;  // Optional routing metadata must never fail the user's I/O.
   }
-  struct device_route {
-    int device;
+  struct device_route {    int device;
     bool allowed;
   };
   std::vector<device_route> routes;
@@ -1042,7 +1077,9 @@ void cufile_reactor::record_submit_fences(cufile_io_object const& file,
         return event.device == buffer.device_id && event.stream == stream;
       });
       if (found == events.end()) {
-        auto fence = submit_event_pool::instance().record(buffer.device_id, stream);
+        auto fence = buffer.ready_gate
+          ? std::make_shared<submit_fence>(submit_fence{buffer.ready_gate->get(), buffer.ready_gate})
+          : submit_event_pool::instance().record(buffer.device_id, stream);
         events.push_back({buffer.device_id, stream, fence});
         buffer.fence = std::move(fence);
       } else {
@@ -1104,7 +1141,7 @@ cufile_reactor::engine_route_result cufile_reactor::engine_route(
 {
   if (_config.async_engine.mode == engine_mode::legacy ||
       (slice.is_write() ? !_config.async_engine.async_writes : !_config.async_engine.async_reads) ||
-      slice.is_flush() || !slice.has_device_request() || slice.has_host_request() ||
+      slice.is_flush() || slice.is_fused() || !slice.has_device_request() || slice.has_host_request() ||
       !slice.d_buffer.fence || (!slice.is_write() && slice.d_buffer.original_stream_was_null) ||
       slice.on_complete || !_engine_outstanding || _engine_outstanding->cancel->load())
     return {};
@@ -1170,36 +1207,67 @@ bool cufile_reactor::engine_write_candidate(std::shared_ptr<const io_object> con
          binding && binding->engine->ready() && binding->engine->accepts_writes();
 }
 
-cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
-  : _ctx(std::move(ctx)), _tname(tname)
+cufile_reactor::cufile_reactor(std::shared_ptr<reactor_context> ctx,
+                               std::string_view tname,
+                               reactor_placement placement)
+  : _ctx(std::move(ctx)), _tname(tname), _placement(std::move(placement))
 {
   if (_ctx == nullptr) {
     throw std::invalid_argument("cufile_reactor: reactor_context must be non-null");
   }
+  _config = _ctx->cfg();
   _write_wakeup->notify = [this] {
     // A null queue entry only interrupts the timed dequeue; it is never dispatched.
     static_cast<void>(_requests.enqueue(nullptr, io_priority::high));
   };
-  _config = _ctx->cfg();
-  if (_config.async_engine.mode != engine_mode::legacy ||
-      _config.async_engine.process_params != process_cufile_parameters{} ||
-      _config.async_engine.strict_parameters) {
+  if (_config.async_engine.mode != engine_mode::legacy) {
     _config.async_engine.validate();
     std::ignore = runtime::instance().ensure_initialized(_config.async_engine.process_params,
                                                          _config.async_engine.strict_parameters);
   }
   if (_config.async_engine.mode != engine_mode::legacy)
     _engine_outstanding = std::make_shared<engine_admission>();
+
   if (_config.max_inflight == 0) {
     throw std::invalid_argument("cufile_reactor: max_inflight must be non-zero");
   }
   if (_config.max_op_bytes < IO_BLOCK_SIZE) {
     throw std::invalid_argument("cufile_reactor: max_op_bytes must be at least IO_BLOCK_SIZE");
   }
+  if (_config.staging_piece_bytes < IO_BLOCK_SIZE ||
+      _config.staging_piece_bytes % IO_BLOCK_SIZE != 0) {
+    throw std::invalid_argument(
+      "cufile_reactor: staging_piece_bytes must be a non-zero multiple of IO_BLOCK_SIZE");
+  }
   // Sized once so a record can always be appended after a copy is already on the
   // stream: a throwing push_back there would free the event the stream records.
   _inflight_copy.reserve(_config.max_inflight);
   _waiting.reserve(_config.max_inflight);
+}
+
+reactor_stats cufile_reactor::stats() const noexcept
+{
+  auto load = [](std::atomic<std::uint64_t> const& value) {
+    return value.load(std::memory_order_relaxed);
+  };
+  reactor_stats out;
+  out.staged_reads       = load(_counters.staged_reads);
+  out.staged_bytes       = load(_counters.staged_bytes);
+  out.early_staged_reads = load(_counters.early_staged_reads);
+  out.fused_slices       = load(_counters.fused_slices);
+  out.direct_reads       = load(_counters.direct_reads);
+  out.direct_bytes       = load(_counters.direct_bytes);
+  out.posix_device_reads = load(_counters.posix_device_reads);
+  out.posix_device_bytes = load(_counters.posix_device_bytes);
+  out.host_reads         = load(_counters.host_reads);
+  out.host_bytes         = load(_counters.host_bytes);
+  out.cufile_failures    = load(_counters.cufile_failures);
+  out.parked_slices      = load(_counters.parked_slices);
+  out.staged_writes      = load(_counters.staged_writes);
+  out.staged_write_bytes = load(_counters.staged_write_bytes);
+  out.direct_writes      = load(_counters.direct_writes);
+  out.direct_write_bytes = load(_counters.direct_write_bytes);
+  return out;
 }
 
 cufile_reactor::~cufile_reactor()
@@ -1259,10 +1327,12 @@ void cufile_reactor::shutdown()
   if (_worker.joinable()) {
     _stop_source.request_stop();
     _worker.join();
-    // The worker is gone: release its pinned scratch and copy streams now
-    // rather than with the reactor.
+    // The worker is gone (and gave its staging slots back): release its pinned
+    // scratch and copy streams now rather than with the reactor.
     _scratch.reset();
     _copy_streams.clear();
+    _pair_streams.clear();
+    _staging.clear();
     wait_engine();
     return;
   }
@@ -1485,7 +1555,8 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
     }
 
     // Standalone reactor callers (without an ioctx submission ticket) still share inode ordering.
-    if (slice.is_write() && !slice.backend_owner && file->writable())
+    if (_config.async_engine.mode != engine_mode::legacy && _config.async_engine.async_writes &&
+        slice.is_write() && !slice.backend_owner && file->writable())
       slice.backend_owner = file->write_state()->begin();
 
     // A legacy-parked slice stays legacy even if its mount qualified meanwhile.
@@ -1497,8 +1568,7 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
       adopted.write_ticket             = slice.backend_owner;
       adopted.granule                  = file->mount_identity_info().geometry.granule;
       adopted.geometry_bytes           = file->mount_identity_info().geometry.geometry_bytes;
-      adopted.file_policy              = file->async_policy();
-      adopted.logical                  = slice.rng;
+      adopted.file_policy              = file->async_policy();      adopted.logical                  = slice.rng;
       adopted.user_ptr                 = slice.d_buffer.data;
       adopted.device_id                = slice.d_buffer.device_id;
       adopted.user_stream              = slice.d_buffer.stream.get();
@@ -1525,11 +1595,55 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
     // Do not hold engine visibility behind any synchronous legacy work in this pass.
     if (publication) publication->publish();
 
+    bool const is_read     = !slice.is_write() && !slice.is_flush();
+    bool const device_only = slice.has_device_request() && !slice.has_host_request();
+    auto const clamped     = clamp_to_file(file->size(), slice.rng.offset, slice.rng.size);
+    // The GDS fast path serves a pure device destination, large enough to repay
+    // cuFile's bookkeeping, of a file that registered with cuFile.  Writes choose
+    // their path in dispatch_write.
+    bool const gds_path = is_read && device_only && clamped != 0 &&
+                          clamped >= _config.gds_threshold && file->cufile_registered() &&
+                          cufile_api::get() != nullptr;
+
+    int device_id = slice.d_buffer.device_id;
+    if (slice.has_device_request() && device_id < 0) {
+      CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id));
+      slice.d_buffer.device_id = device_id;
+    }
+    std::optional<rmm::cuda_set_device_raii> guard;
+    if (slice.has_device_request()) guard.emplace(rmm::cuda_device_id{device_id});
+
     // A device-only slice (a read into or a write from device memory) must not
     // touch its buffer before the work queued on its stream before the call has
-    // finished.  Park it rather than block the worker on someone else's GPU work.
-    bool const device_only = slice.has_device_request() && !slice.has_host_request();
-    if (device_only && !stream_ready && park_if_stream_busy(obj, slice, coordinator)) return;
+    // finished.  Park it rather than block the worker on someone else's GPU work
+    // -- unless it is a read staged into a spare slot, where only its scatter copy
+    // has to wait, and that wait happens on the GPU.  A write past EOF clamps to
+    // nothing but still reads its whole source.
+    device_staging* staging = gds_path ? staging_for(device_id) : nullptr;
+    bool gate_pending       = false;
+    if (device_only && (clamped != 0 || !is_read) && !stream_ready) {
+      switch (gate_of(slice)) {
+        case gate_state::ready: break;
+        case gate_state::pending: {
+          bool const early =
+            staging != nullptr && _config.staging_slots_per_reactor > 1 &&
+            detail::staged_calls(slice.rng.offset,
+                                 slice.rng.offset + clamped,
+                                 file->size(),
+                                 align_down_block(_config.staging_slot_bytes())) == 1 &&
+            staging->free_count() >= 2 && inflight_count() < _config.max_inflight;
+          if (!early) {
+            park_on_gate(obj, std::move(slice), coordinator);
+            return;
+          }
+          gate_pending = true;
+          break;
+        }
+        case gate_state::unchecked:
+          if (park_if_stream_busy(obj, slice, coordinator)) return;
+          break;
+      }
+    }
 
     // Tracked legacy writes retain their exact old I/O policy; only conflicting
     // inode granules wait resource-free, rather than occupying a blocking worker.
@@ -1565,7 +1679,7 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
       request->device_copy            = std::make_unique<device_cpy_request>();
       request->device_copy->req_rng   = slice.rng;
       request->device_copy->d_buffer  = slice.d_buffer;
-      request->device_copy->device_id = slice.d_buffer.device_id;
+      request->device_copy->device_id = device_id;
     }
 
     if (slice.is_write() || slice.is_flush()) {
@@ -1585,17 +1699,35 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
     }
 
     // Clamp to EOF up front so the terminal paths can trust request->io_rng.
-    auto const clamped = clamp_to_file(file->size(), slice.rng.offset, slice.rng.size);
-    request->io_rng    = range{slice.rng.offset, clamped};
+    request->io_rng = range{slice.rng.offset, clamped};
     if (clamped == 0) {
       request->finish_success();
       return;
     }
 
-    // The GDS fast path serves a pure device destination, large enough to repay
-    // cuFile's bookkeeping, of a file that registered with cuFile.
-    if (file->cufile_registered() && device_only && clamped >= _config.gds_threshold) {
-      if (read_cufile(*file, slice, request)) return;
+    if (gds_path) {
+      if (staging != nullptr) {
+        if (read_cufile_staged(*file, slice, request, *staging, gate_pending)) return;
+      } else if (!slice.is_fused() && read_cufile(*file, slice, request)) {
+        return;
+      }
+    }
+    if (slice.is_fused()) {
+      // Not staged (no slot, no GDS, or cuFile failed): serve the parts as the
+      // separate slices they were.  Each takes a credit of its own before this
+      // slice gives its one back, so the request cannot settle in between.  The
+      // gate has been waited for by now, or was never pending.
+      coordinator->add_tasks(slice.fused.size());
+      for (auto const& part : slice.fused) {
+        prepared_io_slice single;
+        single.rng           = part.rng;
+        single.d_buffer      = slice.d_buffer;
+        single.d_buffer.data = part.data;
+        single.priority      = slice.priority;
+        dispatch_slice(obj, std::move(single), coordinator, /*stream_ready=*/true);
+      }
+      request->finish_success();
+      return;
     }
     dispatch_posix(*file, slice, std::move(request));
   } catch (...) {
@@ -1609,15 +1741,36 @@ void cufile_reactor::dispatch_slice(std::shared_ptr<const io_object> const& obj,
   }
 }
 
+cufile_reactor::gate_state cufile_reactor::gate_of(prepared_io_slice const& slice)
+{
+  if (!slice.d_buffer.ready_gate_set) return gate_state::unchecked;
+  if (slice.d_buffer.ready_gate == nullptr) return gate_state::ready;
+  auto const status = slice.d_buffer.ready_gate->query_raw_status();
+  if (status == cudaSuccess) return gate_state::ready;
+  if (status == cudaErrorNotReady) return gate_state::pending;
+  std::ignore = cudaGetLastError();
+  throw cucascade::cuda_error(std::string{"cufile_reactor: querying a stream gate failed: "} +
+                              cudaGetErrorString(status));
+}
+
+void cufile_reactor::park_on_gate(std::shared_ptr<const io_object> const& obj,
+                                  prepared_io_slice&& slice,
+                                  std::shared_ptr<grouped_coordinator> const& coordinator)
+{
+  auto gate = slice.d_buffer.ready_gate;
+  _waiting.push_back(waiting_slice{obj, std::move(slice), coordinator, std::move(gate)});
+  _counters.parked_slices.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool cufile_reactor::park_if_stream_busy(std::shared_ptr<const io_object> const& obj,
                                          prepared_io_slice& slice,
                                          std::shared_ptr<grouped_coordinator> const& coordinator)
 {
-  int device_id = slice.d_buffer.device_id;
-  if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
-  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
-
-  auto const stream = slice.d_buffer.stream.get();
+  // The caller's device is current (dispatch_slice set it).  Without a gate
+  // recorded at submission the stream can only be checked here, on the worker:
+  // the null handle is the caller's legacy default stream, never the worker's
+  // per-thread one.
+  auto const stream = worker_view_of(slice.d_buffer.stream.get());
   if (stream != cudaStreamLegacy) {
     auto const state = cudaStreamQuery(stream);
     if (state == cudaSuccess) return false;
@@ -1627,13 +1780,16 @@ bool cufile_reactor::park_if_stream_busy(std::shared_ptr<const io_object> const&
                                   cudaGetErrorString(state));
     }
   }
-  // A legacy-stream event orders after prior work on every blocking stream,
-  // including a PTDS caller's null stream. A bare legacy-stream query does not
-  // promise that dependency. Explicit streams keep the cheap query above.
-  cucascade::cuda::cuda_event event{cudaEventDisableTiming};
-  CUCASCADE_CUDA_TRY(cudaEventRecord(event.get(), stream));
+  // The event marks "everything queued before this dispatch"; work the caller
+  // queues later does not hold the slice back.  A legacy-stream event orders
+  // after prior work on every blocking stream, including a PTDS caller's null
+  // stream; a bare legacy-stream query does not promise that dependency, so
+  // explicit streams keep the cheap query above and the legacy stream is
+  // checked through the event.
+  auto event = std::make_shared<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
+  CUCASCADE_CUDA_TRY(cudaEventRecord(event->get(), stream));
   if (stream == cudaStreamLegacy) {
-    auto const state = cudaEventQuery(event.get());
+    auto const state = cudaEventQuery(event->get());
     if (state == cudaSuccess) return false;
     std::ignore = cudaGetLastError();
     if (state != cudaErrorNotReady) {
@@ -1642,6 +1798,176 @@ bool cufile_reactor::park_if_stream_busy(std::shared_ptr<const io_object> const&
     }
   }
   _waiting.push_back(waiting_slice{obj, std::move(slice), coordinator, std::move(event)});
+  _counters.parked_slices.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+cufile_reactor::device_staging* cufile_reactor::staging_for(int device_id)
+{
+  if (device_id < 0 || _config.staging_mode == staging::never) return nullptr;
+  if (_config.staging_mode == staging::automatic && !gds_available()) return nullptr;
+  auto const index = static_cast<std::size_t>(device_id);
+  if (_staging.size() <= index) _staging.resize(index + 1);
+  auto& entry = _staging[index];
+  if (entry == nullptr) entry = std::make_unique<device_staging>();
+  if (!entry->initialized) {
+    entry->initialized = true;
+    // Automatic staging is worth it only into registered memory; forced staging
+    // takes what it can get.
+    bool const require_registered = _config.staging_mode == staging::automatic;
+    auto const slot_bytes         = _config.staging_slot_bytes();
+    auto& pool                    = detail::staging_pool::instance();
+    for (std::size_t i = 0; i < _config.staging_slots_per_reactor; ++i) {
+      auto slot =
+        pool.acquire(device_id, slot_bytes, _ctx->staging_cap(device_id), require_registered);
+      if (!slot) break;
+      try {
+        entry->slots.emplace_back();
+        auto& added = entry->slots.back();
+        added.slot  = slot;
+        CUCASCADE_CUDA_TRY(cudaStreamCreateWithFlags(&added.stream.stream, cudaStreamNonBlocking));
+        added.stream.device_id = device_id;
+      } catch (...) {
+        if (!entry->slots.empty() && entry->slots.back().slot.base == slot.base) {
+          entry->slots.pop_back();
+        }
+        pool.release(slot);
+        break;
+      }
+    }
+  }
+  return entry->slots.empty() ? nullptr : entry.get();
+}
+
+bool cufile_reactor::read_cufile_staged(cufile_io_object const& file,
+                                        prepared_io_slice const& slice,
+                                        std::unique_ptr<io_op_request>& request,
+                                        device_staging& staging,
+                                        bool gate_pending)
+{
+  auto const* api = cufile_api::get();
+  auto* entry     = staging.free_slot();
+  if (api == nullptr || entry == nullptr) {
+    // Every slot holds a copy waiting for another stream (cannot happen when the
+    // gate passed: early reads always leave one free).  Read directly instead.
+    if (gate_pending) std::ignore = slice.d_buffer.ready_gate->synchronize_no_throw();
+    if (slice.is_fused()) return false;
+    return read_cufile(file, slice, request);
+  }
+
+  auto const& gate     = slice.d_buffer.ready_gate;
+  auto const offset    = request->io_rng.offset;
+  auto const end       = offset + request->io_rng.size;
+  auto const file_size = file.size();
+  auto const body_end  = align_down_block(file_size);
+  auto* const dst      = slice.d_buffer.data;
+  auto const slot_size = align_down_block(entry->slot.bytes);
+  std::optional<grouped_coordinator::error_type> failure;
+  auto wait_for_gate = [&]() noexcept {
+    if (!gate_pending) return;
+    gate_pending = false;
+    std::ignore  = gate->synchronize_no_throw();
+  };
+
+  auto pos = offset;
+  while (pos < end) {
+    if (_stop_source.stop_requested()) {
+      failure = canceled_error();
+      break;
+    }
+    // Widen the piece to whole blocks: an aligned file offset, length and slot
+    // address are what cuFile can DMA into registered memory directly.  Never
+    // past the end of the file, though (what a GDS path does there is not
+    // specified, and some nvidia-fs builds trip over it): a range ending in the
+    // file's partial last block reads the aligned body first and that tail in a
+    // call of its own, so the body stays eligible for direct DMA.
+    auto const aligned_offset = align_down_block(pos);
+    auto stop                 = std::min(align_up_block(end), aligned_offset + slot_size);
+    if (stop > file_size) { stop = aligned_offset < body_end ? body_end : file_size; }
+    auto const want = stop - aligned_offset;
+    errno           = 0;
+    auto const got  = api->read(
+      file.cufile_handle(), entry->slot.base, want, static_cast<off_t>(aligned_offset), 0);
+    if (got < 0) {
+      log_cufile_failure_once(file, got, errno);
+      _counters.cufile_failures.fetch_add(1, std::memory_order_relaxed);
+      // Whatever was copied already is rewritten, identically, by the fallback,
+      // which writes the destination itself and so must follow the gate.
+      wait_for_gate();
+      return false;
+    }
+    auto const read_end  = aligned_offset + static_cast<std::size_t>(got);
+    auto const piece_end = std::min(read_end, end);
+    // The range was clamped to the size recorded at open, so reading nothing
+    // where data was expected means the file shrank underneath us; more than
+    // asked is malformed.  A short read that made progress is carried on from
+    // where it stopped: every call moves `pos`, so the loop ends.
+    if (static_cast<std::size_t>(got) > want || piece_end <= pos) {
+      failure = std::make_error_code(std::errc::io_error);
+      break;
+    }
+
+    // Scatter the wanted bytes on the slot's stream, ordered after the caller's
+    // earlier work by the gate.
+    auto const stream = entry->stream.stream;
+    auto status       = cudaSuccess;
+    if (gate_pending) status = cudaStreamWaitEvent(stream, gate->get(), 0);
+    if (status == cudaSuccess && !slice.is_fused()) {
+      status = cudaMemcpyAsync(dst + (pos - offset),
+                               entry->slot.base + (pos - aligned_offset),
+                               piece_end - pos,
+                               cudaMemcpyDeviceToDevice,
+                               stream);
+    }
+    // A fused slice: each part's share of the bytes this call brought in.
+    for (auto const& part : slice.fused) {
+      if (status != cudaSuccess) break;
+      auto const from = std::max(pos, part.rng.offset);
+      auto const to   = std::min(piece_end, part.rng.offset + part.rng.size);
+      if (to <= from) continue;
+      status = cudaMemcpyAsync(part.data + (from - part.rng.offset),
+                               entry->slot.base + (from - aligned_offset),
+                               to - from,
+                               cudaMemcpyDeviceToDevice,
+                               stream);
+    }
+    if (status == cudaSuccess) status = cudaEventRecord(entry->done.get(), stream);
+    if (status != cudaSuccess) {
+      // The copy may be queued without an event to wait on: drain the slot's
+      // stream (it carries only this slot's copies) before the slot is reused or
+      // the request settles.
+      std::ignore = cudaStreamSynchronize(stream);
+      std::ignore = cudaGetLastError();
+      failure     = status;
+      break;
+    }
+    if (gate_pending && piece_end == end) {
+      // The whole range is in the slot and its copy waits on the GPU for the
+      // caller's stream: hand the request to the slot and serve other reads.
+      entry->owner       = std::move(request);
+      entry->owner_bytes = slice.payload_bytes();
+      entry->owner_parts = slice.fused.size();
+      ++_staged_inflight;
+      return true;
+    }
+    wait_for_gate();
+    if (auto const synced = entry->done.synchronize_no_throw(); synced != cudaSuccess) {
+      std::ignore = cudaGetLastError();
+      failure     = synced;
+      break;
+    }
+    pos = piece_end;
+  }
+
+  wait_for_gate();
+  if (failure) {
+    request->finish_error(*failure);
+  } else {
+    _counters.staged_reads.fetch_add(1, std::memory_order_relaxed);
+    _counters.staged_bytes.fetch_add(slice.payload_bytes(), std::memory_order_relaxed);
+    _counters.fused_slices.fetch_add(slice.fused.size(), std::memory_order_relaxed);
+    request->finish_success();
+  }
   return true;
 }
 
@@ -1652,22 +1978,14 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
   auto const* api = cufile_api::get();
   if (api == nullptr) return false;
 
-  int device_id = slice.d_buffer.device_id;
-  if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
-  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
-
   auto const offset = request->io_rng.offset;
   auto const end    = offset + request->io_rng.size;
   auto* const dst   = slice.d_buffer.data;
   std::optional<std::error_code> failure;
   {
-    // A registered range is addressed by its base plus an offset (cuFile requires
-    // the registered base); an unregistered one by the exact pointer.
-    transfer_registration const registration{
-      dst, request->io_rng.size, offset % IO_BLOCK_SIZE == 0, _config.register_min_bytes};
-    if (registration.conflict()) return false;
-    auto pos        = offset;
-    int short_reads = 0;
+    // The destination is never registered with cuFile: each piece is addressed
+    // by its exact device pointer with a zero buffer offset.
+    auto pos = offset;
     while (pos < end) {
       if (_stop_source.stop_requested()) {
         failure = canceled_error();
@@ -1677,38 +1995,27 @@ bool cufile_reactor::read_cufile(cufile_io_object const& file,
       run_cufile_transfer_hook();
       errno = 0;
       auto const got =
-        registration.registered()
-          ? api->read(file.cufile_handle(),
-                      dst,
-                      want,
-                      static_cast<off_t>(pos),
-                      static_cast<off_t>(pos - offset))
-          : api->read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
+        api->read(file.cufile_handle(), dst + (pos - offset), want, static_cast<off_t>(pos), 0);
       if (got < 0) {
-        auto const saved_errno = errno;
-        static std::atomic<bool> logged{false};
-        if (!logged.exchange(true, std::memory_order_relaxed)) {
-          CUCASCADE_LOG_WARN(
-            "cufile_reactor: cuFileRead of '{}' failed: {}; serving such reads through POSIX "
-            "(logged once per process)",
-            file.object_path(),
-            describe_cufile_failure(got, saved_errno));
-        }
+        log_cufile_failure_once(file, got, errno);
+        _counters.cufile_failures.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
       // The range was clamped to the size recorded at open, so nothing read here
       // is a sign that the file shrank underneath us; more than asked is malformed.
-      if (got == 0 || static_cast<std::size_t>(got) > want || ++short_reads > max_short_reads) {
+      // A short read that made progress is carried on from where it stopped.
+      if (got == 0 || static_cast<std::size_t>(got) > want) {
         failure = std::make_error_code(std::errc::io_error);
         break;
       }
-      if (static_cast<std::size_t>(got) == want) short_reads = 0;
       pos += static_cast<std::size_t>(got);
     }
   }
   if (failure) {
     request->finish_error(*failure);
   } else {
+    _counters.direct_reads.fetch_add(1, std::memory_order_relaxed);
+    _counters.direct_bytes.fetch_add(end - offset, std::memory_order_relaxed);
     request->finish_success();
   }
   return true;
@@ -1743,9 +2050,11 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
     return;
   }
   // A host-only read goes O_DIRECT (staged through the scratch when it is not
-  // block-aligned), like the uring reactor's; a host+device pair, or a file
-  // without an O_DIRECT fd, reads through the page cache.
-  bool const direct = !slice.has_device_request() &&
+  // block-aligned), like the uring reactor's, and so does a host+device pair of
+  // a file cuFile serves (buffered reads of a file read with GDS cost the GDS
+  // reads performance); other pairs, and files without an O_DIRECT fd, read
+  // through the page cache.
+  bool const direct = (!slice.has_device_request() || file.cufile_registered()) &&
                       uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
   auto const bytes_read = direct
                             ? read_host_direct(file, base, request->io_rng)
@@ -1760,6 +2069,8 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
   }
 
   if (!slice.has_device_request()) {
+    _counters.host_reads.fetch_add(1, std::memory_order_relaxed);
+    _counters.host_bytes.fetch_add(bytes_read, std::memory_order_relaxed);
     request->finish_success();
     return;
   }
@@ -1774,14 +2085,35 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
   }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
   cucascade::cuda::cuda_event event{cudaEventDisableTiming};
-  auto status = request->device_copy->copy_async(request->io_rng, request->iovecs);
-  if (status == cudaSuccess) status = record_copy_event(event.get(), slice.d_buffer.stream.get());
+  // With a submission-time gate the copy runs on the reactor's own stream, after
+  // the gate: the caller's stream handle may name another stream on this thread.
+  // Without one, the caller's stream orders it (null meaning the legacy stream).
+  cudaStream_t copy_on = worker_view_of(slice.d_buffer.stream.get());
+  auto status          = cudaSuccess;
+  if (slice.d_buffer.ready_gate_set) {
+    try {
+      copy_on = pair_stream(device_id);
+    } catch (...) {
+      request->finish_error(std::current_exception(), /*host_data_valid=*/true);
+      return;
+    }
+    if (slice.d_buffer.ready_gate != nullptr) {
+      status = cudaStreamWaitEvent(copy_on, slice.d_buffer.ready_gate->get(), 0);
+    }
+  }
+  if (status == cudaSuccess) {
+    auto copy            = *request->device_copy;
+    copy.d_buffer.stream = ::cuda::stream_ref{copy_on};
+    copy.d_buffer.ready_gate.reset();
+    status = copy.copy_async(request->io_rng, request->iovecs);
+  }
+  if (status == cudaSuccess) status = record_copy_event(event.get(), copy_on);
   if (status != cudaSuccess) {
-    // Some copies may already be queued on the caller's stream (copy_async can
-    // fail part-way, or only the event record failed): they still read the host
-    // buffer and write the destination, so wait for them before settling, or
-    // the caller could free either while the DMA runs.
-    std::ignore = cudaStreamSynchronize(slice.d_buffer.stream.get());
+    // Some copies may already be queued (copy_async can fail part-way, or only
+    // the event record failed): they still read the host buffer and write the
+    // destination, so wait for them before settling, or the caller could free
+    // either while the DMA runs.
+    std::ignore = cudaStreamSynchronize(copy_on);
     std::ignore = cudaGetLastError();
     request->finish_error(status, /*host_data_valid=*/true);
     return;
@@ -1801,17 +2133,18 @@ std::size_t cufile_reactor::read_host_direct(cufile_io_object const& file,
     }
     // Read whole blocks covering the range through the scratch, a slot at a time,
     // and copy out the wanted bytes.  A read reaching EOF returns short there.
-    auto* const buffer = scratch();
+    auto const first   = align_down_block(rng.offset);
+    auto const lease   = lease_scratch(align_up_block(end) - first, 1);
     std::size_t copied = 0;
-    for (auto block = align_down_block(rng.offset); block < end;) {
+    for (auto block = first; block < end;) {
       if (_stop_source.stop_requested()) throw std::system_error(canceled_error());
       auto const want =
-        std::min(scratch_slot_bytes, align_down_block(end - 1) + IO_BLOCK_SIZE - block);
-      auto const got  = pread_all(file.direct_fd(), buffer, want, block);
+        std::min(lease.slot_bytes, align_down_block(end - 1) + IO_BLOCK_SIZE - block);
+      auto const got  = lease.read(file.direct_fd(), 0, want, block);
       auto const from = std::max(block, rng.offset);
       auto const to   = std::min(block + got, end);
       if (to <= from) break;
-      std::memcpy(destination + (from - rng.offset), buffer + (from - block), to - from);
+      lease.to_host(destination + (from - rng.offset), 0, from - block, to - from);
       copied += to - from;
       if (got < want) break;  // end of file
       block += want;
@@ -1832,92 +2165,126 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
   if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
 
-  auto* const scratch_base = scratch();
-
-  // Double-buffered: the read of piece k+1 overlaps the H2D copy of piece k, and a
-  // slot is reused only after its previous copy has completed.  The copies run on
-  // the reactor's own stream: the slice passed its stream gate, so the caller's
-  // earlier work is done, and later caller work cannot hold the worker.
-  static_assert(scratch_slots == 2, "one event per scratch slot below");
-  std::array<cucascade::cuda::cuda_event, scratch_slots> copied{
-    cucascade::cuda::cuda_event{cudaEventDisableTiming},
-    cucascade::cuda::cuda_event{cudaEventDisableTiming}};
-  std::array<bool, scratch_slots> pending{};
-  auto const stream = copy_stream(device_id);
-  // Wait for every copy issued so far.  When a slot's event cannot be waited on,
-  // fall back to the whole (reactor-owned) copy stream: the request must not
-  // settle, nor the scratch be reused, while a copy may still be running.
-  auto drain = [&]() noexcept {
-    auto status = cudaSuccess;
-    for (std::size_t slot = 0; slot < scratch_slots; ++slot) {
-      if (!pending[slot]) continue;
-      pending[slot] = false;
-      if (auto const s = copied[slot].synchronize_no_throw(); s != cudaSuccess) status = s;
-    }
-    if (status != cudaSuccess) {
-      std::ignore = cudaStreamSynchronize(stream);
-      std::ignore = cudaGetLastError();
-    }
-    return status;
-  };
-
   auto const offset = request.io_rng.offset;
   auto const size   = request.io_rng.size;
-  std::size_t done  = 0;
-  for (std::size_t piece = 0; done < size; ++piece) {
-    if (_stop_source.stop_requested()) {
-      std::ignore = drain();
-      request.finish_error(canceled_error());
-      return;
-    }
-    auto const slot = piece % scratch_slots;
-    if (pending[slot]) {
-      pending[slot] = false;
-      if (auto const status = copied[slot].synchronize_no_throw(); status != cudaSuccess) {
-        std::ignore = drain();
-        request.finish_error(status);
-        return;
+  // The outcome is decided with the scratch leased and settled once it is back:
+  // a borrowed HOST pool block must not outlive the transfer.
+  auto const failure = [&]() -> std::optional<grouped_coordinator::error_type> {
+    // A slot holds a piece widened by a block at each end; a second slot only
+    // when the range takes more than one piece.
+    auto const span  = std::min(align_up_block(size) + 2 * IO_BLOCK_SIZE, scratch_slot_bytes);
+    auto const lease = lease_scratch(span, size + 2 * IO_BLOCK_SIZE <= span ? 1 : scratch_slots);
+
+    // Double-buffered: the read of piece k+1 overlaps the H2D copy of piece k, and a
+    // slot is reused only after its previous copy has completed.  The copies run on
+    // the reactor's own stream: the slice passed its stream gate, so the caller's
+    // earlier work is done, and later caller work cannot hold the worker.
+    static_assert(scratch_slots == 2, "one event per scratch slot below");
+    std::array<cucascade::cuda::cuda_event, scratch_slots> copied{
+      cucascade::cuda::cuda_event{cudaEventDisableTiming},
+      cucascade::cuda::cuda_event{cudaEventDisableTiming}};
+    std::array<bool, scratch_slots> pending{};
+    auto const stream = copy_stream(device_id);
+    // Wait for every copy issued so far.  When a slot's event cannot be waited on,
+    // fall back to the whole (reactor-owned) copy stream: the request must not
+    // settle, nor the scratch be reused, while a copy may still be running.
+    auto drain = [&]() noexcept {
+      auto status = cudaSuccess;
+      for (std::size_t slot = 0; slot < scratch_slots; ++slot) {
+        if (!pending[slot]) continue;
+        pending[slot] = false;
+        if (auto const s = copied[slot].synchronize_no_throw(); s != cudaSuccess) status = s;
       }
+      if (status != cudaSuccess) {
+        std::ignore = cudaStreamSynchronize(stream);
+        std::ignore = cudaGetLastError();
+      }
+      return status;
+    };
+
+    // A file cuFile serves is read O_DIRECT here too, whole blocks around each
+    // piece: buffered reads of a file being read with GDS cost the GDS reads
+    // performance (IBM documents it for Storage Scale) and fill the page cache with
+    // blocks the direct path must keep coherent.
+    bool direct = file.cufile_registered() &&
+                  uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
+    std::size_t done = 0;
+    for (std::size_t piece = 0; done < size; ++piece) {
+      if (_stop_source.stop_requested()) {
+        std::ignore = drain();
+        return canceled_error();
+      }
+      auto const slot = piece % scratch_slots;
+      if (pending[slot]) {
+        pending[slot] = false;
+        if (auto const status = copied[slot].synchronize_no_throw(); status != cudaSuccess) {
+          std::ignore = drain();
+          return status;
+        }
+      }
+      auto const pos = offset + done;
+      std::size_t source{0};  // where the wanted bytes start in the slot
+      std::size_t want{0};
+      std::size_t got{0};
+      try {
+        if (direct) {
+          // The widened piece must fit the slot: up to a block of head and tail.
+          want                     = std::min(lease.slot_bytes - 2 * IO_BLOCK_SIZE, size - done);
+          auto const aligned_begin = align_down_block(pos);
+          auto const head          = pos - aligned_begin;
+          try {
+            auto const read = lease.read(
+              file.direct_fd(), slot, align_up_block(pos + want) - aligned_begin, aligned_begin);
+            got    = read > head ? std::min(read - head, want) : 0;
+            source = head;
+          } catch (std::system_error const& error) {
+            // The filesystem refused O_DIRECT at run time: the page cache from here on.
+            if (!uring::detail::is_odirect_runtime_error(error.code().value())) throw;
+            direct = false;
+            want   = std::min(lease.slot_bytes, size - done);
+            got    = lease.read(file.buffered_fd(), slot, want, pos);
+            source = 0;
+          }
+        } else {
+          want = std::min(lease.slot_bytes, size - done);
+          got  = lease.read(file.buffered_fd(), slot, want, pos);
+        }
+      } catch (...) {
+        std::ignore = drain();
+        throw;
+      }
+      // The range was clamped to the size recorded at open: a short read means the
+      // file shrank underneath us.
+      if (got != want) {
+        std::ignore = drain();
+        return std::make_error_code(std::errc::io_error);
+      }
+      auto status = delay_staging_copy(stream);
+      if (status == cudaSuccess) {
+        status = lease.to_device(slice.d_buffer.data + done, slot, source, want, stream);
+      }
+      if (status == cudaSuccess) status = record_copy_event(copied[slot].get(), stream);
+      if (status != cudaSuccess) {
+        // This piece's copy may be queued without an event to wait on (only the
+        // record failed): wait for the whole copy stream, which carries only this
+        // reactor's copies, before the scratch or the request is released.
+        std::ignore = cudaStreamSynchronize(stream);
+        std::ignore = cudaGetLastError();
+        std::ignore = drain();
+        return status;
+      }
+      pending[slot] = true;
+      done += want;
     }
-    auto* const buffer = scratch_base + slot * scratch_slot_bytes;
-    auto const want    = std::min(scratch_slot_bytes, size - done);
-    std::size_t got{0};
-    try {
-      got = pread_all(file.buffered_fd(), buffer, want, offset + done);
-    } catch (...) {
-      std::ignore = drain();
-      throw;
-    }
-    // The range was clamped to the size recorded at open: a short read means the
-    // file shrank underneath us.
-    if (got != want) {
-      std::ignore = drain();
-      request.finish_error(std::make_error_code(std::errc::io_error));
-      return;
-    }
-    auto status = delay_staging_copy(stream);
-    if (status == cudaSuccess) {
-      status =
-        cudaMemcpyAsync(slice.d_buffer.data + done, buffer, want, cudaMemcpyHostToDevice, stream);
-    }
-    if (status == cudaSuccess) status = record_copy_event(copied[slot].get(), stream);
-    if (status != cudaSuccess) {
-      // This piece's copy may be queued without an event to wait on (only the
-      // record failed): wait for the whole copy stream, which carries only this
-      // reactor's copies, before the scratch or the request is released.
-      std::ignore = cudaStreamSynchronize(stream);
-      std::ignore = cudaGetLastError();
-      std::ignore = drain();
-      request.finish_error(status);
-      return;
-    }
-    pending[slot] = true;
-    done += want;
-  }
-  if (auto const status = drain(); status != cudaSuccess) {
-    request.finish_error(status);
+    if (auto const status = drain(); status != cudaSuccess) return status;
+    return std::nullopt;
+  }();
+  if (failure) {
+    request.finish_error(*failure);
     return;
   }
+  _counters.posix_device_reads.fetch_add(1, std::memory_order_relaxed);
+  _counters.posix_device_bytes.fetch_add(size, std::memory_order_relaxed);
   request.finish_success();
 }
 
@@ -1929,6 +2296,44 @@ std::uint8_t* cufile_reactor::scratch()
   return _scratch.get();
 }
 
+cufile_reactor::scratch_lease cufile_reactor::lease_scratch(std::size_t bytes, std::size_t slots)
+{
+  bytes = std::clamp(align_up_block(bytes), IO_BLOCK_SIZE, scratch_slot_bytes);
+  scratch_lease lease;
+  if (auto* const pool = memory::find_host_pool(_placement.numa_node); pool != nullptr) {
+    auto const block = pool->get_block_size();
+    if (block != 0 && block % IO_BLOCK_SIZE == 0) {
+      auto const per_slot = (bytes + block - 1) / block;
+      try {
+        auto blocks  = pool->allocate_multiple_blocks(per_slot * block * slots);
+        bool usable  = blocks->size() == per_slot * slots;
+        for (auto* const start : blocks->get_blocks()) {
+          usable = usable && is_block_aligned(start);
+        }
+        if (usable) {
+          lease.blocks     = std::move(blocks);
+          lease.slot_bytes = per_slot * block;
+          lease.run_bytes  = block;
+          return lease;
+        }
+      } catch (std::exception const& e) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+          CUCASCADE_LOG_WARN(
+            "cufile_reactor: the HOST memory pool cannot lend {} bytes of staging ({}); using the "
+            "reactor's own pinned scratch (logged once per process)",
+            per_slot * block * slots,
+            e.what());
+        }
+      }
+    }
+  }
+  lease.own        = scratch();
+  lease.slot_bytes = scratch_slot_bytes;
+  lease.run_bytes  = scratch_slot_bytes;
+  return lease;
+}
+
 void cufile_reactor::pinned_deleter::operator()(std::uint8_t* memory) const noexcept
 {
   scratch_pool::instance().release(memory);
@@ -1936,12 +2341,22 @@ void cufile_reactor::pinned_deleter::operator()(std::uint8_t* memory) const noex
 
 cudaStream_t cufile_reactor::copy_stream(int device_id)
 {
+  return device_stream(_copy_streams, device_id);
+}
+
+cudaStream_t cufile_reactor::pair_stream(int device_id)
+{
+  return device_stream(_pair_streams, device_id);
+}
+
+cudaStream_t cufile_reactor::device_stream(std::vector<owned_stream>& streams, int device_id)
+{
   if (device_id < 0) {
     throw std::invalid_argument("cufile_reactor: copy stream of an unresolved device");
   }
   auto const index = static_cast<std::size_t>(device_id);
-  if (_copy_streams.size() <= index) _copy_streams.resize(index + 1);
-  auto& owned = _copy_streams[index];
+  if (streams.size() <= index) streams.resize(index + 1);
+  auto& owned = streams[index];
   if (owned.stream == nullptr) {
     CUCASCADE_CUDA_TRY(cudaStreamCreateWithFlags(&owned.stream, cudaStreamNonBlocking));
     owned.device_id = device_id;
@@ -1993,7 +2408,7 @@ std::size_t cufile_reactor::host_write(cufile_io_object const& file,
 
   bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
   auto const granule   = write_granule();
-  for (auto const& piece : range_plan::split_write_range(range{offset, size}, granule)) {
+  for (auto const& piece : uring::detail::split_write_range(range{offset, size}, granule)) {
     if (piece.empty()) continue;
     auto const* src = source + (piece.offset - offset);
     write_host_piece(
@@ -2022,7 +2437,7 @@ void cufile_reactor::dispatch_write(cufile_io_object const& file,
   request.kind       = io_op_kind::write;
   request.io_rng     = slice.rng;  // writes are never clamped: they may extend the file
   auto const granule = write_granule();
-  auto const pieces  = range_plan::split_write_range(slice.rng, granule);
+  auto const pieces  = uring::detail::split_write_range(slice.rng, granule);
 
   if (!slice.has_device_request()) {
     auto* const source = std::get<std::uint8_t*>(slice.h_buffer.buffer);
@@ -2056,9 +2471,11 @@ void cufile_reactor::dispatch_write(cufile_io_object const& file,
   if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
 
-  // The granule-aligned body goes to cuFile (whatever the source pointer's
-  // alignment: cuFile bounces an unaligned one inside the GPU); the sub-granule
-  // head and tail, and a body cuFile cannot or should not take, are staged.
+  // The granule-aligned body goes to cuFile; the sub-granule head and tail, and
+  // a body cuFile cannot or should not take, are staged through host memory.
+  // When the reactor holds staging slots on the source's GPU the body is copied
+  // into a registered, aligned slot first (as staged reads are), so cuFile can
+  // DMA it instead of bouncing an unregistered source through its own buffers.
   auto const& body = pieces[1];
   std::array<range, 3> staged{pieces[0], range{}, pieces[2]};
   // In compatibility mode (including one forced by the environment) cuFile
@@ -2071,9 +2488,11 @@ void cufile_reactor::dispatch_write(cufile_io_object const& file,
   if (try_cufile) {
     // The slice passed its stream gate in dispatch_slice, so the work queued on
     // the source's stream before the call has finished: cuFile may read it.
-    if (!write_cufile(file, slice.d_buffer.data + (body.offset - slice.rng.offset), body)) {
-      staged[1] = body;
-    }
+    auto const* source = slice.d_buffer.data + (body.offset - slice.rng.offset);
+    auto* staging      = staging_for(device_id);
+    bool const written = staging != nullptr ? write_cufile_staged(file, source, body, *staging)
+                                            : write_cufile(file, source, body);
+    if (!written) staged[1] = body;
   } else {
     staged[1] = body;
   }
@@ -2089,11 +2508,7 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
   if (api == nullptr) return false;
 
   auto const max_op = _config.max_op_bytes - _config.max_op_bytes % IO_BLOCK_SIZE;
-  // Deregistered when this function returns or throws, before the request settles.
-  transfer_registration const registration{
-    source, piece.size, /*aligned=*/true, _config.register_min_bytes};
-  if (registration.conflict()) return false;
-  std::size_t done = 0;
+  std::size_t done  = 0;
   int short_writes = 0;
   while (done < piece.size) {
     if (_stop_source.stop_requested()) {
@@ -2104,14 +2519,7 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
     run_cufile_transfer_hook();
     errno = 0;
     auto const got =
-      registration.registered()
-        ? api->write(file.cufile_handle(),
-                     source,
-                     want,
-                     static_cast<off_t>(piece.offset + done),
-                     static_cast<off_t>(done))
-        : api->write(
-            file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
+      api->write(file.cufile_handle(), source + done, want, static_cast<off_t>(piece.offset + done), 0);
     if (got < 0) {
       auto const saved_errno = errno;
       static std::atomic<bool> logged{false};
@@ -2122,15 +2530,92 @@ bool cufile_reactor::write_cufile(cufile_io_object const& file,
           file.object_path(),
           describe_cufile_failure(got, saved_errno));
       }
+      _counters.cufile_failures.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
-    if (got == 0 || static_cast<std::size_t>(got) > want || ++short_writes > max_short_reads) {
+    if (got == 0 || static_cast<std::size_t>(got) > want || ++short_writes > max_short_writes) {
       throw std::system_error(std::make_error_code(std::errc::io_error),
                               "cufile_reactor: cuFileWrite wrote nothing or too much");
     }
     if (static_cast<std::size_t>(got) == want) short_writes = 0;
     done += static_cast<std::size_t>(got);
   }
+  _counters.direct_writes.fetch_add(1, std::memory_order_relaxed);
+  _counters.direct_write_bytes.fetch_add(piece.size, std::memory_order_relaxed);
+  return true;
+}
+
+bool cufile_reactor::write_cufile_staged(cufile_io_object const& file,
+                                         std::uint8_t const* source,
+                                         range piece,
+                                         device_staging& staging)
+{
+  auto const* api = cufile_api::get();
+  auto* entry     = staging.free_slot();
+  if (api == nullptr || entry == nullptr) return write_cufile(file, source, piece);
+
+  // The piece is block-aligned in the file and a slot holds whole blocks, so
+  // every call writes an aligned length from an aligned address.  cuFile
+  // addresses a registered slot by its base plus an offset; an unregistered one
+  // (forced staging) by the exact pointer.
+  auto const slot_size = align_down_block(entry->slot.bytes);
+  auto const stream    = entry->stream.stream;
+  std::size_t done     = 0;
+  while (done < piece.size) {
+    if (_stop_source.stop_requested()) {
+      throw std::system_error(canceled_error(), "cufile_reactor: write canceled by shutdown");
+    }
+    auto const want = std::min(slot_size, piece.size - done);
+    // The slice passed its stream gate: the source is ready.  The copy runs on
+    // the slot's own stream and is finished before cuFile reads the slot.
+    auto status = cudaMemcpyAsync(
+      entry->slot.base, source + done, want, cudaMemcpyDeviceToDevice, stream);
+    if (status == cudaSuccess) status = cudaEventRecord(entry->done.get(), stream);
+    if (status == cudaSuccess) status = entry->done.synchronize_no_throw();
+    if (status != cudaSuccess) {
+      // The copy may be queued without an event to wait on: drain the slot's
+      // stream (it carries only this slot's copies) before the slot is reused.
+      std::ignore = cudaStreamSynchronize(stream);
+      std::ignore = cudaGetLastError();
+      throw cucascade::cuda_error(std::string{"cufile_reactor: staging copy failed: "} +
+                                  cudaGetErrorString(status));
+    }
+    int short_writes = 0;
+    for (std::size_t written = 0; written < want;) {
+      cufile_write_calls.fetch_add(1, std::memory_order_relaxed);
+      run_cufile_transfer_hook();
+      errno          = 0;
+      bool const registered = entry->slot.registered;
+      auto const got        = api->write(file.cufile_handle(),
+                                  registered ? entry->slot.base : entry->slot.base + written,
+                                  want - written,
+                                  static_cast<off_t>(piece.offset + done + written),
+                                  registered ? static_cast<off_t>(written) : 0);
+      if (got < 0) {
+        auto const saved_errno = errno;
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+          CUCASCADE_LOG_WARN(
+            "cufile_reactor: staged cuFileWrite of '{}' failed: {}; staging such writes through "
+            "POSIX (logged once per process)",
+            file.object_path(),
+            describe_cufile_failure(got, saved_errno));
+        }
+        _counters.cufile_failures.fetch_add(1, std::memory_order_relaxed);
+        // The caller rewrites the whole piece through POSIX, identically.
+        return false;
+      }
+      if (got == 0 || static_cast<std::size_t>(got) > want - written ||
+          ++short_writes > max_short_writes) {
+        throw std::system_error(std::make_error_code(std::errc::io_error),
+                                "cufile_reactor: cuFileWrite wrote nothing or too much");
+      }
+      written += static_cast<std::size_t>(got);
+    }
+    done += want;
+  }
+  _counters.staged_writes.fetch_add(1, std::memory_order_relaxed);
+  _counters.staged_write_bytes.fetch_add(piece.size, std::memory_order_relaxed);
   return true;
 }
 
@@ -2139,23 +2624,34 @@ void cufile_reactor::write_device_staged(cufile_io_object const& file,
                                          std::span<range const> pieces,
                                          int device_id)
 {
-  // Chunks of at most one scratch slot, never crossing a piece boundary, so a
-  // granule-aligned piece yields granule-aligned chunks (slot size is a multiple
-  // of every granule) that can go O_DIRECT.
+  std::size_t total     = 0;
+  std::size_t non_empty = 0;
+  for (auto const& piece : pieces) {
+    total += piece.size;
+    non_empty += piece.size != 0 ? 1 : 0;
+  }
+  if (total == 0) return;
+  auto const span  = std::min(align_up_block(total), scratch_slot_bytes);
+  auto const lease = lease_scratch(span, non_empty == 1 && total <= span ? 1 : scratch_slots);
+
+  // Chunks of at most one slot rounded down to the write granule, never crossing
+  // a piece boundary, so a granule-aligned piece yields granule-aligned chunks
+  // that can go O_DIRECT.
+  auto const granule     = write_granule();
+  auto const chunk_bytes = lease.slot_bytes >= granule
+                             ? lease.slot_bytes - lease.slot_bytes % granule
+                             : lease.slot_bytes;
   std::vector<range> chunks;
   for (auto const& piece : pieces) {
-    for (std::size_t done = 0; done < piece.size; done += scratch_slot_bytes) {
-      chunks.push_back(range{piece.offset + done, std::min(scratch_slot_bytes, piece.size - done)});
+    for (std::size_t done = 0; done < piece.size; done += chunk_bytes) {
+      chunks.push_back(range{piece.offset + done, std::min(chunk_bytes, piece.size - done)});
     }
   }
-  if (chunks.empty()) return;
 
-  auto* const scratch_base = scratch();
   // The slice passed its stream gate (dispatch_slice), so the source's earlier
   // work is done: the copies run on the reactor's own stream, where later work
   // of the caller cannot hold the worker.
   auto const stream    = copy_stream(device_id);
-  auto const granule   = write_granule();
   bool const direct_fd = uring::detail::odirect_available(_config.use_odirect, file.direct_fd());
   static_assert(scratch_slots == 2, "one event per scratch slot below");
   std::array<cucascade::cuda::cuda_event, scratch_slots> copied{
@@ -2182,11 +2678,8 @@ void cufile_reactor::write_device_staged(cufile_io_object const& file,
     auto const slot = k % scratch_slots;
     auto status     = delay_staging_copy(stream);
     if (status == cudaSuccess) {
-      status = cudaMemcpyAsync(scratch_base + slot * scratch_slot_bytes,
-                               slice.d_buffer.data + (chunks[k].offset - slice.rng.offset),
-                               chunks[k].size,
-                               cudaMemcpyDeviceToHost,
-                               stream);
+      status = lease.from_device(
+        slot, slice.d_buffer.data + (chunks[k].offset - slice.rng.offset), chunks[k].size, stream);
     }
     if (status == cudaSuccess) status = record_copy_event(copied[slot].get(), stream);
     if (status != cudaSuccess) {
@@ -2215,10 +2708,9 @@ void cufile_reactor::write_device_staged(cufile_io_object const& file,
         throw cucascade::cuda_error(std::string{"cufile_reactor: staging copy failed: "} +
                                     cudaGetErrorString(status));
       }
-      write_host_piece(file,
-                       direct_fd && is_granule_aligned(chunks[k], granule),
-                       scratch_base + slot * scratch_slot_bytes,
-                       chunks[k]);
+      write_piece(file, direct_fd && is_granule_aligned(chunks[k], granule), [&](int fd) {
+        lease.write(fd, slot, chunks[k].size, chunks[k].offset);
+      });
     }
   } catch (...) {
     // Never release the scratch to the next op while a copy may still fill it.
@@ -2243,7 +2735,7 @@ void cufile_reactor::poll_completions() noexcept
         write.coordinator->report_error(canceled_error());
     }
   }
-  // Parked device slices whose stream reached the point recorded at dispatch.
+  // Parked device slices whose stream reached the point recorded for them.
   // They are moved out first: dispatching one may park nothing (its gate is
   // open) but is long and synchronous, and must not race this scan.
   if (!_waiting.empty()) {
@@ -2253,8 +2745,10 @@ void cufile_reactor::poll_completions() noexcept
       // A request that already failed (a sibling slice's error, or shutdown)
       // must not wait for an unrelated stream to drain: nothing was issued for
       // a parked slice, so it settles at once (as canceled, below).
-      auto const status =
-        it->coordinator->should_continue() ? cudaEventQuery(it->event.get()) : cudaSuccess;
+      auto status = cudaSuccess;
+      if (it->coordinator->should_continue() && it->gate != nullptr) {
+        status = it->gate->query_raw_status();
+      }
       if (status == cudaErrorNotReady) {
         if (wait_out != it) *wait_out = std::move(*it);
         ++wait_out;
@@ -2273,17 +2767,22 @@ void cufile_reactor::poll_completions() noexcept
     }
     _waiting.erase(wait_out, _waiting.end());
     // Serve about max_op_bytes of ready slices per call, like a worker pass; the
-    // rest stay parked (their events have fired) for the next call.
+    // rest stay parked (their gates have fired) for the next call.
     std::size_t served_bytes = 0;
     for (auto& [waiting, status] : ready) {
       grouped_coordinator::error_type error{canceled_error()};
       if (status == cudaSuccess && waiting.coordinator->should_continue()) {
         if (served_bytes >= _config.max_op_bytes) {
-          _waiting.push_back(std::move(waiting));  // capacity reserved: cannot throw
+          // No more than were parked before this scan: the capacity holds them.
+          _waiting.push_back(std::move(waiting));
           continue;
         }
-        served_bytes += waiting.slice.size();
+        auto const bytes = waiting.slice.size();
+        served_bytes += bytes;
+        // Counted while its transfer runs, as in a worker pass.
+        _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
         dispatch_slice(waiting.obj, std::move(waiting.slice), waiting.coordinator, true);
+        _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
         continue;
       }
       if (status != cudaSuccess) error = status;
@@ -2304,12 +2803,55 @@ void cufile_reactor::poll_completions() noexcept
       continue;
     }
     if (status == cudaSuccess) {
+      _counters.posix_device_reads.fetch_add(1, std::memory_order_relaxed);
+      _counters.posix_device_bytes.fetch_add(it->bytes, std::memory_order_relaxed);
       it->request->finish_success();
     } else {
+      std::ignore = cudaGetLastError();
       it->request->finish_error(status, /*host_data_valid=*/true);
     }
   }
   _inflight_copy.erase(copy_out, _inflight_copy.end());
+
+  // Staged scatter copies that waited for their caller's stream.
+  if (_staged_inflight != 0) poll_staged(false, nullptr);
+}
+
+void cufile_reactor::poll_staged(bool wait, grouped_coordinator::error_type const* error) noexcept
+{
+  for (auto& staging : _staging) {
+    if (staging == nullptr) continue;
+    for (auto& entry : staging->slots) {
+      if (entry.owner == nullptr) continue;
+      auto const status =
+        wait ? entry.done.synchronize_no_throw() : cudaEventQuery(entry.done.get());
+      if (status == cudaErrorNotReady) continue;
+      auto request = std::move(entry.owner);
+      --_staged_inflight;
+      if (status != cudaSuccess) {
+        std::ignore = cudaGetLastError();
+        request->finish_error(status);
+      } else if (error != nullptr) {
+        request->finish_error(*error);
+      } else {
+        // Only reads issued before their stream was ready ever own a slot.
+        _counters.staged_reads.fetch_add(1, std::memory_order_relaxed);
+        _counters.early_staged_reads.fetch_add(1, std::memory_order_relaxed);
+        _counters.staged_bytes.fetch_add(entry.owner_bytes, std::memory_order_relaxed);
+        _counters.fused_slices.fetch_add(entry.owner_parts, std::memory_order_relaxed);
+        request->finish_success();
+      }
+    }
+    if (wait) {
+      // Shutdown: no read or copy uses the slots any more; give them back.
+      auto& pool = detail::staging_pool::instance();
+      for (auto& entry : staging->slots) {
+        pool.release(entry.slot);
+        entry.slot = {};
+      }
+      staging->slots.clear();
+    }
+  }
 }
 
 void cufile_reactor::cancel_waiting(grouped_coordinator::error_type const& error) noexcept
@@ -2321,8 +2863,7 @@ void cufile_reactor::cancel_waiting(grouped_coordinator::error_type const& error
     waiting.coordinator->report_error(error);
   }
   _waiting.clear();
-  for (auto& waiting : _write_waiting)
-    waiting.coordinator->report_error(error);
+  for (auto& waiting : _write_waiting) waiting.coordinator->report_error(error);
   _write_waiting.clear();
 }
 
@@ -2341,6 +2882,17 @@ void cufile_reactor::drain_inflight(grouped_coordinator::error_type const& termi
 
 void cufile_reactor::worker_loop(std::stop_token const& stop_token)
 {
+  // Pin before the first CUDA or cuFile call, so everything this worker touches
+  // (its scratch, cuFile's per-thread state) is local to its GPU's socket.
+  if (!_placement.cpus.empty() &&
+      !cucascade::exec::thread_util::set_thread_affinity(::pthread_self(), _placement.cpus)) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+      CUCASCADE_LOG_WARN("cufile_reactor: cannot pin worker '{}' to its GPU's CPUs; left unpinned",
+                         _tname);
+    }
+  }
+
   // A pass dispatches up to the in-flight window's worth of slices, or about
   // max_op_bytes of synchronous I/O, whichever comes first; a low request granted
   // service is protected for one such quantum of slices.
@@ -2369,9 +2921,14 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
     while (!stop_token.stop_requested()) {
       poll_completions();
 
-      // Keep the queue moving instead of grinding on a request that already failed.
+      // Keep the queue moving instead of grinding on a request that already failed;
+      // a preempted low request that failed meanwhile is dropped too, rather than
+      // holding its credits and future until it is resumed.
       if (scheduler.active != nullptr && !scheduler.active->coordinator->should_continue()) {
         cancel_request(scheduler.active, canceled_error());
+      }
+      if (scheduler.parked != nullptr && !scheduler.parked->coordinator->should_continue()) {
+        cancel_request(scheduler.parked, canceled_error());
       }
       scheduler.preempt_low();
 
@@ -2394,24 +2951,18 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
           cancel_request(scheduler.active, canceled_error());
           break;
         }
-        auto slice = scheduler.active->take_front();
-        pass_bytes += slice.size();
-        _queued_bytes.fetch_sub(slice.size(), std::memory_order_relaxed);
-        scheduler.on_slice_dispatched();
-        bool handed_off  = false;
+        auto slice       = scheduler.active->take_front();
         auto const bytes = slice.size();
-        dispatch_slice(scheduler.active->obj,
-                       std::move(slice),
-                       scheduler.active->coordinator,
-                       false,
-                       &handed_off,
-                       batch);
-        if (handed_off) {
-          pass_bytes -= bytes;
-          // Engine handoffs do not consume this synchronous worker's pass budget.
-        } else {
-          ++dispatched;
-        }
+        pass_bytes += bytes;
+        scheduler.on_slice_dispatched();
+        bool handed_off = false;
+        dispatch_slice(scheduler.active->obj, std::move(slice), scheduler.active->coordinator,
+                       false, &handed_off, batch);
+        if (handed_off) pass_bytes -= bytes;
+        else ++dispatched;
+        // Counted until here: the transfer runs on this worker, and a reactor busy with a long
+        // one must not look idle to the ioctx's reactor selection.
+        _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
       }
       publication.publish();
       if (scheduler.active != nullptr && scheduler.active->empty()) { scheduler.active.reset(); }
@@ -2423,9 +2974,9 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
       if (scheduler.active == nullptr && has_capacity) {
         if (scheduler.take_next()) continue;
         // Nothing queued.  Block for a request, but only as long as an in-flight
-        // completion can afford to wait.
+        // completion or a parked slice can afford to wait.
         request_ptr next;
-        auto const timeout_us = inflight_count() == 0
+        auto const timeout_us = inflight_count() == 0 && _waiting.empty() && _write_waiting.empty()
                                   ? idle_wait_us
                                   : static_cast<std::int64_t>(_config.poll_interval_us);
         if (_requests.wait_dequeue_timed(next, timeout_us) && next != nullptr) {
@@ -2460,12 +3011,18 @@ void cufile_reactor::worker_loop(std::stop_token const& stop_token)
   // coordinators settle with real byte counts; on a fatal error, or if they do
   // not finish, synchronize and settle them with the terminal error.
   if (fatal_error == nullptr) {
-    for (int attempt = 0; attempt < 50 && inflight_count() != 0; ++attempt) {
+    // About 10 ms, whatever the poll interval.
+    auto const attempts = static_cast<int>(
+      std::max<std::size_t>(1, 10'000 / std::max<std::size_t>(1, _config.poll_interval_us)));
+    for (int attempt = 0; attempt < attempts && inflight_count() != 0; ++attempt) {
       poll_completions();
       if (inflight_count() != 0) std::this_thread::sleep_for(poll_interval);
     }
   }
   if (inflight_count() != 0) { drain_inflight(terminal_error); }
+  // Settle any staged copy still pending and give the slots back to the
+  // process-wide pool; none is in use any more once this returns.
+  poll_staged(true, &terminal_error);
 
   cancel_queued(terminal_error);
 }
@@ -2497,8 +3054,7 @@ cudaError_t delay_engine_copy_for_testing(cudaStream_t stream) noexcept
   if (status == cudaSuccess) status = cudaStreamWaitEvent(stream, gate->event, 0);
   return status;
 }
-bool engine_copy_record_failure_for_testing() noexcept
-{
+bool engine_copy_record_failure_for_testing() noexcept{
   return fail_copy_event_record.load(std::memory_order_relaxed);
 }
 void set_completion_observer_for_testing(void (*observer)(completion_observation const&,
@@ -2531,6 +3087,23 @@ std::size_t arena_slab_counts_for_testing(int device) noexcept
   }
 }
 
+std::size_t staged_calls(std::size_t begin,
+                         std::size_t end,
+                         std::size_t file_size,
+                         std::size_t slot_bytes) noexcept
+{
+  if (begin >= end || slot_bytes < IO_BLOCK_SIZE) return 0;
+  auto const body_end = align_down_block(file_size);
+  std::size_t calls   = 0;
+  for (auto pos = begin; pos < end; ++calls) {
+    auto const aligned_offset = align_down_block(pos);
+    auto stop                 = std::min(align_up_block(end), aligned_offset + slot_bytes);
+    if (stop > file_size) stop = aligned_offset < body_end ? body_end : file_size;
+    pos = std::min(stop, end);
+  }
+  return calls;
+}
+
 std::size_t next_piece(std::size_t pos,
                        std::size_t end,
                        std::size_t file_size,
@@ -2546,38 +3119,11 @@ std::size_t next_piece(std::size_t pos,
   return stop - pos;
 }
 
-std::size_t live_registrations_for_testing() noexcept
-{
-  try {
-    return registration_table::instance().live();
-  } catch (...) {
-    return 0;
-  }
-}
-
 void set_cufile_transfer_hook_for_testing(void (*hook)(void*), void* arg) noexcept
 {
   cufile_transfer_hook.store(nullptr, std::memory_order_release);
   cufile_transfer_hook_arg.store(arg, std::memory_order_release);
   cufile_transfer_hook.store(hook, std::memory_order_release);
-}
-
-bool transfer_tracked_for_testing(void const* base, std::size_t bytes) noexcept
-{
-  try {
-    return registration_table::instance().tracked(base, bytes);
-  } catch (...) {
-    return false;
-  }
-}
-
-std::size_t registrations_created_for_testing() noexcept
-{
-  try {
-    return registration_table::instance().created();
-  } catch (...) {
-    return 0;
-  }
 }
 
 void set_cufile_writes_in_compat_for_testing(bool enabled) noexcept

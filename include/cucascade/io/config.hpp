@@ -58,7 +58,8 @@ enum class io_backend {
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
  *  - @c cufile  — cuFile / GDS read reactor tunables (local-disk GDS path);
- *    always present for ABI stability, even if the backend was not built.
+ *    always present for ABI stability; backend availability is gated by
+ *    @c CUCASCADE_HAS_CUFILE.
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -84,10 +85,14 @@ struct io_config {
   /// worker-owned.
   rest::config rest{};
 
-  /// Number of cuFile reactor worker threads for the GDS local-disk IO path.
-  /// Each reactor serves one synchronous transfer at a time; a vectored read
-  /// with more than two slices fans out across all of them.
-  std::size_t cufile_n_reactors{4};
+  /// cuFile reactor worker threads for the GDS local-disk IO path.  Each reactor
+  /// keeps one synchronous transfer in flight, so this is the backend's queue
+  /// depth.  0 (the default) plans the pool from the discovered topology: a
+  /// group of @c cufile.reactors_per_device reactors per visible GPU, pinned to
+  /// that GPU's CPUs, each GPU's reads served by its own group (see
+  /// @c cufile::plan_cufile_pool).  A positive value is one flat pool of that
+  /// many unpinned reactors shared by every GPU.
+  std::size_t cufile_n_reactors{0};
 
   /// cuFile / GDS read reactor configuration.  Only consulted when
   /// @c backend == @ref io_backend::cufile.  Not derived from @ref cache: the

@@ -141,11 +141,6 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
   if (backend == disk_io_backend::uring && cfg.uring_n_reactors == 0) {
     throw std::invalid_argument("make_disk_io_context: io.uring_n_reactors must be at least 1");
   }
-#ifdef CUCASCADE_HAS_CUFILE
-  if (backend == disk_io_backend::cufile && cfg.cufile_n_reactors == 0) {
-    throw std::invalid_argument("make_disk_io_context: io.cufile_n_reactors must be at least 1");
-  }
-#endif
   if (backend == disk_io_backend::uring && uring_setup_errno() != 0) {
     throw std::system_error(uring_setup_errno(),
                             std::generic_category(),
@@ -162,9 +157,8 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
   switch (backend) {
     case disk_io_backend::cufile: {
 #ifdef CUCASCADE_HAS_CUFILE
-      auto reactor_ctx = std::make_shared<io::cufile::cufile_reactor::reactor_context>(cfg.cufile);
-      return std::make_shared<io::cufile::cufile_ioctx>(cfg.cufile_n_reactors,
-                                                        std::move(reactor_ctx));
+      // As the scan factory builds it: 0 reactors plans a pinned group per GPU.
+      return io::cufile::make_cufile_ioctx(cfg.cufile_n_reactors, cfg.cufile);
 #else
       throw std::invalid_argument(
         "make_disk_io_context: the cufile backend was requested but this build has no cufile.h");

@@ -30,6 +30,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     cucascade_tests
     # Memory tests
     memory/test_fixed_size_host_memory_resource.cpp
+    memory/test_numa_affinity.cpp
     memory/test_memory_reservation_manager.cpp
     memory/test_pool_peer_access.cpp
     memory/test_pool_peer_access_regression.cpp
@@ -41,6 +42,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     data/test_data_repository.cpp
     data/test_data_repository_manager.cpp
     data/test_disk_memory_space.cpp
+    # Logging tests
+    log/test_logging.cpp
+    log/test_logging_pruned.cpp
+    log/test_logging_pruned_all.cpp
     # Utils
     # Replaces the global operator new for the whole test binary
     utils/allocation_counter.cpp
@@ -48,6 +53,21 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     unittest.cpp)
   set_target_properties(cucascade_tests PROPERTIES CUDA_STANDARD 20
                                                    CUDA_STANDARD_REQUIRED ON)
+
+  # Negative compile test: a call site pruned by CUCASCADE_MIN_LOG_LEVEL must
+  # still have its format string checked. The object target is excluded from the
+  # default build and the test passes only when its compilation fails on the
+  # format string.
+  add_library(cucascade_log_pruned_ill_formed OBJECT EXCLUDE_FROM_ALL
+                                                     log/pruned_ill_formed.cpp)
+  target_link_libraries(cucascade_log_pruned_ill_formed PRIVATE cucascade)
+  add_test(NAME cucascade_log_pruned_site_checks_format
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target
+                   cucascade_log_pruned_ill_formed)
+  set_tests_properties(
+    cucascade_log_pruned_site_checks_format
+    PROPERTIES PASS_REGULAR_EXPRESSION
+               "basic_format_string.*is not a constant expression")
 
   # Set include directories
   target_include_directories(
@@ -130,9 +150,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     target_sources(
       cucascade_io_tests
       PRIVATE io/cufile/test_cufile_platform.cpp
-              io/cufile/test_cufile_probe.cpp
-              io/cufile/test_cufile_reactor.cpp
-              io/cufile/test_cufile_write.cpp
+              io/cufile/test_cufile_probe.cpp io/cufile/test_cufile_reactor.cpp
+              io/cufile/test_cufile_staging.cpp io/cufile/test_cufile_tune.cpp
+              io/cufile/test_cufile_compare.cpp io/cufile/test_cufile_write.cpp
               io/cufile/test_cufile_api_optional.cpp
               io/cufile/test_async_engine_config.cpp
               io/cufile/test_device_arena.cpp
@@ -154,13 +174,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
               io/cufile/test_engine_hardening.cpp
               io/cufile/test_phase6_review.cpp
               io/cufile/test_engine_ioctx.cpp)
-    # Compile and exercise the optional Lustre client branch on every cuFile
-    # test build. Only this TU sees the external-UAPI shim; production uses
-    # installed client headers.
-    set_source_files_properties(
-      io/cufile/test_lustre_layout.cpp
-      PROPERTIES INCLUDE_DIRECTORIES
-                 "${CMAKE_CURRENT_SOURCE_DIR}/io/cufile/lustre_shim")
+    set_source_files_properties(io/cufile/test_lustre_layout.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/io/cufile/lustre_shim")
   endif()
 
   set_target_properties(cucascade_io_tests PROPERTIES CUDA_STANDARD 20
@@ -192,6 +206,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     data/test_disk_randomized.cpp
     data/test_gpu_disk_converters.cpp
     data/test_representation_converter.cpp
+    cudf/test_gpu_to_gpu_converter.cpp
     cudf/test_release_table_stream.cpp
     # Main test runner
     unittest.cpp)
@@ -203,6 +218,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
       PRIVATE cudf/test_cache_object_identity.cpp
               cudf/test_rest_datasource_contracts.cpp
               cudf/test_cache_read_arbitration.cpp
+              cudf/test_datasource_read_lifetime.cpp
               cudf/test_dispose_eviction.cpp
               cudf/test_explicit_eviction.cpp
               cudf/test_write_cache_invalidation.cpp)
@@ -218,8 +234,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
 
   # Link dependencies
   target_link_libraries(
-    cucascade_cudf_tests PRIVATE cucascade_cudf Catch2::Catch2
-                                 CUDA::cudart_static)
+    cucascade_cudf_tests
+    PRIVATE cucascade_cudf Catch2::Catch2 CUDA::cudart_static
+            cudf::cudftest_default_stream)
 
   # Register tests with CTest
   add_test(NAME cucascade_cudf_tests COMMAND cucascade_cudf_tests)
@@ -229,7 +246,8 @@ endif()
 add_executable(
   cucascade_topology_discovery_tests
   memory/test_path_storage.cpp memory/test_topology_discovery.cpp
-  memory/test_net_topology.cpp unittest_topology_discovery.cpp)
+  memory/test_net_topology.cpp memory/test_gds_setup.cpp
+  unittest_topology_discovery.cpp)
 set_target_properties(cucascade_topology_discovery_tests
                       PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 

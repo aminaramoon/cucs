@@ -22,10 +22,60 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 
 namespace cucascade::io::cufile {
+
+/**
+ * @brief cuFile's size_t configuration parameters (@c CUFileSizeTConfigParameter_t).
+ *
+ * Declared here rather than taken from @c cufile.h: the parameter API first shipped in a later
+ * libcufile than the oldest header cuCascade builds against, and the library is loaded at run time
+ * anyway.  The values are the header's enumerators, identical in libcufile 1.16 through 1.20.
+ */
+enum class size_parameter : int {
+  profile_stats                     = 0,
+  execution_max_io_queue_depth      = 1,
+  execution_max_io_threads          = 2,
+  execution_min_io_threshold_kb     = 3,
+  execution_max_request_parallelism = 4,
+  max_direct_io_size_kb             = 5,
+  max_device_cache_size_kb          = 6,
+  per_buffer_cache_size_kb          = 7,
+  max_device_pinned_mem_size_kb     = 8,
+  io_batch_size                     = 9,
+  poll_threshold_size_kb            = 10,
+  batch_io_timeout_ms               = 11,
+};
+
+/// cuFile's boolean configuration parameters (@c CUFileBoolConfigParameter_t); see
+/// @ref size_parameter for why they are declared here.
+enum class bool_parameter : int {
+  use_poll_mode           = 0,
+  allow_compat_mode       = 1,
+  force_compat_mode       = 2,
+  api_check_aggressive    = 3,
+  execution_parallel_io   = 4,
+  allow_system_memory     = 6,
+  use_pci_p2pdma          = 7,
+  prefer_io_uring         = 8,
+  force_odirect_mode      = 9,
+  skip_topology_detection = 10,
+  stream_memops_bypass    = 11,
+  posix_io_mode           = 12,
+  gds_fallback_io         = 13,
+};
+
+/// cuFile's string configuration parameters (@c CUFileStringConfigParameter_t); see
+/// @ref size_parameter for why they are declared here.
+enum class string_parameter : int {
+  logging_level    = 0,
+  env_logfile_path = 1,
+  log_dir          = 2,
+  rdma_transport   = 3,
+};
 
 /**
  * @brief The cuFile entry points cuCascade calls, resolved at run time.
@@ -52,6 +102,16 @@ struct cufile_api {
   decltype(&cuFileBufDeregister) buf_deregister{nullptr};
   decltype(&cuFileRead) read{nullptr};
   decltype(&cuFileWrite) write{nullptr};
+
+  using get_size_parameter_fn   = CUfileError_t (*)(size_parameter, std::size_t*);
+  using get_bool_parameter_fn   = CUfileError_t (*)(bool_parameter, bool*);
+  using get_string_parameter_fn = CUfileError_t (*)(string_parameter, char*, int);
+  /// @c cuFileGetParameterSizeT: the effective value once the driver is open.
+  get_size_parameter_fn get_size_parameter{nullptr};
+  /// @c cuFileGetParameterBool.
+  get_bool_parameter_fn get_bool_parameter{nullptr};
+  /// @c cuFileGetParameterString.
+  get_string_parameter_fn get_string_parameter{nullptr};
 
   decltype(&cuFileReadAsync) read_async{nullptr};
   decltype(&cuFileWriteAsync) write_async{nullptr};
@@ -88,6 +148,9 @@ struct cufile_api {
    *         reason is logged once).
    */
   [[nodiscard]] static cufile_api const* get() noexcept;
+  [[nodiscard]] static cufile_api const* loaded() noexcept;
+  [[nodiscard]] static std::uint64_t generation() noexcept;
+  [[nodiscard]] static bool open_loaded_driver() noexcept;
 
   /**
    * @brief Open the cuFile driver once per process.

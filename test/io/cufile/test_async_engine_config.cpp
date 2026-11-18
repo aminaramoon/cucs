@@ -92,7 +92,8 @@ TEST_CASE("async engine configuration defaults preserve legacy routing", "[io][c
   // Existing legacy knobs keep their defaults and are not rewritten by validation.
   CHECK(reactor.max_inflight == 32);
   CHECK(reactor.max_op_bytes == 64UL << 20);
-  CHECK(reactor.register_min_bytes == 0);
+  CHECK(reactor.staging_mode == cucascade::io::cufile::staging::automatic);
+  CHECK(reactor.write_split_bytes == (64UL << 20));
   CHECK(reactor.gds_threshold == 256UL << 10);
   CHECK(reactor.use_odirect);
   CHECK_FALSE(reactor.compat_mode.has_value());

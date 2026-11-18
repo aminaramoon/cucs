@@ -604,7 +604,7 @@ TEST_CASE("engine public flush waits before a gated write is even admitted",
   context.shutdown();
 }
 
-TEST_CASE("legacy handle buffered writes serialize against engine granules and share flush",
+TEST_CASE("opt-in context buffered fallbacks serialize against engine granules and share flush",
           "[cufile][engine][write][ioctx]")
 {
   if (!has_device()) SKIP("CUDA unavailable");
@@ -618,7 +618,10 @@ TEST_CASE("legacy handle buffered writes serialize against engine granules and s
   w.r.start();
   auto body = w.write({0, mib});
   REQUIRE(until([&] { return w.r.transport->snapshot().blocked_completions == 1; }));
-  auto shared = std::make_shared<cufile_reactor::reactor_context>(config{});
+  config cfg;
+  cfg.async_engine.mode = engine_mode::async_auto;
+  cfg.async_engine.async_writes = true;
+  auto shared = std::make_shared<cufile_reactor::reactor_context>(cfg);
   cufile_ioctx legacy(1, shared);
   legacy.start();
   std::vector<prepared_io_slice> edges;
@@ -721,7 +724,7 @@ TEST_CASE("engine negative write completion revokes even an operator override",
   CHECK(w.r.engine->gauges().pinned_write_scratch_bytes == write_granule() * w.r.lanes->capacity());
 }
 
-TEST_CASE("synchronous host and legacy device writes wait for engine granules",
+TEST_CASE("opt-in context host and legacy device fallbacks wait for engine granules",
           "[cufile][engine][write][ioctx]")
 {
   if (!has_device()) SKIP("CUDA unavailable");
@@ -739,6 +742,8 @@ TEST_CASE("synchronous host and legacy device writes wait for engine granules",
   REQUIRE(until([&] { return w.r.transport->snapshot().blocked_completions == 1; }));
   config cfg;
   cfg.max_inflight = 1;
+  cfg.async_engine.mode = engine_mode::async_auto;
+  cfg.async_engine.async_writes = true;
   auto shared      = std::make_shared<cufile_reactor::reactor_context>(cfg);
   cufile_ioctx legacy(1, shared);
   legacy.start();
