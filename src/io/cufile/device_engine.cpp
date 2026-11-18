@@ -1533,13 +1533,24 @@ struct device_engine::impl : std::enable_shared_from_this<impl> {
               g.effective         = {0, capacity_mib << smallest, 1};
               g.slabs             = 1;
             }
-            policies[i]->set_effective(g.effective);
             auto const bit =
               g.effective.op_bytes == 0
                 ? 0U
-                : static_cast<unsigned>(std::countr_zero(g.effective.op_bytes / capacity_mib));
-            static_cast<void>(
-              self->options.arena->set_quota(ids[i], g.slabs, 0, static_cast<slot_class>(bit)));
+                : static_cast<unsigned>(std::countr_zero(
+                    backing_slot_bytes(g.effective.op_bytes, self->class_mask) / capacity_mib));
+            auto const assigned =
+              self->options.arena->set_quota(ids[i], g.slabs, 0, static_cast<slot_class>(bit));
+            if (g.effective.qd != 0) {
+              // Slot registrations have immutable classes. A desired slab grant may still
+              // be pending (or partially registered); never advertise its bytes as usable.
+              auto const op = g.effective.op_bytes;
+              g.effective   = fit({g.effective.qd, op},
+                                assigned.registered_bytes,
+                                g.lanes,
+                                static_cast<std::uint8_t>(1U << bit));
+              if (g.effective.qd == 0) g.effective = {0, op, 1};
+            }
+            policies[i]->set_effective(g.effective);
           }
           result r;
           r.kind   = result_kind::capacity;
@@ -2369,6 +2380,7 @@ engine_gauges device_engine::gauges() const
   auto result                       = _impl->snapshot;
   result.pinned_write_scratch_bytes = _impl->scratch_cell_bytes * _impl->options.lanes->capacity();
   result.pinned_write_scratch_pool_bytes = write_scratch_allocated_bytes.load();
+  result.arena_registered_class_mask     = _impl->class_mask;
   {
     std::lock_guard affinity_lock(_impl->affinity_mutex);
     result.reaper_affinity    = _impl->reaper_affinity;
@@ -2409,8 +2421,14 @@ device_engine& device_engine::for_device(int device, async_engine_config const& 
   if (!rt.engine_possible(config.mode) &&
       !(config.async_writes && rt.engine_possible(config.mode, true)))
     throw std::runtime_error("cuFile async engine unavailable");
-  auto& arena = device_arena::for_device(device);
-  static_cast<void>(arena.warm_up(config));
+  auto& arena       = device_arena::for_device(device);
+  auto const report = arena.bootstrap(config);
+  CUCASCADE_LOG_INFO(
+    "cuFile engine device {}: registered arena class mask={} bytes={} registrations={}",
+    device,
+    arena.available_class_mask(),
+    report.registered_bytes,
+    arena.gauges().registrations);
   device_engine_options options;
   options.arena     = &arena;
   options.lanes     = std::make_shared<lane_pool>(device, config);

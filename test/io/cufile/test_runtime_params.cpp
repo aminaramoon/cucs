@@ -21,8 +21,11 @@
 #include <catch2/catch_all.hpp>
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <latch>
+#include <memory>
 #include <mutex>
 #include <string_view>
 #include <thread>
@@ -48,6 +51,8 @@ struct fake_library {
   std::latch properties_entered{1};
   std::latch release_properties{1};
   std::optional<cufile_api> resolved;
+  std::string json_at_open;
+  std::string json_at_set;
 
   void record(std::string_view call)
   {
@@ -61,6 +66,7 @@ thread_local fake_library* active_library = nullptr;
 CUfileError_t fake_open()
 {
   active_library->record("open");
+  if (auto const* path = std::getenv("CUFILE_ENV_PATH_JSON")) active_library->json_at_open = path;
   return {active_library->open_error, CUDA_SUCCESS};
 }
 
@@ -105,6 +111,7 @@ parameter_adapter::set_result set_parameter(void* opaque,
 {
   auto& library = *static_cast<fake_library*>(opaque);
   library.record("set");
+  if (auto const* path = std::getenv("CUFILE_ENV_PATH_JSON")) library.json_at_set = path;
   if (library.block_setter) {
     library.setter_entered.count_down();
     library.release_setter.wait();
@@ -142,7 +149,106 @@ process_cufile_parameters request()
   return parameters;
 }
 
+struct restore_environment {
+  std::optional<std::string> old;
+  restore_environment()
+  {
+    if (auto* p = std::getenv("CUFILE_ENV_PATH_JSON")) old = p;
+    ::unsetenv("CUFILE_ENV_PATH_JSON");
+  }
+  ~restore_environment()
+  {
+    if (old)
+      ::setenv("CUFILE_ENV_PATH_JSON", old->c_str(), 1);
+    else
+      ::unsetenv("CUFILE_ENV_PATH_JSON");
+  }
+};
+
 }  // namespace
+
+TEST_CASE("cuFile JSON selection precedes driver open and respects process ownership",
+          "[cufile][runtime]")
+{
+  restore_environment restore;
+  std::unique_ptr<std::FILE, decltype(&std::fclose)> json(std::tmpfile(), &std::fclose);
+  REQUIRE(json);
+  fake_library library;
+  active_library = &library;
+  auto const api = make_api();
+  driver_open_state driver;
+  runtime context(&api, driver, adapters(library));
+  process_cufile_parameters params;
+  params.cufile_json_path = "/proc/self/fd/" + std::to_string(::fileno(json.get()));
+  params.logging_level    = "INFO";
+  auto const scenario     = GENERATE(0, 1, 2, 3, 4);
+  if (scenario == 1) ::setenv("CUFILE_ENV_PATH_JSON", "/conflicting.json", 1);
+  if (scenario == 2) ::setenv("CUFILE_ENV_PATH_JSON", params.cufile_json_path->c_str(), 1);
+  if (scenario == 3) static_cast<void>(driver.open(&api));
+  if (scenario == 4) library.open_error = CU_FILE_DRIVER_ALREADY_OPEN;
+  auto const report = context.ensure_initialized(params);
+  REQUIRE(report.parameters.size() == 2);
+  auto const& entry = report.parameters.front();
+  CHECK(entry.parameter == process_parameter::cufile_json_path);
+  if (scenario == 0 || scenario == 2) {
+    CHECK(library.json_at_open == *params.cufile_json_path);
+    CHECK(library.json_at_set == *params.cufile_json_path);
+    CHECK(entry.status == parameter_status::unverified);
+    CHECK_NOTHROW(context.ensure_initialized(params, true));
+  } else {
+    CHECK(entry.status == parameter_status::unapplied);
+    CHECK(entry.reason == (scenario == 1 ? "conflicting environment" : "driver already open"));
+    CHECK_THROWS_AS(context.ensure_initialized(params, true), configuration_error);
+  }
+  if (scenario == 1) CHECK(library.json_at_open == "/conflicting.json");
+  if (scenario == 3 || scenario == 4) CHECK(std::getenv("CUFILE_ENV_PATH_JSON") == nullptr);
+  auto different             = params;
+  different.cufile_json_path = "/different.json";
+  CHECK_THROWS_AS(context.ensure_initialized(different, true), configuration_error);
+  CHECK(std::count(library.calls.begin(), library.calls.end(), "open") == 1);
+}
+
+TEST_CASE("cuFile automatic probe freezes defaults before a late JSON request", "[cufile][runtime]")
+{
+  restore_environment restore;
+  fake_library library;
+  active_library = &library;
+  auto const api = make_api();
+  driver_open_state driver;
+  runtime context(&api, driver, adapters(library));
+  // Same no-argument initialization used by gds_available()/automatic DISK bootstrap.
+  auto const initial = context.ensure_initialized();
+  REQUIRE(initial.parameters.empty());
+  process_cufile_parameters params;
+  params.cufile_json_path = "/late.json";
+  auto const late         = context.ensure_initialized(params);
+  CHECK(late.parameters_differ);
+  CHECK(late.parameters.empty());
+  CHECK(std::getenv("CUFILE_ENV_PATH_JSON") == nullptr);
+  CHECK_THROWS_AS(context.ensure_initialized(params, true), configuration_error);
+}
+
+TEST_CASE("cuFile JSON invalid paths and missing libraries do not mutate the environment",
+          "[cufile][runtime]")
+{
+  restore_environment restore;
+  fake_library library;
+  active_library      = &library;
+  auto const api      = make_api();
+  auto const scenario = GENERATE(0, 1, 2);
+  driver_open_state driver;
+  runtime context(scenario == 2 ? nullptr : &api, driver);
+  process_cufile_parameters params;
+  params.cufile_json_path = scenario == 0 ? "relative.json" : "/nonexistent-p7b.json";
+  auto const report       = context.ensure_initialized(params);
+  REQUIRE(report.parameters.size() == 1);
+  CHECK(report.parameters[0].status ==
+        (scenario == 2 ? parameter_status::unsupported : parameter_status::unapplied));
+  CHECK(report.parameters[0].reason ==
+        (scenario == 2 ? "library unavailable" : "json not readable"));
+  CHECK(std::getenv("CUFILE_ENV_PATH_JSON") == nullptr);
+  CHECK_THROWS_AS(context.ensure_initialized(params, true), configuration_error);
+}
 
 TEST_CASE("cuFile runtime loads optional groups before setters, open and properties",
           "[cufile][runtime]")

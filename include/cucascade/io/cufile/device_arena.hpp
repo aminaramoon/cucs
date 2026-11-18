@@ -81,6 +81,9 @@ struct device_arena_hooks {
 };
 
 struct device_arena_options {
+  /// Shared production/benchmark bootstrap translation; validates the configuration.
+  [[nodiscard]] static device_arena_options from_config(async_engine_config const& config);
+  bool operator==(device_arena_options const&) const = default;
   registration_granularity registration{registration_granularity::slot};
   /// Explicit diagnostic/qualified-GDS opt-in, never permission to use shared compat buffers.
   bool allow_shared_registration{false};
@@ -118,9 +121,14 @@ struct arena_gauges {
   std::size_t draining_slabs{};
   std::size_t pending_slabs{};  ///< Unsatisfied grants or class changes, not silently discarded.
   std::size_t reclassifications{};
+  std::size_t registrations{};           ///< Active cuFile registrations, not slab count.
+  std::uint8_t registered_class_mask{};  ///< Actual registered slot classes, bits 0..3.
+  std::uint8_t unregistered_class_mask{};
 };
 
 struct arena_quota_report {
+  /// Assigned registered bytes in the requested class, excluding draining/wrong-class slabs.
+  std::size_t registered_bytes{};
   std::size_t registered_slabs{};
   std::size_t unregistered_slabs{};
   std::size_t draining_slabs{};
@@ -206,6 +214,8 @@ class device_arena {
   device_arena(device_arena&&)                 = delete;
   device_arena& operator=(device_arena&&)      = delete;
 
+  /// Production bootstrap entry point: always translates config geometry before warm-up.
+  [[nodiscard]] arena_warmup_report bootstrap(async_engine_config const& config);
   [[nodiscard]] arena_warmup_report warm_up(async_engine_config const& config,
                                             device_arena_options const& options = {});
   [[nodiscard]] std::optional<staging_lease> try_lease(arena_mount_id mount,

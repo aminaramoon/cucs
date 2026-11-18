@@ -98,3 +98,12 @@
     - **Tracked perf issue (Phase 6):** `queries_per_op` = 400, against an NFR-3 target of 8 and a ceiling of 70.
       - With a completion p50 of 8.4 ms, the poll cap of 100 us alone accounts for about 80 queries per op. The rest suggests wake-driven re-polling of lane heads.
       - The poll cadence must scale with the observed completion latency.
+  - **Phase 7b (gaps found in lead Q&A): DONE**.
+    - The automatic arena bootstrap now honours `async_engine_config.arena_slot_classes`, default {4 MiB}. Previously it prepared only 1 MiB slots, which capped every I/O at 1 MiB.
+    - NIC steering:
+      - `tools/gds/make_cufile_json.py` writes a per-GPU `rdma_dev_addr_list`.
+      - `process_params.cufile_json_path` sets `CUFILE_ENV_PATH_JSON` before driver open.
+      - `nic_counters.py` captures per-NIC counter deltas.
+      - AM-19 requires the export (or runtime priming) before DISK setup.
+    - Review: 13 findings, all resolved.
+    - Tests: 942 cases, 941 passed, 1 skipped. Python tests: 55 passed. Lead verified.

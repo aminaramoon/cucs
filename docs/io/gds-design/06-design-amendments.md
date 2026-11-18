@@ -654,3 +654,45 @@ qualification or B-6 acceptance result is implied.
   per-process setarch -R, but CUDA-event happens-before is not modeled: its
   callback/argument-lifetime reports are retained, not globally suppressed, and
   G-6 is not signed off.
+
+## AM-19: Phase 7b production arena geometry and cuFile-managed RDMA selection
+
+- Production `arena_slot_classes` defaults to {4} MiB and validates unique
+  members of {1,2,4,8}. Automatic bootstrap and the benchmark use the same
+  config-to-options translation. AM-9 still registers each slot independently.
+  Registered masks and registration counts report actual geometry, not requests.
+- Extends AM-11 fitting: when all prepared slots exceed a filesystem preference,
+  smaller logical pieces use the smallest sufficient backing class, charging
+  physical slot bytes against capacity. Exact-class fitting otherwise stays
+  unchanged; shrinking pieces cannot manufacture slots or QD. GPFS 8-MiB
+  preferences need explicit {8} for GPFS-only processes; {4,8} splits capacity
+  and is for mixed GPFS + local use. Demand charges the fitted piece's backing;
+  effective QD is capped by actually assigned bytes of the requested slot class.
+  The local-NVMe {4} default costs 4×/2× bytes for 1/2-MiB network-FS pieces:
+  unknown-BAR1 NFS QD 64 fits QD 12 with {4}, versus QD 51 with {1}.
+  Network-FS-only processes should consider {1}/{2}.
+- libcufile 1.17 RDMA typed setters remain unsupported. The stdlib topology
+  generator selects IPv4 addresses into properties.rdma_dev_addr_list for
+  user-space filesystem clients (stock JSON scope), ranking nearest shared
+  bridges (PIX before PXB). Kernel NFS/Lustre/BeeGFS dynamic routing uses
+  fs.<type> lists/mount_table, left unchanged with warnings. RoCE GIDs need
+  netdev associations; IPoIB addresses come from ip -j addr.
+  Base policies are preserved; explicit policies are RoundRobin/RoundRobinMaxMin.
+  **[verify]** multi-GPU list semantics, IPv6 opt-in, policy support and dynamic
+  routing. GPFS/WEKA/VAST client-side NIC controls remain separate.
+- Optional `process_params.cufile_json_path` requires an absolute readable file.
+  It selects CUFILE_ENV_PATH_JSON before setters/driver open under the runtime
+  transaction, never overwriting a conflicting environment. **Required ordering:**
+  export before launch, or explicitly call runtime::instance().ensure_initialized
+  with the complete parameters before any DISK setup or gds_available() probe.
+  make_disk_io_context(automatic) and default_disk_io_context() otherwise freeze
+  defaults before reactor construction; configuring the context alone is too late.
+  Later differing runtime requests return parameters_differ with the original
+  report and no new parameter entry (strict mode throws). A driver opened outside
+  the runtime before the first initialization instead yields unapplied entries.
+  Conflicts/unreadable paths are unapplied; absent libcufile is unsupported.
+  Selection remains unverified, without libcufile readback. Because setenv is
+  process-wide, bootstrap must precede unrelated environment readers.
+- Qualification records read-only per-port RX/TX counter deltas around engine
+  runs. These include unrelated host traffic and are not direct-path evidence.
+  Legacy remains the default; no new hardware qualification is implied.

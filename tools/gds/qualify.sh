@@ -67,8 +67,13 @@ run() {
   local step=$1 label=$2 fs=$3 dev=$4 qd=$5 op=$6 direction=$7 variant=$8 path=$9
   shift 9
   show "$@"
-  ((DRY)) && { echo "  stdout -> $OUT/$path; stderr -> $OUT/$path.stderr"; return 0; }
+  ((DRY)) && { echo "  stdout -> $OUT/$path; stderr -> $OUT/$path.stderr"; echo "  NIC counters: RECORD_NIC_COUNTERS=$RECORD_NIC_COUNTERS ($NIC_SYSFS_ROOT, engine runs only)"; return 0; }
   show "$@" >>"$OUT/commands.log"
+  local engine_case=0 arg
+  for arg in "$@"; do [[ $arg != "$ENGINE_BIN" ]] || engine_case=1; done
+  if ((RECORD_NIC_COUNTERS && engine_case)); then
+    python3 tools/gds/nic_counters.py --sysfs-root "$NIC_SYSFS_ROOT" --out "$OUT/$path.nic-before.json"
+  fi
   local limit=${CASE_TIMEOUT_S:-600}
   [[ $step != G-7 ]] || limit=$(python3 -c "print(int($SOAK_MINUTES * 60 + 300))")
   timeout --kill-after=60 "$limit" "$@" >"$OUT/$path" 2>"$OUT/$path.stderr" &
@@ -77,6 +82,10 @@ run() {
   wait "$command_pid"
   local rc=$?
   trap stop_jobs INT TERM
+  if ((RECORD_NIC_COUNTERS && engine_case)); then
+    python3 tools/gds/nic_counters.py --sysfs-root "$NIC_SYSFS_ROOT" --out "$OUT/$path.nic-after.json"
+    python3 tools/gds/nic_counters.py --sysfs-root "$NIC_SYSFS_ROOT" --before "$OUT/$path.nic-before.json" --after "$OUT/$path.nic-after.json" --out "$OUT/$path.nic-delta.json"
+  fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$step" "$label" "$fs" "$dev" "$qd" "$op" "$direction" "$variant" "$path" "$rc" >>"$OUT/manifest.tsv"
   ((rc == 0)) || echo "FAILED ($rc): $step $label $variant -> $path" | tee -a "$OUT/failures.log"
   if ((CLEANUP && rc == 0)) && [[ $step == B-3 || $step == B-4 || $step == B-5 || $step == B-6 || $step == B-9 || $step == G-7 ]]; then

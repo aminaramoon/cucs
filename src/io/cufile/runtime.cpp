@@ -20,6 +20,8 @@
 #include <cucascade/io/cufile/runtime.hpp>
 #include <cucascade/log/logging.hpp>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <utility>
@@ -54,6 +56,7 @@ bool forced_compat_environment() noexcept
 std::string_view parameter_name(process_parameter parameter) noexcept
 {
   switch (parameter) {
+    case process_parameter::cufile_json_path: return "cufile_json_path";
     case process_parameter::allow_compat_mode: return "allow_compat_mode";
     case process_parameter::force_compat_mode: return "force_compat_mode";
     case process_parameter::max_direct_io_size_kib: return "max_direct_io_size_kib";
@@ -71,12 +74,13 @@ std::string_view parameter_name(process_parameter parameter) noexcept
 std::vector<parameter_report> requested_parameters(process_cufile_parameters const& parameters)
 {
   std::vector<parameter_report> result;
-  result.reserve(10);
+  result.reserve(11);
   auto const add = [&](process_parameter id, auto const& value) {
     if (value.has_value()) {
       result.push_back({id, parameter_value{*value}, parameter_status::unapplied, {}});
     }
   };
+  add(process_parameter::cufile_json_path, parameters.cufile_json_path);
   add(process_parameter::allow_compat_mode, parameters.allow_compat_mode);
   add(process_parameter::force_compat_mode, parameters.force_compat_mode);
   add(process_parameter::max_direct_io_size_kib, parameters.max_direct_io_size_kib);
@@ -174,8 +178,36 @@ void runtime::initialize(process_cufile_parameters const& parameters)
 
   auto transaction                     = _driver.acquire();
   _report.driver_attempted_before_init = transaction.attempted();
+  bool json_environment_created        = false;
   for (auto& entry : _report.parameters) {
-    if (api == nullptr) {
+    if (entry.parameter == process_parameter::cufile_json_path) {
+      // Process-wide mutation: bootstrap must precede unrelated environment readers.
+      // Never overwrite a caller-selected JSON file, even in non-strict mode.
+      auto const& path    = std::get<std::string>(entry.requested);
+      auto const* current = std::getenv("CUFILE_ENV_PATH_JSON");
+      if (api == nullptr) {
+        entry.status = parameter_status::unsupported;
+        entry.reason = "library unavailable";
+      } else if (_report.driver_attempted_before_init) {
+        entry.reason = "driver already open";
+      } else if (path.front() != '/' || ::access(path.c_str(), R_OK) != 0) {
+        entry.reason = "json not readable";
+      } else if (current && path != current) {
+        entry.reason = "conflicting environment";
+      } else if (!current && ::setenv("CUFILE_ENV_PATH_JSON", path.c_str(), 0) != 0) {
+        entry.reason = "setenv failed";
+      } else {
+        auto const* selected = std::getenv("CUFILE_ENV_PATH_JSON");
+        if (!selected || path != selected) {
+          entry.reason = "conflicting environment";
+        } else {
+          json_environment_created = current == nullptr;
+          entry.status             = parameter_status::unverified;
+          entry.reason =
+            "CUFILE_ENV_PATH_JSON selected before driver open; library semantics unverified";
+        }
+      }
+    } else if (api == nullptr) {
       entry.status = parameter_status::unsupported;
       entry.reason = "library unavailable";
     } else if (_report.driver_attempted_before_init) {
@@ -207,10 +239,18 @@ void runtime::initialize(process_cufile_parameters const& parameters)
   bool const externally_opened =
     opened.status.has_value() && opened.status->err == CU_FILE_DRIVER_ALREADY_OPEN;
   if (externally_opened) {
+    if (json_environment_created) {
+      auto const* selected = std::getenv("CUFILE_ENV_PATH_JSON");
+      if (selected && parameters.cufile_json_path == selected) {
+        ::unsetenv("CUFILE_ENV_PATH_JSON");
+      }
+    }
     _report.driver_previously_opened = true;
     for (auto& entry : _report.parameters) {
       entry.status = parameter_status::unapplied;
-      entry.reason = "driver was already open outside cuCascade; pre-open setting not applied";
+      entry.reason = entry.parameter == process_parameter::cufile_json_path
+                       ? "driver already open"
+                       : "driver was already open outside cuCascade; pre-open setting not applied";
     }
   }
   if (opened.opened && api != nullptr && api->driver_get_properties != nullptr) {
@@ -219,7 +259,10 @@ void runtime::initialize(process_cufile_parameters const& parameters)
     _report.properties_available = status.err == CU_FILE_SUCCESS;
   }
   for (auto& entry : _report.parameters) {
-    if (entry.status != parameter_status::unverified) { continue; }
+    if (entry.status != parameter_status::unverified ||
+        entry.parameter == process_parameter::cufile_json_path) {
+      continue;
+    }
     if (!opened.opened) {
       entry.reason = "setter accepted but driver did not open; effective value unverified";
     } else if (_adapter.verify != nullptr && api != nullptr) {

@@ -388,6 +388,7 @@ TEST_CASE("device arena retains successful slot registrations after later failur
   REQUIRE(f.fake->active_registrations.size() == 3);
   REQUIRE(f.arena.gauges().partially_registered_slabs == 1);
   REQUIRE(f.arena.set_quota(1, 1, 1, slot_class::mib1).pending_slabs == 0);
+  CHECK(f.arena.quota(1).registered_bytes == 3 * mib);
   auto registered   = lease_all(f.arena, 1, mib);
   auto unregistered = lease_all(f.arena, 1, mib, false);
   REQUIRE(registered.size() == 3);
@@ -607,6 +608,27 @@ TEST_CASE("device arena lease moves and facade destruction retain valid metadata
   REQUIRE(fake->deregistrations == 0);
 }
 
+TEST_CASE("device arena production bootstrap splits mixed classes and caps assigned capacity",
+          "[cufile][arena]")
+{
+  arena_fixture f;
+  auto config               = arena_config(4 * slab);
+  config.arena_slot_classes = {4, 8};
+  REQUIRE(f.arena.bootstrap(config).registered_bytes == 4 * slab);
+  CHECK(f.arena.available_class_mask() == 0x0c);
+  auto const assigned = f.arena.set_quota(1, 3, 0, slot_class::mib8);
+  CHECK(assigned.registered_slabs == 2);
+  CHECK(assigned.pending_slabs == 1);
+  CHECK(assigned.registered_bytes == 2 * slab);
+  auto const effective = fit({4, 8 * mib}, assigned.registered_bytes, 160, 0x08);
+  CHECK(effective.qd == 3);
+  CHECK(effective.lanes * 8 * mib <= assigned.registered_bytes);
+  config.arena_slot_classes = {1};
+  // First warm-up wins (with a warning), until explicit maintenance.
+  REQUIRE(f.arena.bootstrap(config).registered_bytes == 4 * slab);
+  CHECK(f.arena.available_class_mask() == 0x0c);
+}
+
 TEST_CASE("device arena repeated warm-up and lease cycles do no resource work", "[cufile][arena]")
 {
   arena_fixture f;
@@ -638,6 +660,7 @@ TEST_CASE("device arena quota reclassification drains at most one slab per mount
   REQUIRE(leases.size() == 48);
   REQUIRE(f.arena.set_quota(1, 3, 0, slot_class::mib8).draining_slabs == 1);
   REQUIRE(f.arena.quota(1).pending_slabs == 3);
+  CHECK(f.arena.quota(1).registered_bytes == 0);
   for (auto& lease : leases) {
     REQUIRE(lease.capacity() == mib);  // Never revoked or reformatted while live.
     lease.reset();
@@ -670,6 +693,7 @@ TEST_CASE("device arena slot reclassification uses prewarmed replacement or repo
   large.reset();
   auto const pending = f.arena.set_quota(1, 1, 0, slot_class::mib4);
   REQUIRE(pending.pending_slabs == 1);
+  CHECK(pending.registered_bytes == 0);
   REQUIRE(pending.draining_slabs == 0);
   auto still_usable = f.arena.try_lease(1, 8 * mib, true);
   REQUIRE(still_usable);

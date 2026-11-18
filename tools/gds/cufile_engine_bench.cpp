@@ -53,6 +53,7 @@ struct options {
   std::size_t file_bytes{4096 * mib}, chunk_min{mib}, chunk_max{8 * mib}, columns{64};
   std::size_t reactors{1}, repetitions{1}, min_seconds{1};
   unsigned qd{32};
+  std::vector<unsigned> arena_classes{4};
   std::size_t op_bytes{4 * mib}, arena_bytes{256 * mib};
   int device{};
   bool create{}, verify{true}, sync_each{}, require_direct{true}, unsafe_arena{}, coalesce{true};
@@ -100,6 +101,7 @@ options parse(int argc, char** argv)
            "  --task-mib 2048 --chunk-min-mib 1 --chunk-max-mib 8\n"
            "  --columns 64 --col-dist kib|mixed|large --single-mib 1024\n"
            "  --qd 32 --op-mib 4 --arena-mib 256 --device 0 --coalesce 0|1\n"
+           "  --arena-classes 4 (comma-separated MiB classes; production default {4})\n"
            "  --override fs_type:VALUE|mount_prefix:VALUE|fsid:VALUE (repeatable)\n"
            "  --registration slot|unsafe-arena (slot default; AM-9 diagnostic only)\n"
            "  --require-direct-evidence 0|1 (default 1; 0 TEST ONLY)\n"
@@ -189,7 +191,18 @@ options parse(int argc, char** argv)
       o.columns = number(value);
     else if (key == "--op-mib")
       o.op_bytes = bytes(value);
-    else if (key == "--arena-mib")
+    else if (key == "--arena-classes") {
+      o.arena_classes.clear();
+      std::istringstream list(value);
+      std::string item;
+      while (std::getline(list, item, ',')) {
+        auto const n = number(item);
+        if (n != 1 && n != 2 && n != 4 && n != 8)
+          throw std::invalid_argument("arena classes must be 1,2,4,8");
+        o.arena_classes.push_back(static_cast<unsigned>(n));
+      }
+      if (value.empty() || value.back() == ',') throw std::invalid_argument("empty arena class");
+    } else if (key == "--arena-mib")
       o.arena_bytes = bytes(value);
     else if (key == "--qd") {
       auto n = number(value);
@@ -265,7 +278,8 @@ options parse(int argc, char** argv)
   if (o.soak_minutes && (o.csv.empty() || o.csv == "-" || !o.verify))
     throw std::invalid_argument("soak requires --csv PATH and --verify 1");
   async_engine_config validation;
-  validation.mount_overrides = o.overrides;
+  validation.mount_overrides    = o.overrides;
+  validation.arena_slot_classes = o.arena_classes;
   validation.validate();  // Reject invalid selectors before --create-file can write anything.
   return o;
 }
@@ -533,6 +547,7 @@ int run(options const& o)
   if (o.engine == "async" && !o.require_direct)
     std::cerr << "test_only_compat_admission=1 transport=libcufile (not simulated)\n";
   cfg.async_engine.arena_bytes                   = o.arena_bytes;
+  cfg.async_engine.arena_slot_classes            = o.arena_classes;
   cfg.async_engine.device_lane_cap               = static_cast<unsigned>(lanes(o.qd));
   cfg.async_engine.mount_overrides               = o.overrides;
   cfg.async_engine.probe.require_direct_evidence = o.require_direct;
@@ -571,15 +586,16 @@ int run(options const& o)
       transport = simulator;
     } else
       transport = make_cufile_transport();
-    auto hooks = simulator ? simulator->arena_hooks() : device_arena_hooks::defaults();
-    device_arena_options arena_options;
-    arena_options.initial_class = static_cast<slot_class>(std::countr_zero(o.op_bytes / mib));
+    auto hooks         = simulator ? simulator->arena_hooks() : device_arena_hooks::defaults();
+    auto arena_options = device_arena_options::from_config(cfg.async_engine);
     arena_options.registration =
       o.unsafe_arena ? registration_granularity::arena : registration_granularity::slot;
     arena_options.allow_shared_registration = o.unsafe_arena;
     arena       = std::make_unique<device_arena>(o.device, std::move(hooks));
     auto report = arena->warm_up(cfg.async_engine, arena_options);
-    std::cerr << "arena_registered_bytes=" << report.registered_bytes << '\n';
+    std::cerr << "arena_registered_bytes=" << report.registered_bytes
+              << " arena_registered_class_mask=" << unsigned(arena->available_class_mask())
+              << " registrations=" << arena->gauges().registrations << '\n';
     lane_resources = std::make_shared<lane_pool>(o.device, cfg.async_engine);
     device_engine_options opts;
     opts.arena      = arena.get();
@@ -992,7 +1008,13 @@ int run(options const& o)
     "flush,NOT_GDS,residence_p50_us,residence_p99_us,backlog_ns,storage_qd_ns,"
     "accounted_ns,completed_ops,policy_state,policy_demotions,policy_cooldowns,policy_cooldown_s,"
     "policy_trigger,policy_trigger_us,policy_healthy_p99_us,resident_pages,slow_floor_us,stuck_ms,"
-    "residence_mean_us";
+    "residence_mean_us,arena_slot_classes,arena_registered_class_mask,registrations";
+  std::string classes;
+  for (auto cls : o.arena_classes) {
+    if (!classes.empty()) classes += ',';
+    classes += std::to_string(cls);
+  }
+  auto const arena_state = arena ? arena->gauges() : arena_gauges{};
   std::ostringstream row;
   row << std::fixed << std::setprecision(3) << o.engine << ',' << o.workload << ',' << o.threads
       << ',' << o.tasks << ',' << o.verify << ',' << (o.unsafe_arena ? "unsafe-arena" : "slot")
@@ -1052,7 +1074,9 @@ int run(options const& o)
       << (after.residence.count > before.residence.count
             ? static_cast<double>(after.residence.total_ns - before.residence.total_ns) /
                 static_cast<double>(after.residence.count - before.residence.count) / 1000.0
-            : 0.0);
+            : 0.0)
+      << ',' << quote(classes) << ',' << unsigned(arena_state.registered_class_mask) << ','
+      << arena_state.registrations;
   std::cout << header << '\n' << row.str() << '\n';
   if (!o.csv.empty() && o.csv != "-") {
     std::ofstream csv(o.csv);

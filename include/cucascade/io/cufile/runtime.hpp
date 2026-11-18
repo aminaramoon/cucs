@@ -34,6 +34,7 @@
 namespace cucascade::io::cufile {
 
 enum class process_parameter : std::uint8_t {
+  cufile_json_path,
   allow_compat_mode,
   force_compat_mode,
   max_direct_io_size_kib,
@@ -120,6 +121,8 @@ struct parameter_adapter {
  * driver transaction, opens once, then queries properties/readback before releasing that lock.
  * It never closes the driver and never calls cuFileDriverGetP2PFlags. The legacy entry point
  * joins the same transaction, freezing defaults if called first, without enabling an engine.
+ * cufile_json_path uses process-wide setenv here on the control/bootstrap path. Initialize
+ * before starting threads that read the environment; our driver lock cannot protect them.
  */
 class runtime {
  public:

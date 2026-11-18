@@ -18,6 +18,7 @@
 #include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/device_arena.hpp>
 #include <cucascade/io/cufile/runtime.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -323,6 +324,12 @@ struct device_arena_state {
     for (auto const& slab : slabs) {
       if (slab.owner != mount) { continue; }
       if (slab.has_registration()) {
+        if (!slab.draining && slab.cls == q->cls) {
+          result.registered_bytes +=
+            static_cast<std::size_t>(
+              std::count(slab.registered.begin(), slab.registered.begin() + slab.slots(), true)) *
+            class_bytes(slab.cls);
+        }
         ++result.registered_slabs;
       } else {
         ++result.unregistered_slabs;
@@ -428,6 +435,26 @@ device_arena::device_arena(int device, device_arena_hooks hooks)
 
 device_arena::~device_arena() = default;
 
+device_arena_options device_arena_options::from_config(async_engine_config const& config)
+{
+  config.validate();
+  device_arena_options result;
+  for (auto mib : config.arena_slot_classes) {
+    auto cls = mib == 1   ? slot_class::mib1
+               : mib == 2 ? slot_class::mib2
+               : mib == 4 ? slot_class::mib4
+                          : slot_class::mib8;
+    result.slab_classes.push_back(cls);
+  }
+  result.initial_class = result.slab_classes.front();
+  return result;
+}
+
+arena_warmup_report device_arena::bootstrap(async_engine_config const& config)
+{
+  return warm_up(config, device_arena_options::from_config(config));
+}
+
 arena_warmup_report device_arena::warm_up(async_engine_config const& config,
                                           device_arena_options const& options)
 {
@@ -454,7 +481,13 @@ arena_warmup_report device_arena::warm_up(async_engine_config const& config,
   if (s.maintenance) {
     throw std::logic_error("device_arena maintenance must finish before warm-up");
   }
-  if (s.warmed) { return s.report; }
+  if (s.warmed) {
+    if (s.options != options) {
+      CUCASCADE_LOG_WARN("cuFile arena device {}: warm-up options differ; first geometry retained",
+                         s.device);
+    }
+    return s.report;
+  }
 
   auto const memory = telemetry<arena_memory_info>(s.hooks.memory_info, s.device);
   auto const reservable =
@@ -768,7 +801,10 @@ arena_gauges device_arena::gauges() const
   for (auto const& allocation : s.allocations) {
     if (allocation.base != nullptr) { result.total_bytes += allocation.bytes; }
     for (auto const& registration : allocation.registrations) {
-      if (registration.active) { result.registered_bytes += registration.bytes; }
+      if (registration.active) {
+        result.registered_bytes += registration.bytes;
+        ++result.registrations;
+      }
     }
   }
   result.unregistered_bytes = result.total_bytes - result.registered_bytes;
@@ -777,7 +813,12 @@ arena_gauges device_arena::gauges() const
     ++result.slabs;
     auto const registrations =
       static_cast<unsigned>(std::count(slab.registered.begin(), slab.registered.end(), true));
-    if (registrations != 0) { ++result.registered_slabs; }
+    auto const bit = static_cast<std::uint8_t>(1U << static_cast<unsigned>(slab.cls));
+    if (registrations != 0) {
+      ++result.registered_slabs;
+      result.registered_class_mask |= bit;
+    }
+    if (registrations != slab.slots()) result.unregistered_class_mask |= bit;
     if (registrations != 0 && registrations != slab.slots()) {
       ++result.partially_registered_slabs;
     }

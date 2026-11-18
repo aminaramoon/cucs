@@ -95,6 +95,7 @@ struct engine_mount_gauges {
   mount_profile profile;
 };
 struct engine_gauges {
+  std::uint8_t arena_registered_class_mask{};  ///< Effective physical classes, bits 0..3.
   std::size_t storage_qd{}, max_storage_qd{}, outstanding_slices{}, live_operations{};
   double mean_storage_qd{}, backlog_mean_storage_qd{};
   /// Additive time bases/integrals for warm-up-excluding benchmark windows.

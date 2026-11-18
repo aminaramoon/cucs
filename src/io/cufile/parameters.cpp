@@ -102,6 +102,7 @@ adapter::set_result set(void*,
       }
 #endif
       return adapter::set_result::unsupported;
+    case process_parameter::cufile_json_path: return adapter::set_result::unsupported;
     // libcufile 1.17 exposes neither a typed RDMA list nor policy parameter ID.
     // Do not guess IDs or encode a list into the unrelated logging string setter.
     case process_parameter::rdma_dev_addr_list:
@@ -243,7 +244,8 @@ adapter::verification verify(void*,
 #endif
     }
     case process_parameter::rdma_dev_addr_list:
-    case process_parameter::rdma_load_balancing_policy: return adapter::verification::unavailable;
+    case process_parameter::rdma_load_balancing_policy:
+    case process_parameter::cufile_json_path: return adapter::verification::unavailable;
   }
   return adapter::verification::unavailable;
 }

@@ -62,6 +62,8 @@ struct gpu_bounce_slabs {
 
 /** @brief Typed pre-driver-open process allowlist. Unset means no requested change. */
 struct process_cufile_parameters {
+  /// Set CUFILE_ENV_PATH_JSON on the control/bootstrap path, before other environment readers.
+  std::optional<std::string> cufile_json_path;
   std::optional<bool> allow_compat_mode;
   std::optional<bool> force_compat_mode;
   std::optional<std::size_t> max_direct_io_size_kib;
@@ -79,7 +81,7 @@ struct process_cufile_parameters {
     if (!positive(max_direct_io_size_kib) || !positive(max_device_pinned_mem_size_kib) ||
         !positive(max_device_cache_size_kib))
       throw std::invalid_argument("cuFile size limits must be positive KiB");
-    for (auto const* text : {&logging_level, &rdma_load_balancing_policy})
+    for (auto const* text : {&logging_level, &rdma_load_balancing_policy, &cufile_json_path})
       if (*text && ((*text)->empty() || (*text)->find('\0') != std::string::npos))
         throw std::invalid_argument("cuFile parameter string must be nonempty and contain no NUL");
     if (rdma_dev_addr_list) {
@@ -149,6 +151,8 @@ struct async_engine_config {
   /// the minimum of 1 GiB, 5% of device memory, and reservable memory. Explicit nonzero
   /// targets are accepted as given; actual allocation/registration is a resource concern.
   std::size_t arena_bytes{0};
+  /// Prewarmed MiB classes, unique members of {1,2,4,8}. Smaller pieces use larger slots.
+  std::vector<unsigned> arena_slot_classes{4};
   unsigned device_lane_cap{160};
   std::size_t max_pending_slices_per_device{4096};
   unsigned low_service_interval{4};
@@ -220,6 +224,15 @@ struct async_engine_config {
     }
     if (submitters_per_device < 1 || submitters_per_device > 8) {
       throw std::invalid_argument("submitters_per_device must be in [1, 8]");
+    }
+    if (arena_slot_classes.empty())
+      throw std::invalid_argument("arena_slot_classes must be nonempty");
+    unsigned class_mask = 0;
+    for (auto cls : arena_slot_classes) {
+      if ((cls != 1 && cls != 2 && cls != 4 && cls != 8) || (class_mask & cls))
+        throw std::invalid_argument(
+          "arena_slot_classes requires unique MiB classes from {1,2,4,8}");
+      class_mask |= cls;
     }
     positive(device_lane_cap, "device_lane_cap");
     positive(max_pending_slices_per_device, "max_pending_slices_per_device");

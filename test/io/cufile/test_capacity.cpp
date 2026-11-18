@@ -98,6 +98,41 @@ TEST_CASE("cuFile capacity fits lanes before operation classes", "[io][cufile][c
   REQUIRE(extreme.op_bytes == 8 * capacity_mib);
 }
 
+TEST_CASE("cuFile backing slots charge physical bytes and retain larger logical pieces",
+          "[io][cufile][capacity]")
+{
+  CHECK(backing_slot_bytes(capacity_mib, 0) == 0);
+  CHECK(backing_slot_bytes(capacity_mib, 0x0c) == 4 * capacity_mib);
+  CHECK(backing_slot_bytes(2 * capacity_mib, 0x05) == 4 * capacity_mib);
+  CHECK(backing_slot_bytes(8 * capacity_mib, 0x04) == 0);
+  CHECK(backing_slot_bytes(8 * capacity_mib, 0x08) == 8 * capacity_mib);
+  auto const same_backing = fit({64, 2 * capacity_mib}, 64 * capacity_mib, 160, 0x04);
+  CHECK(same_backing.op_bytes == 2 * capacity_mib);
+  CHECK(same_backing.qd == 12);
+  auto const exact = fit({64, 2 * capacity_mib}, 64 * capacity_mib, 160, 0x05);
+  CHECK(exact.op_bytes == capacity_mib);
+  CHECK(exact.qd == 51);
+  // A mixed {4,8} arena's 8-MiB half owns 32 MiB, not the full 64 MiB.
+  auto const assigned = fit({4, 8 * capacity_mib}, 32 * capacity_mib, 160, 0x08);
+  CHECK(assigned.qd == 3);
+  CHECK(assigned.lanes * 8 * capacity_mib <= 32 * capacity_mib);
+}
+
+TEST_CASE("cuFile rebalance demand uses the piece fit actually selects", "[io][cufile][capacity]")
+{
+  std::array<mount_capacity_demand, 1> mounts{{{{64, 8 * capacity_mib}, 1}}};
+  auto const gpfs = rebalance(mounts, 1024 * capacity_mib, 160, 0x04).front();
+  CHECK(gpfs.slabs == 20);
+  CHECK(gpfs.effective.op_bytes == 4 * capacity_mib);
+  CHECK(gpfs.effective.qd == 64);
+  mounts[0].profile.preferred_op_bytes = 2 * capacity_mib;
+  auto const weka                      = rebalance(mounts, 1024 * capacity_mib, 160, 0x05).front();
+  CHECK(weka.slabs == 5);
+  CHECK(weka.effective.op_bytes == capacity_mib);
+  CHECK(weka.effective.qd == 64);
+  CHECK(rebalance(mounts, 1024 * capacity_mib, 160, 0).front().slabs == 0);
+}
+
 TEST_CASE("cuFile water filling is weighted capped and deterministic", "[io][cufile][capacity]")
 {
   std::array<capacity_demand, 3> demands{{{100, 1}, {100, 2}, {100, 1}}};
@@ -180,7 +215,10 @@ TEST_CASE("cuFile capacity only chooses prewarmed operation classes", "[io][cufi
   REQUIRE(slot_default.qd == 32);
   REQUIRE(slot_default.op_bytes == capacity_mib);
   REQUIRE(fit({32, 4 * capacity_mib}, 256 * capacity_mib, 160, 0).is_fallback());
-  REQUIRE(fit({32, capacity_mib}, 256 * capacity_mib, 160, 0x02).is_fallback());
+  auto const larger_backing = fit({32, capacity_mib}, 64 * capacity_mib, 160, 0x04);
+  REQUIRE(larger_backing.op_bytes == capacity_mib);
+  REQUIRE(larger_backing.qd == 12);
+  REQUIRE(larger_backing.lanes * 4 * capacity_mib <= 64 * capacity_mib);
   auto const no_small_slots = fit({32, 8 * capacity_mib}, 16 * capacity_mib, 160, 0x04);
   REQUIRE(no_small_slots.qd == 3);
   REQUIRE(no_small_slots.op_bytes == 4 * capacity_mib);

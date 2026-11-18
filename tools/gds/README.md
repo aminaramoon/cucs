@@ -7,6 +7,42 @@ See [QUALIFICATION.md](QUALIFICATION.md) for `qualify.sh`, its example config,
 and separate ASan+UBSan/TSan build and run commands. All default product behavior
 remains legacy; compat smoke and raw nvidia-fs snapshots are not GDS evidence.
 
+## Selecting GPU-local NICs
+
+`python3 tools/gds/make_cufile_json.py --gpu 0 --base /etc/cufile.json --out /tmp/cufile-gpu0.json`
+prints a GPU/NIC mapping and an exact shell-quoted `export CUFILE_ENV_PATH_JSON=...`.
+The base is optional; // comments are accepted. Repeat `--gpu INDEX|BDF` for
+multi-GPU processes. Use BDFs when CUDA visibility remaps ordinals. Optional
+`--policy`, `--sysfs-root` and `--nvidia-smi-topo FILE` support policy selection,
+fixtures and captured `nvidia-smi topo -m` input. No NIC/address means a graceful
+no-write/no-export result, not a generated empty allowlist.
+
+The script ranks the nearest shared upstream bridge first (PIX before PXB), then
+NUMA proximity. It emits IPv4 only by default, printing excluded IPv6 candidates;
+`--allow-ipv6` is **[verify]** opt-in, not validated libcufile IPv6 support.
+RoCE GIDs require netdev associations; IPoIB addresses come from `ip -j addr`.
+Unrelated JSON keys and the base policy survive; `--policy` explicitly overrides
+with `RoundRobin` or `RoundRobinMaxMin` (RoundRobin only when no base policy exists).
+Undocumented base policies warn. Writes are atomic; `--out == --base` is rejected.
+The properties-level list is for **user-space filesystem clients**, per stock JSON.
+Kernel NFS/Lustre/BeeGFS dynamic routing uses separate `fs.<type>` lists/mount tables;
+the script leaves them unchanged and warns about them and enabled dynamic routing.
+**[verify]** multi-GPU list semantics, policy support and `rdma_dynamic_routing`
+depend on libcufile. This never controls GPFS `verbsPorts`, WEKA `net=` or VAST
+`localports=`. Export before launch; for runtime selection, explicitly call
+`runtime::instance().ensure_initialized(params, strict)` before any DISK context
+or `gds_available()` probe. Automatic DISK setup otherwise freezes defaults before
+reactor parameters are read, returning `parameters_differ` without new entries. See
+[Selecting NICs for a GPU](../../docs/io/cufile-reactor.md#selecting-nics-for-a-gpu)
+for the four-GPU example and runtime initialization ordering.
+
+`qualify.sh` defaults to `RECORD_NIC_COUNTERS=1` (`NIC_SYSFS_ROOT=/sys`): every
+engine bench invocation, including legacy comparison arms, gets
+`*.nic-before.json`, `*.nic-after.json` and `*.nic-delta.json`. Collection is
+read-only; absent/denied counters are recorded as unavailable. RX/TX data counters
+use 4-byte units; byte deltas are also recorded. Resets/new counters yield null.
+These host-global traffic deltas are hints, not cuFile/direct-path proof.
+
 ## Standalone cuFile async-QD harness
 
 Phase 1 / P0 (B-0 and initial B-1 components), per
@@ -192,8 +228,13 @@ Modes and safety:
   explicit `--override fs_type:VALUE`, `mount_prefix:VALUE`, or `fsid:VALUE`
   (repeatable) to operator-qualify the target mount per AM-4. `--qd 32` and
   `--op-mib 4` set these overrides' preferred profiles; capacity fitting may
-  reduce either. `--arena-mib 256` provisions the selected 1/2/4/8 MiB slot
-  class, so a geometry absent from the arena cannot be reported as effective.
+  reduce either. `--arena-mib 256 --arena-classes 4` uses production's default
+  slot geometry independently of `--op-mib`. Choose comma-separated unique classes
+  from 1,2,4,8 (for example `--arena-classes 4,8`); mixed classes split capacity.
+  Use `{8}` for GPFS-only processes. `{4}` charges 4×/2× backing bytes for
+  1/2-MiB network-FS pieces; prefer `{1}`/`{2}` for network-FS-only processes.
+  CSV records `arena_slot_classes`, `arena_registered_class_mask`, and `registrations`,
+  so geometry absent from the arena cannot be reported as effective.
   Without a matching qualified/probed policy, reads stay legacy and the tool
   warns if no measured engine transport bytes were observed.
 - `--require-direct-evidence 0` is **TEST ONLY**. For `--engine async` it uses

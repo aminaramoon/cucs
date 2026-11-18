@@ -8,6 +8,67 @@ using namespace cucascade::io;
 using namespace cucascade::io::cufile;
 using namespace cucascade::io::cufile::engine_test;
 
+TEST_CASE("production arena configuration fits filesystem profiles in a simulated engine",
+          "[cufile][engine][arena]")
+{
+  if (!has_device()) SKIP("CUDA unavailable");
+  auto cfg                          = configuration(4);
+  auto const which                  = GENERATE(0, 1, 2, 3, 4);
+  cfg.arena_bytes                   = 64 * mib;
+  cfg.arena_slot_classes            = which == 1   ? std::vector<unsigned>{1}
+                                      : which == 2 ? std::vector<unsigned>{4, 8}
+                                                   : std::vector<unsigned>{4};
+  cfg.mount_overrides.front().value = which == 2   ? "gpfs"
+                                      : which == 3 ? "wekafs"
+                                      : which == 4 ? "nfs"
+                                                   : "ext4";
+  cfg.mount_overrides.front().op_bytes.reset();
+  fixture f(8 * mib, cfg);
+  f.arena->release_for_maintenance();
+  auto const report = f.arena->bootstrap(cfg);
+  REQUIRE(report.registered_bytes == cfg.arena_bytes);
+  auto identity        = mount_identity{};
+  identity.fs_type     = which == 2 ? "gpfs" : which == 3 ? "wekafs" : which == 4 ? "nfs" : "ext4";
+  identity.block_bytes = 8 * mib;
+  if (which == 2) identity.geometry.geometry_bytes = 8 * mib;
+  identity.valid = true;
+  f.policy =
+    std::make_shared<mount_policy>(mount_policy_key{1, 1, "", "bootstrap-0", 1}, identity, cfg);
+  transport_simulator::fault fault;
+  fault.index            = 0;
+  fault.stuck_completion = true;
+  f.transport->add_fault(fault);
+  f.start();
+  auto group  = std::make_shared<grouped_coordinator>(8 * mib, 1);
+  auto future = group->get_future();
+  f.engine->hand_off(f.slice(group, {0, 8 * mib}));
+  REQUIRE(until([&] { return f.transport->snapshot().blocked_completions != 0; }));
+  REQUIRE(until([&] {
+    auto const snapshot = f.engine->gauges();
+    return snapshot.mounts.size() == 1 && snapshot.mounts[0].effective.op_bytes != 0;
+  }));
+  auto const gauges = f.engine->gauges();
+  REQUIRE(gauges.mounts.size() == 1);
+  auto const expected = which == 1 || which == 4 ? mib
+                        : which == 2             ? 8 * mib
+                        : which == 3             ? 2 * mib
+                                                 : 4 * mib;
+  CHECK(gauges.mounts[0].effective.op_bytes == expected);
+  CHECK(gauges.arena_registered_class_mask == (which == 1 ? 1 : which == 2 ? 12 : 4));
+  auto const arena = f.arena->gauges();
+  CHECK(arena.registered_class_mask == gauges.arena_registered_class_mask);
+  CHECK(arena.registrations == (which == 1 ? 64 : which == 2 ? 12 : 16));
+  if (which == 2) {
+    auto const effective = gauges.mounts[0].effective;
+    CHECK(effective.lanes * 8 * mib <= 32 * mib);
+    CHECK(effective.qd == 3);
+  }
+  f.transport->unblock_all();
+  REQUIRE(std::move(future).get(5s) == 8 * mib);
+  REQUIRE(f.engine->drain(5s));
+  CHECK(f.contents() == f.image);
+}
+
 TEST_CASE("engine distinguishes inode refusals from mount driver and device failures",
           "[cufile][engine][hardening]")
 {

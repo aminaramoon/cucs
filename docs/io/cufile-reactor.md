@@ -89,6 +89,7 @@ a.async_reads = true;
 a.async_writes = false;                 // independent, not implied by read qualification
 // a.affinity = true;                   // optional; default off
 // a.arena_bytes = 512UL << 20;          // otherwise auto
+// a.arena_slot_classes = {4, 8};        // default {4}; add 8 for GPFS 8-MiB blocks
 mount_override mount;
 mount.value = "/mnt/disk_2";            // normalized mount prefix
 mount.state = mount_override_state::operator_qualified;
@@ -100,7 +101,8 @@ mount.op_bytes = 4UL << 20;
 // mount.allow_writes = true;           // only AFTER client/version write qualification
 // a.async_writes = true;               // both settings required for override writes
 a.mount_overrides.push_back(mount);
-// Set process params BEFORE any cuFile user opens the driver:
+// Set process params BEFORE any cuFile probe or driver open (see bootstrap below):
+// a.process_params.cufile_json_path = "/run/user/1000/cufile-gpu0.json";
 // a.process_params.max_device_pinned_mem_size_kib = 1UL << 20;
 // a.strict_parameters = true;
 ```
@@ -119,13 +121,38 @@ the cuFile pin limit. An explicit allocation target is not a guarantee of
 registered capacity. Default bootstrap uses `cudaMalloc`; reservation-manager
 integration remains open.
 
-`device_arena_options` is a **control/bootstrap** API, not nested in
-`async_engine_config`. For advanced provisioning, obtain
-`device_arena::for_device(device, options)` before automatic engine creation.
-Prepare `slab_classes` for the expected 1/2/4/8-MiB profiles. Defaults prepare
-only 1-MiB slots, so `op_bytes=4 MiB` alone does **not** guarantee 4-MiB I/O.
-Slot registrations cannot be reshaped during transfers. Observe
-`engine_gauges.mounts[].effective`, not just requested preferences.
+Production bootstrap translates `async_engine_config::arena_slot_classes`
+through `device_arena_options::from_config(config)` into `slab_classes` and
+`initial_class`. The default is **{4} MiB**: smaller 1/2-MiB pieces can lease
+4-MiB slots, while ext4/xfs retain 4-MiB operations (reducing QD if bytes
+require it). Fitting charges the **physical backing slot**, never the smaller
+logical piece, against byte capacity. GPFS with 8-MiB blocks needs explicit
+`{8}` for GPFS-only processes. `{4,8}` is for mixed GPFS + local deployments:
+classes repeat across 16-MiB slabs, splitting registered capacity between them.
+Effective QD is clamped to actually assigned registered bytes of the backing class,
+not pending/wrong-class slab grants. Classes must
+be nonempty, unique members of {1,2,4,8}; ordering determines slab provisioning
+order. Limited registration may not prepare every requested class. Check the
+actual registered class masks, not just configuration.
+The `{4}` default costs 4×/2× bytes per 1/2-MiB network-FS piece. With unknown
+BAR1's 64-MiB registration cap, NFS QD 64 fits QD 12 with `{4}` versus QD 51
+with `{1}`. Prefer `{1}` or `{2}` for network-FS-only processes. A zero-grant
+sync fallback also borrows a 4-MiB piece under `{4}`.
+A later warm-up with different options warns and retains the first geometry;
+changing it requires maintenance and re-warming.
+
+`device_arena_options` remains an advanced **control/bootstrap** API. Its raw
+defaults still use `mib1`; use `from_config` for production-equivalent isolated
+bootstrap, as the benchmark does. Obtain `device_arena::for_device(device)`, then
+call `warm_up(config, options)` before engine creation for advanced provisioning.
+First warm-up wins. Slot registrations cannot be reshaped during transfers.
+Observe `engine_gauges.mounts[].effective`, not just requested preferences.
+
+AM-9 registers each S-MiB slot separately: each full 16-MiB slab has 16/S
+registrations (four for S=4, two for S=8). Registered-byte/BAR1 and pin budgets
+remain the sum of actual registration lengths, not the registration count.
+Unknown BAR1 still caps registration at 64 MiB: 16 registrations with {4}.
+The benchmark's `--op-mib` sets this same config field, not private arena geometry.
 
 **AM-9 warning:** libcufile 1.17 compat has demonstrated silent cross-slot
 corruption with shared arena **and slab** registrations, even with full successful
@@ -141,9 +168,30 @@ or bytes-count-only verification as correctness evidence.
 **entire first request**, including omitted fields. Repeating exactly is safe;
 a later differing request is reported, ignored, and throws in strict mode.
 The no-argument overload joins the frozen runtime rather than requesting defaults
-when already initialized. If it runs first (including a legacy file open, arena or
-lane bootstrap), it freezes an empty/default request; later explicit parameters
-are ignored, or rejected in strict mode.
+when already initialized. If it runs first (including `gds_available()`, the
+`make_disk_io_context(automatic)` backend probe, `default_disk_io_context()`,
+a legacy file open, arena or lane bootstrap), it freezes an empty/default request.
+Later differing requests return `parameters_differ=true` with the original report
+and **no new per-field entries**, or throw in strict mode.
+
+**Required bootstrap for automatic DISK contexts:** setting fields only in
+`disk_io_context_options.io.cufile.async_engine.process_params` is too late:
+the automatic GDS probe runs before reactor construction. Export
+`CUFILE_ENV_PATH_JSON` before launch (preferred), or explicitly prime the runtime
+with the same complete parameters before constructing any DISK context or probing GDS:
+
+```cpp
+#include <cucascade/io/cufile/runtime.hpp>
+// a is the same async_engine_config passed to the DISK context.
+a.process_params.cufile_json_path = "/run/user/1000/cufile-gpu0.json";
+a.strict_parameters = true;
+auto report = cucascade::io::cufile::runtime::instance().ensure_initialized(
+  a.process_params, a.strict_parameters);
+// Only now call make_disk_io_context(...) / default_disk_io_context().
+```
+
+The process-shared default has no parameter argument: use the export or the
+explicit priming step, not an implicit context default.
 Set parameters before any other library's driver open, property probe or file
 registration. All defaults are **unset**, meaning no setter call. Even a legacy
 context can explicitly request process parameters without enabling the engine.
@@ -156,6 +204,7 @@ serializes setters → driver open → properties → readback. There is no
 
 | `process_params` field | Type / units | Setter / readback in the installed 1.17 header |
 |---|---|---|
+| `cufile_json_path` | optional absolute, readable path | `setenv(CUFILE_ENV_PATH_JSON)` before setters/driver open; explicit pre-probe bootstrap required; library interpretation unverified |
 | `allow_compat_mode` | optional bool | `Bool`, `PROPERTIES_ALLOW_COMPAT_MODE` |
 | `force_compat_mode` | optional bool | `Bool`, `FORCE_COMPAT_MODE` |
 | `max_direct_io_size_kib` | optional size, KiB | `SizeT`, `PROPERTIES_MAX_DIRECT_IO_SIZE_KB` |
@@ -180,6 +229,7 @@ Vendor-specific value ranges are left to the actual setter.
   already-open driver was detected, or the setter rejected the value;
 - **unsupported:** no library, validated adapter or setter symbol;
 - **unverified:** accepted, but getter missing/failed, or driver open failed.
+  JSON selection also stays unverified: environment selection is not library readback.
   Acceptance alone never implies the setting took effect;
 - **differs:** accepted, but readback contradicts the requested value.
 
@@ -190,6 +240,28 @@ Versioned, commented configuration templates live in
 [`cufile-profiles/`](cufile-profiles/README.md). Strip comments and select the
 result via `CUFILE_ENV_PATH_JSON` **before process initialization**. RDMA JSON
 policy is distinct from engine thread placement.
+
+`process_params.cufile_json_path` is an alternative to an external export **only
+with the explicit pre-probe bootstrap above**. During that first initialization,
+the driver transaction sets `CUFILE_ENV_PATH_JSON` before setters and driver open.
+A relative or unreadable path is **unapplied: json not readable**. An identical existing value is accepted; a different value reports
+**unapplied: conflicting environment** without overwriting it. A prior driver
+open reports **unapplied: driver already open** (a prior failed attempt also
+prevents changes, since initialization does not retry). Both are strict-mode
+errors. These per-field statuses apply only to the first runtime initialization;
+a previously frozen runtime instead returns `parameters_differ` and no new entry.
+An externally opened driver is detected at open and reported likewise, removing
+an environment value created by this transaction. Missing libcufile reports
+**unsupported** without changing the environment. The library is loaded before
+the environment selection; constructor-time JSON consumption is **[verify]**.
+Successful environment selection is **unverified**, not proof that libcufile
+accepted the JSON or its RDMA policy. Typed RDMA setters remain unsupported.
+
+**Thread-safety caveat:** `setenv` mutates the process environment. Initialize on
+the control/bootstrap path **before starting other threads that read the
+environment**. The cuFile transaction lock cannot serialize unrelated environment
+readers or writers. Prefer a shell export before launch when that ordering cannot
+be guaranteed; do not change JSON selection from transfer/application workers.
 
 ### Affinity (optional, default off)
 
@@ -228,6 +300,78 @@ vendor-specific NIC eligibility, routing steering, and NUMA first-touch of the
 shared blocking-pool scratch are not implemented by this placement policy.
 `device_engine_options::{sysfs_root,gpu_bdf,permitted_cpus}` inject discovery
 inputs for isolated tests; production defaults to live discovery.
+
+### Selecting NICs for a GPU
+
+Example node (illustrative; discover actual PCIe bridges and addresses):
+
+| GPU / BDF | NUMA | Closest RDMA NIC / example address |
+|---|---:|---|
+| 0 / 0000:11:00.0 | 0 | mlx5_0 / 10.0.0.10 |
+| 1 / 0000:21:00.0 | 0 | mlx5_1 / 10.0.1.10 |
+| 2 / 0000:81:00.0 | 1 | mlx5_2 / 10.0.2.10 |
+| 3 / 0000:91:00.0 | 1 | mlx5_3 / 10.0.3.10 |
+
+To run on GPU 2 **without pinning the process**:
+
+```sh
+python3 tools/gds/make_cufile_json.py --gpu 2 --base /etc/cufile.json --out /tmp/cufile-gpu2.json
+# Inspect the mapping, then use the exact export printed by the tool:
+export CUFILE_ENV_PATH_JSON=/tmp/cufile-gpu2.json
+# Launch the application normally, no taskset/numactl needed.
+```
+
+Per-request `device_id` selects the CUDA GPU. The generator's index is the
+`nvidia-smi` index, **not** a remapped CUDA-visible ordinal; use `--gpu BDF` to
+avoid ambiguity with `CUDA_VISIBLE_DEVICES`. The generator selects that GPU's
+best addressable NIC set for **cuFile-managed RDMA**: nearest shared upstream
+PCIe bridge first (PIX before PXB by hop distance), then same NUMA, then others;
+all equal-best NICs are included. It reads sysfs, RoCE GIDs with netdev associations
+and (when available) `rdma -j link` / `ip -j addr`; IPoIB addresses come from the
+netdev's `ip -j addr`, not unassociated IB GIDs.
+Only usable non-link-local **IPv4** addresses are emitted by default, never MACs.
+IPv6 candidates are printed but excluded; `--allow-ipv6` is an explicit **[verify]**
+opt-in because libcufile documents IPv4 lists. Unknown NUMA
+and bridge information is reported as uncertain. Optional `--nvidia-smi-topo`
+accepts saved `nvidia-smi topo -m` output as a bridge-proximity fallback.
+`--base` is optional and accepts // comments (comments are dropped on output).
+Unrelated keys and the existing policy are preserved. `--policy` accepts only
+`RoundRobin` or `RoundRobinMaxMin`; absent a base policy, the default is RoundRobin.
+An undocumented base policy is preserved with a **[verify]** warning.
+Output is replaced atomically; `--out` must not be the base file. No addressable NIC means a diagnostic and
+successful exit with **no output file written or export generated** (an existing
+output file is left untouched). Do not reuse an old output after that diagnostic.
+
+For multi-GPU processes repeat `--gpu`; the output list is the deduplicated union
+of each GPU's best set. **[verify]** libcufile's interpretation of a shared list
+across multiple GPUs, policy support, and `rdma_dynamic_routing` are
+version-specific. The tool leaves dynamic routing unchanged and makes no
+per-GPU enforcement or reachability guarantee. Validate the resulting traffic.
+
+The generated `properties.rdma_dev_addr_list` is for **user-space filesystem
+clients**, per the stock cuFile JSON. Kernel NFS/Lustre/BeeGFS clients have separate
+`fs.<type>.rdma_dev_addr_list` / `mount_table` lists for dynamic routing; the tool
+leaves these unchanged and warns about fs-level lists, mount tables and enabled
+`rdma_dynamic_routing`. It does not steer all cuFile traffic automatically.
+Export before launch, or use the explicit `runtime::instance().ensure_initialized`
+pre-probe bootstrap above; automatic DISK setup otherwise freezes defaults first.
+
+This does **not** control filesystem-client-managed RDMA. GPFS needs its client
+`verbsPorts` settings; WEKA needs its client `net=` selection; VAST needs its
+client `localports=` settings. Consult the installed client/version and admin;
+libcufile JSON cannot replace these controls.
+
+Optionally set `affinity=true` and mount override `nic="mlx5_2"` for this mount.
+That pins **only engine-owned threads**: the reaper near the GPU, submitters near
+the selected NIC. Application threads are never pinned. Affinity does not select
+RDMA routes and the JSON generator does not enable affinity.
+
+Verify with `tools/gds/collect_topology.sh --out /tmp/gpu2-topology.md` and deltas
+of `/sys/class/infiniband/<dev>/ports/<p>/counters/port_rcv_data` (4-byte units)
+on **every** NIC before/after an isolated run; TX counters help with writes.
+`qualify.sh` records read-only RX/TX snapshots and deltas around each engine
+benchmark invocation by default (`RECORD_NIC_COUNTERS=1`). Counters include
+unrelated host traffic; deltas alone do not prove direct I/O or attribution.
 
 ## Configuration reference
 
@@ -268,6 +412,7 @@ per-file engine granules can be larger.
 | `coalesce` / `coalesce_max_targets` | true / 64 | small-read grouping; cap validates 1..4096 |
 | `submitters_per_device` | 1 | shared submitters; validates 1..8 |
 | `arena_bytes` | 0 (auto) | allocation target, not a registration guarantee |
+| `arena_slot_classes` | `{4}` | unique MiB classes from {1,2,4,8}; production prewarm geometry |
 | `device_lane_cap` | 160 | positive maximum owned lanes, at most 160 |
 | `max_pending_slices_per_device` | 4096 | bounded metadata, at most 2^20 |
 | `low_service_interval` | 4 | positive engine fairness interval |
@@ -314,7 +459,7 @@ An fsid selector is lowercase hex of **raw** `f_fsid` bytes, not necessarily
 | `registration` | `slot` (alternatives: unsafe/unqualified `slab`, `arena`) |
 | `allow_shared_registration` | false |
 | `initial_class` | `mib1` |
-| `slab_classes` | empty: repeat `initial_class` |
+| `slab_classes` | raw default empty: repeat `initial_class`; production uses `from_config` ({4}) |
 | `bar1_fraction` | 0.5 |
 | `bar1_headroom` | 64 MiB |
 | `registration_first_step` | 64 MiB; conservative cap when BAR1 is unknown |
@@ -359,6 +504,10 @@ Access `device_engine::try_get(device)->gauges()` after checking for null,
 `device_arena::gauges()`, `mount_policy::gauges()` and the immutable runtime
 initialization report. Snapshots are eventually consistent, not completion
 barriers. Engine metrics are **per device**, not duplicated/additive per facade.
+`engine_gauges.arena_registered_class_mask` exposes effective physical classes;
+`arena_gauges.{registered_class_mask,unregistered_class_mask}` expose actual
+geometry by tier (bits 0..3 mean 1/2/4/8 MiB). `registrations` counts active cuFile
+registrations, independently of bytes and slab counts.
 A mount snapshot includes `mount_id`, requested `profile`, fitted `effective`
 (`qd`, `op_bytes`, `lanes`), current/max QD and occupied lanes.
 

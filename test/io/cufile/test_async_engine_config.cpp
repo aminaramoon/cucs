@@ -38,6 +38,23 @@ void check_invalid(async_engine_config const& cfg, std::string const& field)
 
 }  // namespace
 
+TEST_CASE("production arena slot classes validate", "[io][cufile][config]")
+{
+  async_engine_config cfg;
+  CHECK(cfg.arena_slot_classes == std::vector<unsigned>{4});
+  for (auto const& bad :
+       std::vector<std::vector<unsigned>>{{}, {0}, {3}, {16}, {4, 4}, {1, 8, 7}}) {
+    cfg.arena_slot_classes = bad;
+    check_invalid(cfg, "arena_slot_classes");
+  }
+  cfg.arena_slot_classes = {8, 1, 4, 2};
+  CHECK_NOTHROW(cfg.validate());
+  cfg.process_params.cufile_json_path = "";
+  CHECK_THROWS_AS(cfg.validate(), std::invalid_argument);
+  cfg.process_params.cufile_json_path = std::string("bad") + char(0) + "path";
+  CHECK_THROWS_AS(cfg.validate(), std::invalid_argument);
+}
+
 TEST_CASE("async engine configuration defaults preserve legacy routing", "[io][cufile][config]")
 {
   config const reactor;

@@ -50,8 +50,18 @@ struct effective_profile {
   [[nodiscard]] constexpr bool is_fallback() const noexcept { return qd == 0; }
 };
 
+/// Smallest physical slot that can back a piece, or zero if none is prepared.
+[[nodiscard]] constexpr std::size_t backing_slot_bytes(std::size_t piece,
+                                                       std::uint8_t class_mask) noexcept
+{
+  for (unsigned bit = 1; bit <= 8; bit *= 2)
+    if ((class_mask & bit) && capacity_mib * bit >= piece) return capacity_mib * bit;
+  return 0;
+}
+
 /**
- * @brief Fit lane-limited QD first, then choose the largest fitting available class.
+ * @brief Fit lane-limited QD first, then choose the largest fitting logical piece.
+ * Smaller pieces may lease larger slots; byte capacity always charges the physical slot.
  *
  * If bytes cannot support that QD at the smallest available class, reduce QD further.
  * class_mask bits 0..3 enable 1, 2, 4 and 8 MiB respectively; zero forces fallback.
@@ -80,14 +90,22 @@ struct effective_profile {
   if (qd == 0) return {};
   std::size_t smallest = 0;
   for (unsigned index = 4; index != 0; --index) {
-    auto const bit  = 1U << (index - 1);
-    auto const size = capacity_mib * bit;
-    if ((class_mask & bit) == 0 || size > p.preferred_op_bytes) continue;
+    auto const bit     = 1U << (index - 1);
+    auto const size    = capacity_mib * bit;
+    auto const backing = backing_slot_bytes(size, class_mask);
+    if (backing == 0 || size > p.preferred_op_bytes) continue;
+    // Preserve exact-class preferences when any prepared class is <= the preference.
+    if ((class_mask & bit) == 0 &&
+        backing_slot_bytes(capacity_mib, class_mask) <= p.preferred_op_bytes)
+      continue;
+    // A smaller piece with the same backing costs just as much: keep the larger piece.
+    if (size <= p.preferred_op_bytes / 2 && backing_slot_bytes(size * 2, class_mask) == backing)
+      continue;
     smallest = size;
-    if (lanes(qd) <= bytes / size) { return {qd, size, static_cast<unsigned>(lanes(qd))}; }
+    if (lanes(qd) <= bytes / backing) { return {qd, size, static_cast<unsigned>(lanes(qd))}; }
   }
   if (smallest == 0) return {};
-  auto const byte_limited = fit_qd(qd, bytes / smallest);
+  auto const byte_limited = fit_qd(qd, bytes / backing_slot_bytes(smallest, class_mask));
   return byte_limited == 0
            ? effective_profile{}
            : effective_profile{byte_limited, smallest, static_cast<unsigned>(lanes(byte_limited))};
@@ -193,9 +211,11 @@ struct mount_capacity_grant {
   lane_demands.reserve(mounts.size());
   slab_demands.reserve(mounts.size());
   for (auto const& mount : mounts) {
-    auto const need = std::min<std::uint64_t>(lanes(mount.profile.qd), mount.profile.lane_cap);
-    auto const size = std::clamp(mount.profile.preferred_op_bytes, capacity_mib, 8 * capacity_mib);
-    auto const byte_need = need * size;
+    auto const fitted =
+      fit(mount.profile, std::numeric_limits<std::size_t>::max(), device_lane_cap, class_mask);
+    auto const need      = fitted.lanes;
+    auto const backing   = backing_slot_bytes(fitted.op_bytes, class_mask);
+    auto const byte_need = static_cast<std::uint64_t>(need) * backing;
     auto const slabs     = byte_need / capacity_slab_bytes + (byte_need % capacity_slab_bytes != 0);
     lane_demands.push_back(
       {static_cast<unsigned>(std::min<std::uint64_t>(need, device_lane_cap)), mount.weight});
