@@ -7,6 +7,10 @@ future interface in the base design. Authoritative contract amendments:
 [`gds-design/06-design-amendments.md`](gds-design/06-design-amendments.md),
 especially AM-1, AM-9, AM-11, AM-13 and AM-15.
 
+The async engine and the opt-in fused stream lanes (`fused_reads`,
+[cufile-fused-lanes.md](cufile-fused-lanes.md)) are mutually exclusive: enabling fused reads
+requires `async_engine.mode = legacy`.
+
 ## Architecture
 
 ```mermaid

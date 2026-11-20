@@ -201,7 +201,7 @@ Rules:
 
 ```cpp
 struct fused_plan_options {
-  std::size_t window_bytes;    // lane slot size, a multiple of IO_BLOCK_SIZE
+  std::size_t window_bytes{0}; // lane slot size, a non-zero multiple of IO_BLOCK_SIZE
   std::size_t gap_bytes{0};
   bool fuse{true};
   std::size_t min_read_bytes{0};  // aligned windows smaller than this stay ordinary slices
@@ -209,14 +209,16 @@ struct fused_plan_options {
 struct fused_plan_stats {
   std::size_t reads{0};         // lane reads produced
   std::size_t parts{0};         // caller pieces they serve
-  std::size_t split_slices{0};  // input slices cut across reads
+  std::size_t split_slices{0};  // input slices emitted as more than one piece (tails included)
   std::size_t tail_slices{0};   // sub-block EOF tails peeled off
   std::size_t payload_bytes{0}; // bytes the caller asked for, in lane reads
   std::size_t issued_bytes{0};  // bytes the lane reads cover (aligned windows)
+  bool operator==(fused_plan_stats const&) const = default;
 };
 
 /// Rewrite the lane-eligible device slices of one request, in place, as lane reads.
-/// Strong guarantee: on an exception `slices` is unchanged.
+/// Strong guarantee: on an exception `slices` is unchanged.  Throws std::invalid_argument
+/// for a zero or unaligned window_bytes, or gap_bytes >= window_bytes.
 fused_plan_stats plan_fused_reads(std::vector<prepared_io_slice>& slices,
                                   std::size_t file_size,
                                   fused_plan_options const& options);
@@ -269,6 +271,22 @@ slices instead. Post-conditions, which `is_lane_read` checks and the reactor rel
 - parts are sorted, non-overlapping and inside `rng`;
 - the sum of emitted payload equals the eligible input payload clamped to the file.
 
+As implemented:
+
+- Emit order: every slice that is not eligible first, in its original relative order, then
+  the planned slices group by group (groups ordered by their key), in file order inside a
+  group. When nothing is eligible `slices` is not touched.
+- The open window is closed before an EOF tail is emitted, so output stays in file order. A
+  tail that covers a whole input slice is that slice moved as is. A window of exactly one whole
+  input slice is moved as is too (every field kept). Built slices carry only `rng`,
+  `d_buffer` (copied from the first part's input slice), `priority` and `kind = read`.
+- A window below `min_read_bytes` emits whole inputs as is and split pieces as plain slices.
+- The stats count lane reads only: tails and the parts of windows below `min_read_bytes` do
+  not count in `reads`, `parts`, `payload_bytes` and `issued_bytes`.
+- `is_lane_read` additionally requires `rng` to lie inside `[0, body_end)` (no saturated
+  ends) and every fused part to be non-empty with a destination. It does not check
+  `ready_gate_set` or `gds_threshold`; the reactor checks the threshold.
+
 The legacy split (`staging_piece_bytes`) and fuse (`fuse_gap_bytes`, parts of at most half a
 piece) are not applied when fused lanes are on: this planner replaces both.
 
@@ -298,24 +316,27 @@ struct lane_result {
   ssize_t io_result{};               // last bytes_done (negative: cuFile error)
   cudaError_t cuda_status{cudaSuccess};
   unsigned resubmits{};
+  unsigned lane{};                   // the lane that served it (diagnostics, tests)
 };
 
 struct lane_set_options {
   int device{};
-  std::size_t lanes{};               // wanted; 1..64
-  std::size_t slot_bytes{};
-  std::size_t staging_cap_bytes{};   // staging_pool cap for this device
-  std::size_t max_device_lanes{};    // process-wide budget
+  std::size_t lanes{};               // wanted; at most 64
+  std::size_t slot_bytes{};          // a multiple of 4 KiB
+  std::size_t staging_cap_bytes{};   // staging_pool cap for this device (0 = none)
+  std::size_t max_device_lanes{};    // process-wide budget: lanes are granted only while the
+                                     // device's lanes in use are below this set's own value
   bool register_streams{true};
   lane_completion completion{lane_completion::callback};
   unsigned max_resubmits{8};
-  void (*wake)(void*) noexcept {};   // called from the completion callback
+  void (*wake)(void*) noexcept {};   // called from the completion callback, and when a
+                                     // read fails at submission
   void* wake_context{};
 };
 
 class fused_lane_set {
  public:
-  explicit fused_lane_set(lane_set_options const& options);   // never throws; capacity() may be 0
+  explicit fused_lane_set(lane_set_options const& options) noexcept;  // capacity() may be 0
   ~fused_lane_set();                                          // requires in_flight() == 0
 
   [[nodiscard]] std::size_t capacity() const noexcept;
@@ -323,10 +344,13 @@ class fused_lane_set {
   [[nodiscard]] std::size_t free_lanes() const noexcept;
   [[nodiscard]] std::size_t gated() const noexcept;           // in flight with a gate
   [[nodiscard]] std::size_t slot_bytes() const noexcept;
+  [[nodiscard]] int device() const noexcept;
+  [[nodiscard]] std::size_t registered_streams() const noexcept;  // diagnostics
 
-  /// Issue `read` on a free lane. False when none is free (`read` untouched). An enqueue
-  /// failure is reported by a later reap(), after the lane is known idle.
-  [[nodiscard]] bool submit(lane_read&& read);
+  /// Issue `read` on a free lane. False when none is free (`read` untouched). A refused
+  /// read, an enqueue failure or a malformed read (unaligned, larger than the slot, copies
+  /// outside the window) is reported by a later reap(), after the lane is known idle.
+  [[nodiscard]] bool submit(lane_read&& read) noexcept;
 
   /// Report every lane that finished since the last call; never blocks. `done(result)`.
   template <typename Done> std::size_t reap(Done&& done);
@@ -538,10 +562,20 @@ Counters: `batch_reads`, `batch_bytes`, `batch_failures`.
 ## 9. Pool plan and ioctx
 
 - `device_group_plan` gains `lane_reactors`, `lanes_per_reactor`, `lane_slots`;
-  `pool_plan` gains `host_batch_reactors`. With `fused_reads.enabled` the automatic
-  synchronous reactor count per GPU is `local_reactors_per_device` (8) unless
+  `pool_plan` gains `host_batch_reactors` and `lane_slot_bytes`; `total_reactors()` of a
+  grouped plan counts lane, synchronous and batch reactors. With `fused_reads.enabled` the
+  automatic synchronous reactor count per GPU is `local_reactors_per_device` (8) unless
   `reactors_per_device` is set: lanes carry the device reads, the synchronous reactors serve
   writes and fallbacks.
+- Registered memory (§4): `lane_slots = min(wanted, hard / (slot_bytes + 64 KiB))`, where
+  `hard` is the smaller of half the free BAR1 and cuFile's pinned limit less its bounce cache
+  (no limit when neither is known) and `wanted = min(reactors x lanes, max_lanes_per_device)`.
+  The synchronous staging budget is `max_staging_bytes_per_device`, further limited by
+  `hard` less the lane bytes. `staging_cap_bytes` = that budget + the lane bytes, at most
+  `hard` (0 when there is neither a configured cap nor a hardware limit).
+  `fused_lane_staging_bytes(cfg)` is the lane share a flat pool adds to its cap.
+- An enabled block that fails `validate()` is reported as a plan warning and planned as
+  disabled; with both blocks off the plan is unchanged.
 - `cufile_ioctx` builds reactors in the order lane, synchronous (per GPU), then batch, records
   the ranges, reserves lane slots at `start()` and routes as in §3.1.
 - `prepare_device_slices` resolves GPUs and gates as today, then calls `plan_fused_reads`
@@ -556,6 +590,7 @@ mode on a host without GDS; the GDS host re-runs them on GPFS.
 | File | Tag | Covers |
 |---|---|---|
 | `test_fused_read_plan.cpp` | `[fused_plan]` | packing, gaps, splits, EOF tail, groups by stream/gate, pass-through, min size, invariants on random inputs, exception safety |
+| `test_fused_pool_plan.cpp` | `[fused_plan][placement]` | `validate()` of both blocks, lane and batch reactors in the plan, the lane budget on top of the staging cap, hardware limits cutting lanes, warnings, legacy plan unchanged when off, `describe` |
 | `test_fused_lanes.cpp` | `[fused_lanes]` | lane set against libcufile: content, concurrency up to capacity, round-robin, gate ordering, short-read resubmission and failures through a scripted `cufile_api`, callback failure, budget, drain |
 | `test_host_batch.cpp` | `[host_batch]` | batch reader against libcufile: content at distinct bases, capacity, scripted failures (rejected submit, failed and short entries, `GetStatus` error), drain |
 | `test_fused_ioctx.cpp` | `[fused_ioctx]` | end to end through `cufile_ioctx`: random vectored device reads content-checked against the file, EOF, busy caller stream, cancellation and shutdown with reads in flight, fallback after injected failures, cooldown, host batch reads on every alignment, routing by role, statistics, legacy behaviour unchanged when off |

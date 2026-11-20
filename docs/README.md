@@ -11,6 +11,8 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 | [Data Management](data-management.md) | Data batch lifecycle, repositories, and representation conversion |
 | [Topology & Configuration](topology-and-configuration.md) | Hardware discovery, NUMA awareness, and system configuration |
 | [cuFile / GPUDirect Storage backend](io/cufile-gds.md) | GDS read paths, per-GPU pool planning, registered staging, Storage Scale checklist |
+| [cuFile fused stream lanes and host batch reads](io/cufile-fused-lanes.md) | Opt-in: fused `cuFileReadAsync` device reads on stream lanes, cuFile-batch host reads; configuration, memory, observability |
+| [Fused lane reads: design](io/gds-design/10-fused-lane-reads.md) | Design of the fused-lane planner, lane set, host batch reader, reactor integration and pool plan |
 | [REST transport](io/rest-transport.md) | The io_uring S3 / REST read reactor |
 | [Development Guide](development-guide.md) | Building, testing, benchmarking, and contributing |
 | [Data Batch State Transitions](data_batch_state_transitions.md) | State machine reference for `data_batch` |
