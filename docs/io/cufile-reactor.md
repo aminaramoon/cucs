@@ -396,7 +396,7 @@ syntactic and does not qualify hardware.
 | `gds_threshold` | 256 KiB | minimum legacy device cuFile transfer |
 | `use_odirect` | true | allow direct fd / file registration |
 | `compat_mode` | unset (`automatic`) | automatic, on (POSIX), off (require registration) |
-| `poll_interval_us` | 200 | idle fallback-copy poll delay |
+| `poll_interval_us` | 50 | completion poll delay while copies or polled lanes are in flight |
 | `low_service_interval` | 4 | legacy high starts before one low turn; 0 strict priority |
 | `async_engine` | defaults below | independent opt-in engine configuration |
 
