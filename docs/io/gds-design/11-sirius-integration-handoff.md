@@ -179,24 +179,25 @@ scan_manager:
 
 Measured on that host on 2026-11-20 with `gds_chunk_read --mode cc|cc-host`
 (`tpch_scan_bench`, branch `gds-chunk-read`): 20 files x 1000 MiB per pass, chunks cycling
-1/2/5 MiB read as one vectored call per 15 chunks, GPU 0, medians over the steady passes,
-content verified against `pread`, NIC bytes 1.02x payload on the two GPU-local NICs:
+1/2/5 MiB read as one vectored call per 15 chunks, GPU 0, median of 5 passes after a warmup,
+NIC bytes 1.02x payload on the two GPU-local NICs. Final build, 12:05-12:15 UTC:
 
 | Path | Payload |
 |---|---|
-| raw `cuFileReadAsync` reference (4 threads x 32 streams, fused 8 MiB) | 79.0 GiB/s that hour (79.5-88 over two days) |
-| **fused lanes, defaults (8 x 16, poll)** | **84.3 GiB/s** |
-| fused lanes, 4 x 32, poll | 79.7 GiB/s |
-| fused lanes, 4 x 32, callback completion | 65.1 GiB/s |
-| fused lanes, 256K/512K/1M chunks (12.5 pieces per read) | 77.7 GiB/s |
-| synchronous pool (fused reads off, 32 reactors, one read per chunk) | 77.5 GiB/s |
-| host batch, 2 reactors x 64 (`per_reader` / `exclusive`) | 34.6-37.9 / 37.5-38.0 GiB/s |
+| **fused lanes, defaults (8 x 16, poll)** | **86.6 GiB/s** (NIC ~98 GB/s, line rate; content verified) |
+| raw `cuFileReadAsync` reference (4 threads x 32 streams, fused 8 MiB), 4 min later | 84.4 GiB/s |
+| host batch, defaults (2 reactors x 64, `per_reader`) / `exclusive` | 38.9 / 38.5 GiB/s |
 | host reads, synchronous pool (32 reactors) | 41.2-41.5 GiB/s |
 
-What they mean for Sirius: on 1-5 MiB chunks the lanes match or beat the raw pattern with 8
-threads per GPU instead of 32, and they keep that rate when the chunks are small (a
-read-per-chunk pool cannot: its rate is reads/s x chunk size). Host batch reaches about 90%
-of 32 blocking threads with two reactors.
+Earlier that day (previous builds, raw reference 79.0 GiB/s): lanes 4 x 32 poll 79.7, 4 x 32
+callback 65.1, small chunks (256K/512K/1M, 12.5 pieces per read) 77.7, synchronous pool with
+fused reads off 77.5. The raw reference ranged 79.0-88.3 GiB/s over two days, so compare rows
+of the same hour; full tables in [`../cufile-fused-lanes.md`](../cufile-fused-lanes.md#measured-results).
+
+What they mean for Sirius: the lanes reach the NICs' line rate with 8 threads per GPU instead
+of 32, and keep their rate when the chunks are small (a read-per-chunk pool cannot: its rate
+is reads/s x chunk size). Host batch reaches about 94% of 32 blocking threads with two
+reactors.
 
 Operational rules learned on that host:
 - Keep at most 128 device reads in flight per GPU (`max_lanes_per_device`): a deeper run of

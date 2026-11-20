@@ -25,12 +25,15 @@ What the measurements say:
    **A stream carries one read at a time**, and a thread must rotate over many streams.
 3. A few submitting threads (4) feeding many streams (32 each) beat one thread per read.
    The raw shape used 4 x 32 because its threads block inside cuFile. A non-blocking reactor
-   wants more submitters: on a real GDS path `cuFileReadAsync` costs its caller about 0.28 ms
-   per call (it submits to the kernel there; about 0.03 ms in compatibility mode), so a reactor
-   feeding 32 lanes is busy submitting about 65% of the time and its lanes queue behind it.
-   Measured with the final build on the same host, in one hour: 8 lane reactors x 16 lanes,
-   polled, 84.3 GiB/s (mean lane cycle 9.3 ms); 4 x 32 polled 79.7 (9.8 ms); 4 x 32 with
-   callbacks 65.1 (15.1 ms); the raw reference 79.0. The defaults are therefore 8 x 16.
+   wants more submitters: on a real GDS path `cuFileReadAsync` costs its caller a fraction of
+   a millisecond per call (it submits to the kernel there: 0.28 ms per call measured at
+   4 x 32, 0.62 ms at 8 x 16; about 0.03 ms in compatibility mode), so a reactor feeding 32
+   lanes is busy submitting about 65% of the time and its lanes queue behind it. Configuration
+   comparison on the same host in one hour (2026-11-20, 11:30-11:50 UTC, raw reference 79.0
+   GiB/s): 8 lane reactors x 16 lanes, polled, 84.3 GiB/s; 4 x 32 polled 79.7 (mean lane
+   cycle 9.8 ms); 4 x 32 with callbacks 65.1 (15.1 ms). The defaults are therefore 8 x 16. The
+   final build with them measured 86.6 GiB/s (mean lane cycle 8.5 ms, lane reactors about 69%
+   busy) against 84.4 for the raw reference minutes later.
 4. Registered 8 MiB slots, registered streams (`cuFileStreamRegister` flags 15) and fully
    4 KiB-aligned inputs keep every read on the GDS fast path.
 5. The benchmark's bookkeeping was naive: a mutex and condition variable per worker, a
@@ -570,8 +573,9 @@ class host_batch_reader {
 - Measured (1 GiB file, 1 MiB entries, compatibility mode, local NVMe): 7.0-7.2 GB/s at depth
   32-128 against 3.0-3.2 GB/s for a single-threaded `O_DIRECT` `pread`; `Submit` takes about
   3 ms per wave (it does much of the I/O synchronously), on the helper thread. GDS host (GB200,
-  GPFS, pinned NUMA-local memory): 38.0 GiB/s (`exclusive`, 2 x 64), 37.9 (`per_reader`,
-  2 x 64), 37.1 (`per_reader`, 4 x 32), against 41.2 for 32 synchronous reactors.
+  GPFS, pinned NUMA-local memory, final build): 38.9 GiB/s (`per_reader`, 2 x 64, the
+  default), 38.5 (`exclusive`, 2 x 64), 38.0 (`per_reader`, 4 x 32), against 41.2-41.5 for 32
+  synchronous reactors.
 
 ## 8. Reactor integration (`cufile_reactor`)
 
@@ -766,5 +770,6 @@ mode on a host without GDS; the GDS host re-runs them on GPFS.
 
 `tpch_scan_bench` `gds_chunk_read` gains modes that drive `cufile_ioctx` with fused lanes and
 host batch over the same files, chunk mix and NIC sampler as the raw modes, so the numbers are
-comparable line by line with the 88.3 GiB/s raw result. Rules of that host apply: one run at a
+comparable line by line with the raw result (79.0-88.3 GiB/s over two days, so compare rows
+measured in the same hour; results in [`../cufile-fused-lanes.md`](../cufile-fused-lanes.md#measured-results)). Rules of that host apply: one run at a
 time, at most 128 reads in flight, fresh files, watch `mmfs.log.latest`.

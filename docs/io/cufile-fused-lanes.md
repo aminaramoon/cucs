@@ -74,10 +74,10 @@ Four lessons shaped the feature:
    many lanes.
 3. **A few threads, many streams.** Four submitting threads feeding 32 streams each beat one
    thread per read. The raw benchmark's threads block inside cuFile, so 4 were enough there. A
-   lane reactor never blocks, but on a real GDS path each `cuFileReadAsync` costs it about
-   0.28 ms of CPU, because the call submits to the kernel there (about 0.03 ms in compatibility
-   mode). A reactor feeding 32 lanes is then busy submitting about 65% of the time, and its lanes
-   queue behind it. The default therefore spreads the same 128 lanes over more submitters:
+   lane reactor never blocks, but on a real GDS path each `cuFileReadAsync` costs it a fraction
+   of a millisecond (0.28–0.62 ms measured), because the call submits to the kernel there (about
+   0.03 ms in compatibility mode). A reactor feeding 32 lanes is then busy submitting about 65%
+   of the time, and its lanes queue behind it. The default therefore spreads the same 128 lanes over more submitters:
    8 lane reactors x 16 lanes (see [measured results](#measured-results)).
 4. **Registered and aligned.** Registered slots, registered streams and fully 4 KiB-aligned
    inputs keep every read on the GDS fast path.
@@ -364,7 +364,7 @@ invalid enabled block as a warning and plans without it.
 | Field | Default | Valid | Meaning |
 |-------|---------|-------|---------|
 | `enabled` | false | | Serve eligible device reads on lanes |
-| `reactors_per_device` | 8 | 1–64 | Lane reactors per GPU in a planned pool. More reactors with fewer lanes each spread the per-call submission cost of `cuFileReadAsync` (about 0.28 ms on GDS) |
+| `reactors_per_device` | 8 | 1–64 | Lane reactors per GPU in a planned pool. More reactors with fewer lanes each spread the per-call submission cost of `cuFileReadAsync` (0.28–0.62 ms on GDS) |
 | `lanes_per_reactor` | 16 | 1–64 | Lanes a lane reactor owns per GPU; reads in flight per GPU = reactors x lanes = 128 by default |
 | `max_lanes_per_device` | 128 | ≥ 1 | Process-wide ceiling on lanes per GPU (see [memory](#memory-and-limits)) |
 | `slot_bytes` | 8 MiB | multiple of 64 KiB, 64 KiB–1 GiB | A lane's registered slot: the largest single read |
@@ -397,8 +397,8 @@ invalid enabled block as a warning and plans without it.
 
 | Policy | Shape | libcufile 1.17.1, compatibility mode |
 |--------|-------|--------------------------------------|
-| `per_reader` (default) | whole waves per reader; waves of different readers overlap (the raw GDS-host benchmark's shape) | 0 of 5 crashed; GB200 + GPFS: 37.9 GiB/s with 2 x 64 |
-| `exclusive` | whole waves; one wave in flight process-wide (a gate released, and its waiters woken, when the wave completed) | 0 of 5 crash-probe runs crashed; GB200 + GPFS: 38.0 GiB/s with 2 x 64 |
+| `per_reader` (default) | whole waves per reader; waves of different readers overlap (the raw GDS-host benchmark's shape) | 0 of 5 crashed; GB200 + GPFS: 38.9 GiB/s with 2 x 64 (waves 34 of 64 full on average) |
+| `exclusive` | whole waves; one wave in flight process-wide (a gate released, and its waiters woken, when the wave completed) | 0 of 5 crash-probe runs crashed; GB200 + GPFS: 38.5 GiB/s with 2 x 64 (waves 63 of 64 full) |
 | `continuous` | refill while entries are pending, reap as they complete (`min_nr` 1) | 5 of 5 crashed |
 
 Qualify `continuous` (and any policy on a new stack) first with the hidden test
@@ -437,8 +437,8 @@ Starting values:
 
 - **IBM Storage Scale over RDMA (the measured case):** the defaults: 8 lane reactors x 16 lanes
   (128 in flight), 8 MiB slots, `fuse_gap_bytes` 0, `max_lanes_per_device` 128,
-  `register_streams` on, `poll` completion. Measured in one hour on a GB200 GPU: 8 x 16 polled
-  84.3 GiB/s, 4 x 32 polled 79.7, 4 x 32 with callbacks 65.1, the raw cuFile reference 79.0 (see
+  `register_streams` on, `poll` completion. On a GB200 GPU these defaults measured 86.6 GiB/s,
+  the line rate of its two NICs, against 84.4 for the raw cuFile reference minutes later (see
   [measured results](#measured-results)). Raise `fuse_gap_bytes` only where reading and dropping
   the gap costs less than a read's fixed latency (about 4 ms at load).
 - **Local NVMe:** not measured. A read there costs about 0.1 ms, so far fewer lanes should
@@ -559,26 +559,41 @@ Operational findings from the GB200 + GPFS runs:
 
 ### Measured results
 
-GB200 GPU 0, GPFS over RoCE (two 400 Gb/s NICs per GPU), 20 files x 1000 MiB per pass,
-chunks cycling 1/2/5 MiB, 8 MiB slots, medians over 5 passes, all device runs in the same hour on
-the final build unless noted.
+GB200 GPU 0, GPFS over RoCE (two 400 Gb/s NICs per GPU), `gds_chunk_read --mode cc|cc-host`:
+20 files x 1000 MiB per pass, chunks cycling 1/2/5 MiB, one vectored read per 15 chunks,
+8 MiB slots, median of 5 passes after 1 warmup, at least 4 minutes between processes, NIC bytes
+1.02x the payload. The raw reference itself ranged from 79.0 to 88.3 GiB/s over two days, so
+compare only rows measured in the same hour.
 
-| Run | Median payload | Peak NIC | Notes |
-|-----|----------------|----------|-------|
-| raw cuFile reference (`--mode async --fuse`, 4 threads x 32 streams) | 79.0 GiB/s | | 79.5–85.7 GiB/s over the day; 88.3 on 2026-11-20 |
-| lanes 8 x 16, `poll` (the default) | **84.3 GiB/s** | ~95 GB/s | mean lane cycle 9.3 ms |
-| lanes 4 x 32, `poll` | 79.7 GiB/s | | mean lane cycle 9.8 ms |
-| lanes 4 x 32, `callback` | 65.1 GiB/s | | mean lane cycle 15.1 ms |
-| lanes, small chunks 256K/512K/1M fused (12.5 pieces per read) | 71.3 GiB/s | | 4 x 32 `poll`, previous build |
-| legacy synchronous pool: 32 reactors, one read per chunk (7,500 reads / pass) | 77.5 GiB/s | | |
-| host batch 2 x 64, `per_reader` / `exclusive` | 37.9 / 38.0 GiB/s | | previous build, before the wave cap change |
-| host, synchronous: 32 reactors | 41.2 GiB/s | | previous build, before the wave cap change |
+**Final build** (2026-11-20, 12:05–12:15 UTC):
+
+| Run | Median payload | Notes |
+|-----|----------------|-------|
+| fused lanes, defaults (8 x 16, `poll`) | **86.6 GiB/s** (passes 85.1–87.0) | NIC peak ~98 GB/s (the two NICs' line rate); mean lane cycle 8.5 ms; `cuFileReadAsync` 0.62 ms per call; lane reactors ~69% busy. With `--verify`: 84.6 GiB/s, 128 task buffers, 0 mismatches |
+| raw cuFile reference (4 threads x 32 streams, fused 8 MiB), 4 minutes later | 84.4 GiB/s (83.3–85.8) | NIC peak ~97 GB/s |
+| host batch, defaults (2 x 64, `per_reader`, 1 GiB wave cap) | 38.9 GiB/s | content verified; waves 34 of 64 full on average |
+| host batch, `exclusive`, 2 x 64 | 38.5 GiB/s | waves 63 of 64 full |
+| host batch, `per_reader`, 4 x 32 | 38.0 GiB/s | |
+| host reads, synchronous pool (32 reactors) | 41.2–41.5 GiB/s | |
+
+**Configuration comparison** (previous builds, 11:30–11:50 UTC, when the raw reference measured
+79.0 GiB/s):
+
+| Run | Median payload | Notes |
+|-----|----------------|-------|
+| fused lanes 8 x 16, `poll` | 84.3 GiB/s | |
+| fused lanes 4 x 32, `poll` | 79.7 GiB/s | mean lane cycle 9.8 ms; `cuFileReadAsync` 0.28 ms per call |
+| fused lanes 4 x 32, `callback` | 65.1 GiB/s | mean lane cycle 15.1 ms |
+| fused lanes 4 x 32, `poll`, small chunks 256K/512K/1M, 48 per task | 77.7 GiB/s | 33,600 slices -> 2,800 reads, 12.5 pieces per read |
+| synchronous pool, fused reads off (32 reactors, one read per chunk, 7,500 reads / pass) | 77.5 GiB/s | |
 
 The lane timing counters explain the device rows. On the GDS path `cuFileReadAsync` costs its
-caller about 0.28 ms per read (`lane_read_async_ns / lane_reads`), so a reactor feeding 32 lanes
-spends about 65% of its time submitting and its lanes wait for it. Eight reactors of 16 lanes
-share that cost (mean lane cycle = `lane_flight_ns` / reads). In compatibility mode the same call
-costs about 0.03 ms, so the choice matters little there.
+caller a fraction of a millisecond per read (`lane_read_async_ns / lane_reads`), so a reactor
+feeding 32 lanes spends about 65% of its time submitting and its lanes wait for it. Eight
+reactors of 16 lanes share that cost (mean lane cycle = `lane_flight_ns` / reads). Callback
+completion lengthens every lane cycle. In compatibility mode the call costs about 0.03 ms, so the
+split matters little there. Small chunks keep the lane rate because fusion still makes 8 MiB
+reads of them; a pool with one read per chunk runs at reads/s x chunk size.
 
 ## Known limitations
 
