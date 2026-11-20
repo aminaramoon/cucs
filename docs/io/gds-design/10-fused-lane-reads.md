@@ -470,6 +470,20 @@ class host_batch_reader {
   good; the reactor then uses the synchronous path.
 - `drain` polls with a bounded timeout until every outstanding entry reported, then destroys
   the handle. It never abandons a destination cuFile may still write.
+- **Submit policy.** libcufile 1.17.1 in compatibility mode corrupts its batch state when a
+  `Submit` runs while batch entries are in flight, on the same handle or on another handle of
+  the process, and later crashes inside `GetStatus` (SIGSEGV; 30-85% of 3000-read runs at 32-64
+  entries in flight, also with one entry per submit; never with whole waves). The reader
+  therefore defaults to `batch_submit_policy::exclusive`: a process-wide gate lets one reader at
+  a time submit one wave, and only while nothing is in flight; entries staged meanwhile stay
+  staged (`flush` defers) and `reap` submits them when the gate frees. `continuous` (the API's
+  documented semantics) is opt-in, for a libcufile verified with the hidden
+  `[host_batch_quirk]` test.
+- A rejected submit's entries are reported only once the handle that rejected them has been
+  cancelled and destroyed (after the entries still in flight on it completed), so cuFile can no
+  longer write those destinations when the owner sees the failure.
+- In compatibility mode `Submit` does much of the I/O synchronously: about 3 ms per wave of
+  8-64 entries of 1 MiB, 35-90% of the reader's wall time. The worker blocks there.
 
 ## 8. Reactor integration (`cufile_reactor`)
 
