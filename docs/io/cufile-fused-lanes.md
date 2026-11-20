@@ -113,8 +113,8 @@ A request with lane reads for GPU `g` goes to `g`'s lane reactors (see
 The reactor puts it on a free lane, round-robin over the free lanes so slots and NICs are used
 evenly. The lane issues the sequence in the diagram above. Lane reactors issue reads and copies
 and return. They never wait for a read. A reactor learns of completions by polling the lanes'
-events every `poll_interval_us` while lanes are in flight (the default; a lane whose read is
-younger than half the recent mean read time is not queried yet), or, with
+events every `poll_interval_us` while lanes are in flight (the default; every busy lane on every
+poll), or, with
 `completion = callback`, from a stream callback that wakes it. It reaps every finished lane in
 one pass and refills free lanes from its queue. When no lane is free,
 requests wait in the reactor's queue, where priorities still apply.
@@ -137,13 +137,14 @@ unrelated GPU work). The read runs in two phases instead:
 | Caller's gate (event recorded at submission) | What the lane does |
 |---------------------------------------------|--------------------|
 | none, already passed, or re-dispatched after parking | read + copies + completion |
-| pending, and fewer than `max_gated_lanes` lanes of this reactor's set hold data for a gate | read + completion only (the I/O starts now); when it is done the lane keeps the data, and the reactor queues the copies once it sees the gate fire (it polls held gates every pass) |
+| pending, and fewer than `max_gated_lanes` two-phase reads of this reactor's lane set for that GPU are taken (reading, waiting for a lane, or holding data) | read + completion only (the I/O starts now); when it is done the lane keeps the data, and the reactor queues the copies once it sees the gate fire (it polls held gates every pass) |
 | pending otherwise | park the slice until the gate fires (holds no lane), then submit |
 
-The `max_gated_lanes` cap keeps a stalled caller from taking every lane; a read counts against
-it only while its data is actually held. Reads submitted that way that all finish before their
-gates fire can briefly exceed it; a lane read that then finds every lane held is served
-synchronously. Shutdown and a cancelled request release held data at once, without waiting for
+The `max_gated_lanes` cap keeps a stalled caller from taking every lane: a two-phase read counts
+against it from the moment it takes a lane (or the backlog) until its copies are queued or it is
+released, so at most that many lanes ever wait for callers' streams and reads on idle streams
+keep flowing. The copies of such a read wait on the host (the lane holds the data, the gate is
+polled), never on the GPU. Shutdown and a cancelled request release held data at once, without waiting for
 the caller's stream; a lane read that fails before its gate fired is re-served synchronously
 once the gate fires (parked, not waited for).
 
@@ -366,7 +367,7 @@ invalid enabled block as a warning and plans without it.
 | `fuse_gap_bytes` | 0 | < `slot_bytes` | Largest gap bridged inside one read (read and dropped); 0 = contiguous only |
 | `register_streams` | true | | `cuFileStreamRegister` lane streams (fixed offsets and size, page-aligned inputs) |
 | `completion` | `poll` | `poll`, `callback` | `poll`: the reactor queries the busy lanes' events every `poll_interval_us` while lanes are in flight; at parity with the raw benchmark on GB200 + GPFS, costs some CPU per lane reactor. `callback`: a stream callback wakes the reactor; less CPU, about 5% slower on that stack (CUDA's host-callback delivery), and every lane completion stalls while anything blocks CUDA's host-callback thread |
-| `max_gated_lanes` | 0 | ≤ `lanes_per_reactor` | Lanes per reactor whose copies may wait on a caller's stream; 0 = half the lanes (at least 1) |
+| `max_gated_lanes` | 0 | ≤ `lanes_per_reactor` | Per lane set (one per reactor and GPU): two-phase reads, whose copies wait (on the host) for a caller's stream, it may hold at once; 0 = half the lanes (at least 1) |
 | `max_resubmits` | 8 | any | Short-read continuations of one read before it falls back |
 | `failure_limit` | 8 | ≥ 1 | Consecutive failed lane reads before the cooldown |
 | `cooldown_s` | 30 | any | Seconds a reactor leaves its lanes unused after tripping |

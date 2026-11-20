@@ -151,7 +151,7 @@ struct fused_read_config {
   std::size_t fuse_gap_bytes{0};        // gap bridged inside one read (read and dropped)
   bool register_streams{true};          // cuFileStreamRegister(FIXED_* | PAGE_ALIGNED_INPUTS)
   lane_completion completion{lane_completion::poll};  // or ::callback (see §6)
-  std::size_t max_gated_lanes{0};       // lanes that may wait on a caller stream; 0 = half
+  std::size_t max_gated_lanes{0};       // per lane set: two-phase reads at once; 0 = half
   unsigned max_resubmits{8};            // short-read continuations per read
   unsigned failure_limit{8};            // consecutive failed reads before the cooldown
   unsigned cooldown_s{30};              // lanes unused for this long after tripping
@@ -419,9 +419,9 @@ hang.
 
 `lane_completion::poll` is the default (measured at raw parity on GB200 + GPFS, where callback
 completion was about 5% slower): the last step records the lane's event instead, `reap` queries
-the events of the busy lanes -- skipping a lane whose read was issued less than half the
-recent mean read time ago (an EWMA per set; unknown mean or copies only: always queried) --
-and the reactor polls at `poll_interval_us` while lanes are in flight. Callback mode costs less
+the events of every busy lane, and the reactor polls at `poll_interval_us` while lanes are in
+flight.  (Skipping young lanes was tried and removed: the observed read time then feeds back
+into the skip window, so a storage stall delays the following reads too.) Callback mode costs less
 CPU but depends on CUDA's single host-callback thread: anything blocking it stalls every lane
 completion.
 
@@ -618,14 +618,15 @@ Gate handling (the copies write the caller's memory, the read does not) -- **two
 | Gate | Action |
 |---|---|
 | ready, or re-dispatched after parking | submit with its copies |
-| pending, and the set's `held() < gated_lane_limit()` | submit with `hold`: the read starts now (I/O overlaps the caller's compute); on the `held` result the worker queries the gate: fired → `copy_out`, pending → the op joins the reactor's held list, polled every pass (one query per distinct gate; the wait timeout is `poll_interval_us` while the list is non-empty) and copied out when its gate fires |
+| pending, and fewer than `gated_lane_limit()` two-phase reads taken on that lane set | submit with `hold`: the read starts now (I/O overlaps the caller's compute); on the `held` result the worker queries the gate: fired → `copy_out`, pending → the op joins the reactor's held list, polled every pass (one query per distinct gate; the wait timeout is `poll_interval_us` while the list is non-empty) and copied out when its gate fires |
 | pending otherwise | `park_on_gate` (existing); re-dispatched when the gate fires |
 | unchecked (no submission-time gate) | `park_if_stream_busy` (existing), else submit |
 
-A pending gate counts against the limit only once its read is actually held (I/O done, gate
-still pending), so a merely busy caller stream no longer takes lanes from others.  Reads
-submitted with `hold` that all finish while their gates are still pending can overshoot the
-limit (at most the set's capacity); a lane read that then finds every lane held is served
+A two-phase read counts against the limit from the moment it takes a lane (or the backlog)
+until its copies are queued or it is released (a per-set count on the reactor), so at most
+`gated_lane_limit()` lanes of a set ever wait for callers' streams, whatever the burst; the
+rest park until their gates fire, and reads on idle streams keep the other lanes.  A lane read
+that finds every lane held (possible only when the limit equals the lanes) is served
 synchronously instead of waiting.  `lane_gated_reads` counts reads that were held.
 
 Completion (`reap` result) for the slice's `io_op_request`:
