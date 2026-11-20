@@ -150,7 +150,7 @@ struct fused_read_config {
   bool fuse{true};                      // false: split at the slot size only
   std::size_t fuse_gap_bytes{0};        // gap bridged inside one read (read and dropped)
   bool register_streams{true};          // cuFileStreamRegister(FIXED_* | PAGE_ALIGNED_INPUTS)
-  lane_completion completion{lane_completion::callback};  // or ::poll (see §6)
+  lane_completion completion{lane_completion::poll};  // or ::callback (see §6)
   std::size_t max_gated_lanes{0};       // lanes that may wait on a caller stream; 0 = half
   unsigned max_resubmits{8};            // short-read continuations per read
   unsigned failure_limit{8};            // consecutive failed reads before the cooldown
@@ -417,10 +417,13 @@ work only), gives it a fresh stream and reports `device_failed`.
 with the error, when the stream fails; a host function would never run and the lane would
 hang.
 
-`lane_completion::poll` is a field fallback for a stack where stream callbacks misbehave:
-step 5 records the lane's event instead, `reap` queries the events of the busy lanes, and
-the reactor polls at `poll_interval_us` while lanes are in flight. Same results, more CPU and
-up to one poll interval of refill latency.
+`lane_completion::poll` is the default (measured at raw parity on GB200 + GPFS, where callback
+completion was about 5% slower): the last step records the lane's event instead, `reap` queries
+the events of the busy lanes -- skipping a lane whose read was issued less than half the
+recent mean read time ago (an EWMA per set; unknown mean or copies only: always queried) --
+and the reactor polls at `poll_interval_us` while lanes are in flight. Callback mode costs less
+CPU but depends on CUDA's single host-callback thread: anything blocking it stalls every lane
+completion.
 
 `oldest_in_flight()` reports how long the oldest read has been in flight; the reactor logs a
 warning once per read that exceeds `stall_warn_s` (a hung storage client is otherwise

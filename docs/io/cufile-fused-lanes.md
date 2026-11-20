@@ -29,11 +29,14 @@ One lane, as it runs on the GPU:
    cudaMemcpyAsync(dst(part 0), B_i + rel0, n0, D2D)   one copy per run of parts contiguous in
    cudaMemcpyAsync(dst(part 1), B_i + rel1, n1, D2D)   the file and the destination; 5+ copies
    ...                                                  go out as one cudaMemcpyBatchAsync
-   cudaStreamAddCallback(done)   -> marks lane i finished, wakes the reactor
+   cudaEventRecord(done_i)       -> the reactor polls it (default completion `poll`); with
+                                    `completion = callback`: cudaStreamAddCallback, which marks
+                                    lane i finished and wakes the reactor
  a lane stream never waits on a caller's event: a read whose caller's stream is still busy
- runs in two phases (read + callback, then -- once the reactor sees the gate fire -- copies +
- callback), see "Ordering against the caller's stream"
- the next read into B_i is issued only after done fired, so a slot is never overwritten early
+ runs in two phases (read + completion, then -- once the reactor sees the gate fire -- copies +
+ completion), see "Ordering against the caller's stream"
+ the next read into B_i is issued only after the lane completed, so a slot is never overwritten
+ early
 ```
 
 ## Table of contents
@@ -109,13 +112,16 @@ A request with lane reads for GPU `g` goes to `g`'s lane reactors (see
 
 The reactor puts it on a free lane, round-robin over the free lanes so slots and NICs are used
 evenly. The lane issues the sequence in the diagram above. Lane reactors issue reads and copies
-and return. They never wait for a read. A reactor learns of completions from the stream callback,
-reaps every finished lane in one pass, and refills free lanes from its queue. When no lane is free,
+and return. They never wait for a read. A reactor learns of completions by polling the lanes'
+events every `poll_interval_us` while lanes are in flight (the default; a lane whose read is
+younger than half the recent mean read time is not queried yet), or, with
+`completion = callback`, from a stream callback that wakes it. It reaps every finished lane in
+one pass and refills free lanes from its queue. When no lane is free,
 requests wait in the reactor's queue, where priorities still apply.
 
 ### Completion: host-complete futures
 
-The callback fires after the read and every copy of the lane ran. A successful future therefore
+The lane's completion (event or callback) follows the read and every copy of the lane. A successful future therefore
 means the bytes are in the destination and visible from any stream. This is the same contract
 as the synchronous path. It differs from the async engine (`async_engine.mode = async_auto`, see
 [cufile-reactor.md](cufile-reactor.md)), whose futures resolve once the copies are enqueued and
@@ -322,6 +328,16 @@ Which knobs apply where:
   128 x 1 MiB asynchronous reads (`ShHashV.C`, `nvfs_ioctl -> gpfs_f_aio_read_internal`).
   The fused 8 MiB pattern at the same depth ran cleanly. Do not raise it on GPFS without
   qualifying the client.
+- **Lane streams live as long as the process. Build one cuFile ioctx per process.** A lane's
+  stream is registered with cuFile (`cuFileStreamRegister`) and is never deregistered: when its
+  ioctx shuts down the stream is retired -- kept, registered and idle -- until the process exits.
+  `cuFileStreamDeregister` synchronizes the whole device and stalls every other cuFile call of
+  the process while it waits (measured, libcufile 1.17), and a stream cannot be handed to another
+  reactor thread (a stream used by one thread fails `cuFileReadAsync` from another once the
+  first is gone). An application that builds and destroys cuFile ioctxs repeatedly therefore
+  accumulates one registered stream per lane per ioctx; past 1024 the process logs a warning
+  ("build one cuFile ioctx per process ..."). The slots are not affected: they go back to the
+  staging pool.
 - **Host batch depth** is clamped to cuFile's `max_batch_io_size` (`cufile.json`
   `properties.io_batchsize`; `platform_info::max_batch_io_size`). Host reads in flight =
   batch reactors x depth.
@@ -344,7 +360,7 @@ invalid enabled block as a warning and plans without it.
 | `fuse` | true | | Fuse neighbouring slices; false splits only (each slice costs at least one read) |
 | `fuse_gap_bytes` | 0 | < `slot_bytes` | Largest gap bridged inside one read (read and dropped); 0 = contiguous only |
 | `register_streams` | true | | `cuFileStreamRegister` lane streams (fixed offsets and size, page-aligned inputs) |
-| `completion` | `callback` | `callback`, `poll` | Stream callback, or polled events (a fallback for stacks where callbacks misbehave; more CPU, up to `poll_interval_us` more latency) |
+| `completion` | `poll` | `poll`, `callback` | `poll`: the reactor queries the busy lanes' events every `poll_interval_us` while lanes are in flight; at parity with the raw benchmark on GB200 + GPFS, costs some CPU per lane reactor. `callback`: a stream callback wakes the reactor; less CPU, about 5% slower on that stack (CUDA's host-callback delivery), and every lane completion stalls while anything blocks CUDA's host-callback thread |
 | `max_gated_lanes` | 0 | ≤ `lanes_per_reactor` | Lanes per reactor whose copies may wait on a caller's stream; 0 = half the lanes (at least 1) |
 | `max_resubmits` | 8 | any | Short-read continuations of one read before it falls back |
 | `failure_limit` | 8 | ≥ 1 | Consecutive failed lane reads before the cooldown |
@@ -408,8 +424,9 @@ Through the registry, set the same fields on `io_config::cufile`
 Starting values:
 
 - **IBM Storage Scale over RDMA (the measured case):** the defaults: 4 lane reactors x 32 lanes,
-  8 MiB slots, `fuse_gap_bytes` 0, `max_lanes_per_device` 128, `register_streams` on, `callback`
-  completion. Raise `fuse_gap_bytes` only where reading and dropping the gap costs less than a
+  8 MiB slots, `fuse_gap_bytes` 0, `max_lanes_per_device` 128, `register_streams` on, `poll`
+  completion (measured: poll 4x32 at 75–79 GiB/s and 8x16 up to 85–87 GiB/s against a raw
+  benchmark of 79.5–85.7 GiB/s in the same hour; callback about 5% lower). Raise `fuse_gap_bytes` only where reading and dropping the gap costs less than a
   read's fixed latency (about 4 ms at load).
 - **Local NVMe:** not measured. A read there costs about 0.1 ms, so far fewer lanes should
   suffice, and the synchronous pool may already saturate the drives. Start with 1–2 lane reactors
@@ -440,7 +457,7 @@ counters:
 | `lane_gated_reads` | lane reads that held their data for a pending caller gate |
 | `lane_submit_ns`, `lane_read_async_ns` | time in the lane issue path (`submit`/`copy_out`), and of it inside `cuFileReadAsync` |
 | `lane_flight_ns` | sum over finished lane reads of (reap - first submit): mean lane cycle = this / (`lane_reads` + `lane_failures`) |
-| `lane_notify_ns` | callback completion: sum of (reap - completion callback), the wake-up plus worker-busy latency |
+| `lane_notify_ns` | `callback` completion only (0 with `poll`): sum of (reap - completion callback), the wake-up plus worker-busy latency |
 | `lane_idle_ns` | of `lane_notify_ns`, the part during which lane work was waiting (a finished lane sat unused) |
 | `worker_wait_ns`, `worker_passes` | time the worker slept at its wait point, and its loop passes |
 | `batch_reads`, `batch_bytes` | host reads served by the batch path, and their payload (head and tail included); disjoint from `host_reads`/`host_bytes` |
