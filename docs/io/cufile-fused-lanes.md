@@ -249,7 +249,12 @@ libcufile quirks probed with 1.17.1 shaped these rules:
   event with a status other than `CUFILE_COMPLETE`/`FAILED`/`CANCELED` (cuFile may still own the
   destination), the reader is poisoned: `GetStatus` is never called on that handle again, the
   handle is never destroyed, the entries not reported stay in flight (never settled, never
-  freed), and an error is logged. `batch_partial_status` counts this; it should always be 0.
+  freed), and an error is logged; while shutdown waits it logs every 30 s "shutdown is blocked:
+  cuFile returned a partial batch status and may still write N destinations".
+  `batch_partial_status` counts this; it should always be 0. A signal cannot cause it: the
+  helper thread blocks every signal (an `io_getevents` interrupted by one makes compatibility-mode
+  `GetStatus` fail with `CU_FILE_IO_ERROR`, verified by injecting `EINTR`, which would otherwise
+  abort a healthy reader).
   Waves of different readers may overlap safely (measured with heap spraying).
 - **GetStatus errors.** The helper cancels and destroys the handle, and only after `Destroy`
   returned are the outstanding entries failed. This relies on `Cancel` + `Destroy` stopping
@@ -379,7 +384,7 @@ invalid enabled block as a warning and plans without it.
 | `poll_us` | 200 | 1–1,000,000 | Longest the worker sleeps with batch work outstanding without a wake-up from the helper (bounds a lost wake-up only; the worker never blocks in cuFile) |
 | `failure_limit` | 4 | ≥ 1 | Consecutive rejected submits after which a reactor stops batching for good |
 | `submit_policy` | `per_reader` | `exclusive`, `per_reader`, `continuous` | When a reader submits; see below |
-| `max_wave_bytes` | 256 MiB | 0 or a multiple of 4 KiB | Most bytes one wave carries (0 = no cap); keeps every wave far inside the one-hour wave timeout |
+| `max_wave_bytes` | 1 GiB | 0 or a multiple of 4 KiB | Most bytes one wave carries (0 = no cap); keeps every wave far inside the one-hour wave timeout. The default never cuts a default wave (64 x 8 MiB = 512 MiB) |
 
 `submit_policy` (`batch_submit_policy`):
 

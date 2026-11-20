@@ -168,7 +168,7 @@ struct host_batch_config {
   unsigned poll_us{200};                // bounds a lost helper wake-up (worker never blocks in cuFile)
   unsigned failure_limit{4};            // consecutive failed submits before batch is disabled
   batch_submit_policy submit_policy{batch_submit_policy::per_reader};  // per_reader | exclusive | continuous (§7)
-  std::size_t max_wave_bytes{256UL << 20};  // most bytes per wave; 0 = no cap (§7)
+  std::size_t max_wave_bytes{1UL << 30};    // most bytes per wave; 0 = no cap (§7)
   void validate() const;
 };
 
@@ -534,7 +534,11 @@ class host_batch_reader {
   completed entries are reported, the rest stay in flight for good (cuFile may still write their
   destinations: never settled, never freed), `GetStatus` is never called on the handle again,
   the handle is never destroyed, `available()` is false, an error is logged, and `drain` never
-  returns. `exclusive` adds a process-wide gate: one wave in flight in the process, released by
+  returns (it logs "shutdown is blocked: cuFile returned a partial batch status and may still
+  write N destinations" every 30 s). A signal cannot poison or abort a healthy reader: the
+  helper blocks all signals (`pthread_sigmask`); an `EINTR` from `io_getevents`, injected with
+  strace, makes compatibility-mode `GetStatus` return `CU_FILE_IO_ERROR`, never a short
+  success. `exclusive` adds a process-wide gate: one wave in flight in the process, released by
   the helper as soon as the wave completed (or the reader was poisoned) -- not by the owner, so
   a reactor busy with a long synchronous transfer never holds other readers back -- and the
   release wakes the readers waiting for it. `continuous` hands entries over at once and reaps
