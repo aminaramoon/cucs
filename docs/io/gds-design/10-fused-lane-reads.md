@@ -24,6 +24,13 @@ What the measurements say:
 2. `cuFileReadAsync` blocks the caller while its stream already has a cuFile read pending.
    **A stream carries one read at a time**, and a thread must rotate over many streams.
 3. A few submitting threads (4) feeding many streams (32 each) beat one thread per read.
+   The raw shape used 4 x 32 because its threads block inside cuFile. A non-blocking reactor
+   wants more submitters: on a real GDS path `cuFileReadAsync` costs its caller about 0.28 ms
+   per call (it submits to the kernel there; about 0.03 ms in compatibility mode), so a reactor
+   feeding 32 lanes is busy submitting about 65% of the time and its lanes queue behind it.
+   Measured with the final build on the same host, in one hour: 8 lane reactors x 16 lanes,
+   polled, 84.3 GiB/s (mean lane cycle 9.3 ms); 4 x 32 polled 79.7 (9.8 ms); 4 x 32 with
+   callbacks 65.1 (15.1 ms); the raw reference 79.0. The defaults are therefore 8 x 16.
 4. Registered 8 MiB slots, registered streams (`cuFileStreamRegister` flags 15) and fully
    4 KiB-aligned inputs keep every read on the GDS fast path.
 5. The benchmark's bookkeeping was naive: a mutex and condition variable per worker, a
@@ -143,8 +150,8 @@ Added to `cufile::config` (defaults shown):
 ```cpp
 struct fused_read_config {
   bool enabled{false};
-  std::size_t reactors_per_device{4};   // lane reactors per GPU (planned pools)
-  std::size_t lanes_per_reactor{32};    // 1..64; in flight per GPU = reactors x lanes
+  std::size_t reactors_per_device{8};   // lane reactors per GPU (planned pools); see §1 item 3
+  std::size_t lanes_per_reactor{16};    // 1..64; in flight per GPU = reactors x lanes = 128
   std::size_t max_lanes_per_device{128};// process-wide ceiling per GPU, all ioctxs together
   std::size_t slot_bytes{8UL << 20};    // registered slot = largest read; multiple of 64 KiB
   bool fuse{true};                      // false: split at the slot size only
@@ -153,6 +160,7 @@ struct fused_read_config {
   lane_completion completion{lane_completion::poll};  // or ::callback (see §6)
   std::size_t max_gated_lanes{0};       // per lane set: two-phase reads at once; 0 = half
   unsigned max_resubmits{8};            // short-read continuations per read
+  std::size_t max_parts_per_read{256};  // caller pieces per fused read; >= 1
   unsigned failure_limit{8};            // consecutive failed reads before the cooldown
   unsigned cooldown_s{30};              // lanes unused for this long after tripping
   unsigned stall_warn_s{30};            // warn once when a read is in flight this long; 0 = off
