@@ -26,11 +26,13 @@ One lane, as it runs on the GPU:
  lane i = registered 8 MiB slot B_i + reactor-owned stream S_i (cuFileStreamRegister, flags 15)
  S_i runs in FIFO order:
    cuFileReadAsync(file, B_i, size = aligned window, file_offset = window start, buf_offset = 0)
-   [cudaStreamWaitEvent(S_i, caller's gate)]        only when the caller's stream was busy
-   cudaMemcpyAsync(dst(part 0), B_i + rel0, n0, D2D)
-   cudaMemcpyAsync(dst(part 1), B_i + rel1, n1, D2D)
-   ...
+   cudaMemcpyAsync(dst(part 0), B_i + rel0, n0, D2D)   one copy per run of parts contiguous in
+   cudaMemcpyAsync(dst(part 1), B_i + rel1, n1, D2D)   the file and the destination; 5+ copies
+   ...                                                  go out as one cudaMemcpyBatchAsync
    cudaStreamAddCallback(done)   -> marks lane i finished, wakes the reactor
+ a lane stream never waits on a caller's event: a read whose caller's stream is still busy
+ runs in two phases (read + callback, then -- once the reactor sees the gate fire -- copies +
+ callback), see "Ordering against the caller's stream"
  the next read into B_i is issued only after done fired, so a slot is never overwritten early
 ```
 
@@ -122,15 +124,22 @@ joined onto the caller's stream (AM-1).
 ### Ordering against the caller's stream
 
 The read never writes the caller's memory; only the copies do. So the read may start while the
-caller's stream is still busy, as long as the copies wait for it:
+caller's stream is still busy, as long as the copies wait for it -- but a lane stream never
+waits on the caller's event (that would tie shutdown, cancellation and the lane itself to
+unrelated GPU work). The read runs in two phases instead:
 
 | Caller's gate (event recorded at submission) | What the lane does |
 |---------------------------------------------|--------------------|
-| none, already passed, or re-dispatched after parking | submit without a gate |
-| pending, and fewer than `max_gated_lanes` gated reads in flight on this reactor | submit with the gate: the read starts now, the copies wait on the GPU (`cudaStreamWaitEvent`) |
+| none, already passed, or re-dispatched after parking | read + copies + completion |
+| pending, and fewer than `max_gated_lanes` lanes of this reactor's set hold data for a gate | read + completion only (the I/O starts now); when it is done the lane keeps the data, and the reactor queues the copies once it sees the gate fire (it polls held gates every pass) |
 | pending otherwise | park the slice until the gate fires (holds no lane), then submit |
 
-The `max_gated_lanes` cap keeps a stalled caller from taking every lane.
+The `max_gated_lanes` cap keeps a stalled caller from taking every lane; a read counts against
+it only while its data is actually held. Reads submitted that way that all finish before their
+gates fire can briefly exceed it; a lane read that then finds every lane held is served
+synchronously. Shutdown and a cancelled request release held data at once, without waiting for
+the caller's stream; a lane read that fails before its gate fired is re-served synchronously
+once the gate fires (parked, not waited for).
 
 ### Short reads, failures, cooldown, stalls
 
@@ -428,7 +437,12 @@ counters:
 | `lane_parts` | caller pieces those reads served |
 | `lane_resubmits` | short-read continuations |
 | `lane_failures` | lane reads that failed and were re-served synchronously (also in `cufile_failures`) |
-| `lane_gated_reads` | lane reads submitted with a pending caller gate |
+| `lane_gated_reads` | lane reads that held their data for a pending caller gate |
+| `lane_submit_ns`, `lane_read_async_ns` | time in the lane issue path (`submit`/`copy_out`), and of it inside `cuFileReadAsync` |
+| `lane_flight_ns` | sum over finished lane reads of (reap - first submit): mean lane cycle = this / (`lane_reads` + `lane_failures`) |
+| `lane_notify_ns` | callback completion: sum of (reap - completion callback), the wake-up plus worker-busy latency |
+| `lane_idle_ns` | of `lane_notify_ns`, the part during which lane work was waiting (a finished lane sat unused) |
+| `worker_wait_ns`, `worker_passes` | time the worker slept at its wait point, and its loop passes |
 | `batch_reads`, `batch_bytes` | host reads served by the batch path, and their payload (head and tail included); disjoint from `host_reads`/`host_bytes` |
 | `batch_failures` | entries that came back short or failed (completed synchronously, or failing their read at shutdown) |
 | `batch_waves`, `batch_entries` | waves submitted and the entries they carried (wave fill = `batch_entries / batch_waves`, at most `depth`) |

@@ -311,8 +311,9 @@ struct lane_copy { std::uint8_t* dst; std::size_t offset; std::size_t bytes; }; 
 struct lane_read {
   void* handle{};                    // CUfileHandle_t
   range window;                      // aligned, <= slot
-  std::vector<lane_copy> copies;     // ascending file offset, inside the window
-  cudaEvent_t gate{};                // event the copies must follow, or null
+  std::vector<lane_copy> copies;     // ascending file offset, inside the window; empty with hold
+  bool hold{false};                  // two-phase: read only, report `held`, wait for the owner
+  std::size_t needed_bytes{};        // with hold: bytes of the window that must arrive
   std::uint64_t token{};             // the owner's, returned in the result
 };
 
@@ -324,6 +325,8 @@ struct lane_result {
   cudaError_t cuda_status{cudaSuccess};
   unsigned resubmits{};
   unsigned lane{};                   // the lane that served it (diagnostics, tests)
+  bool held{};                       // a hold read's I/O is done; the lane keeps the data
+  std::int64_t completed_ns{};       // callback mode: when the completion callback ran
 };
 
 struct lane_set_options {
@@ -339,6 +342,7 @@ struct lane_set_options {
   void (*wake)(void*) noexcept {};   // called from the completion callback, and when a
                                      // read fails at submission
   void* wake_context{};
+  std::atomic<std::uint64_t>* read_async_ns{};  // time inside cuFileReadAsync (instrumentation)
 };
 
 class fused_lane_set {
@@ -349,7 +353,8 @@ class fused_lane_set {
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] std::size_t in_flight() const noexcept;
   [[nodiscard]] std::size_t free_lanes() const noexcept;
-  [[nodiscard]] std::size_t gated() const noexcept;           // in flight with a gate
+  [[nodiscard]] std::size_t held() const noexcept;            // held, waiting for the owner
+  [[nodiscard]] std::size_t active() const noexcept;          // work queued (in flight - held)
   [[nodiscard]] std::size_t slot_bytes() const noexcept;
   [[nodiscard]] int device() const noexcept;
   [[nodiscard]] std::size_t registered_streams() const noexcept;  // diagnostics
@@ -359,10 +364,16 @@ class fused_lane_set {
   /// outside the window) is reported by a later reap(), after the lane is known idle.
   [[nodiscard]] bool submit(lane_read&& read) noexcept;
 
+  /// Second phase of a held read: queue its copies (then its completion) on the lane, or
+  /// drop its data and free the lane.  Exactly one of them per held result.
+  [[nodiscard]] bool copy_out(unsigned lane, std::vector<lane_copy>&& copies) noexcept;
+  void release_held(unsigned lane) noexcept;
+
   /// Report every lane that finished since the last call; never blocks. `done(result)`.
   template <typename Done> std::size_t reap(Done&& done);
 
-  /// Wait until nothing is in flight (shutdown), reporting as reap() does.
+  /// Wait until no lane has work queued (shutdown), reporting as reap() does.  Held lanes
+  /// have nothing queued and are not waited for: they are the owner's to release.
   template <typename Done> void drain(Done&& done);
 
   [[nodiscard]] bool completions_pending() const noexcept;    // callback fired, not reaped
@@ -381,13 +392,24 @@ evenly under partial load):
 
 1. fill the arguments; `bytes_done` starts at a sentinel;
 2. `api->read_async(handle, slot.base, &size, &file_offset, &buffer_offset, &bytes_done, stream)`;
-3. `cudaStreamWaitEvent(stream, gate)` when gated;
-4. one `cudaMemcpyAsync(dst, slot.base + (offset - window.offset), bytes, D2D, stream)` per copy;
-5. `cudaStreamAddCallback(stream, on_done, &lane.callback, 0)`.
+3. unless `hold`: the copies -- one `cudaMemcpyAsync(dst, slot.base + (offset - window.offset),
+   bytes, D2D, stream)` per copy, or one `cudaMemcpyBatchAsync` (`cuda::device_copy_batch`) for
+   a window with five or more;
+4. `cudaStreamAddCallback(stream, on_done, &lane.callback, 0)`.
+
+**A lane stream never waits on another stream's event.** A read whose destinations may not be
+written yet (its caller's stream has not reached the gate) is submitted with `hold`: steps 1, 2
+and 4 only.  When its I/O is done (`bytes_done >= needed_bytes`) `reap` reports it with
+`held = true` and the lane stays reserved, slot intact.  The owner then calls exactly one of
+`copy_out(lane, copies)` (steps 3 and 4 now; a final result follows) or `release_held(lane)`.
+So `drain`, shutdown and cancellation never wait for a caller's stream.  A held read that came
+back short is reported held after its first part; `copy_out` copies the bytes already in the
+slot, then reads the rest of the window into the slot (offset 0) behind those copies, then
+queues the remaining copies.
 
 If step 2 fails nothing was queued: the lane is marked finished with `io_failed` at once. If
-step 3, 4 or 5 fails the read is already queued: the set synchronizes the lane's stream
-(blocking, rare) and reports `device_failed`.
+step 3 or 4 fails the read is already queued: the set synchronizes the lane's stream (its own
+work only), gives it a fresh stream and reports `device_failed`.
 
 `on_done(stream, status, ctx)` runs on a CUDA thread: store `status`, set bit `i` of
 `_completed` (`fetch_or`), call `wake`. No CUDA call, no lock, no allocation.
@@ -406,15 +428,29 @@ invisible). Nothing is cancelled: the slot stays leased until the stream reports
 
 `reap` takes `_completed.exchange(0)` and for each bit:
 
-- callback status not `cudaSuccess` → recycle the lane's stream (deregister, destroy, create,
-  register), `device_failed`;
+- callback status not `cudaSuccess` → retire the lane's stream and create a new one (a lane
+  that cannot get one leaves the set: `capacity()` shrinks), `device_failed`;
 - `bytes_done < 0` → `io_failed`;
 - `bytes_done >= needed`, where `needed` is the end of the last copy relative to the window →
   `ok`;
 - otherwise a short read: `progress = align_down(bytes_done)`. With `progress == 0` or the
   resubmit budget spent → `io_failed`. Else advance the window by `progress`, clip the copies
   to it and resubmit on the same lane, **into the slot at offset 0** (never a non-zero buffer
-  offset) and without the gate (it has passed); the lane stays busy.
+  offset); the lane stays busy.  (A `hold` read is reported held instead; see above.)
+
+`drain` also stops waiting for a lane whose stream reports an error without its completion
+arriving (a sticky error stops callbacks): it is reported `device_failed`.
+
+Lane streams are **retired, never deregistered or destroyed** (kept, registered and idle, for
+the life of the process; one small object per lane of every set built), because of what
+libcufile 1.17 does in compatibility mode:
+
+- `cuFileStreamDeregister` synchronizes the whole device and, while waiting, holds a lock the
+  process's other cuFile calls need: deregistering at shutdown, inline or on a background
+  thread, waits for unrelated callers' GPU work and stalls all cuFile I/O meanwhile;
+- a stream one thread used for `cuFileReadAsync` fails it (`-EIO`, `-ENOMEM`) from another
+  thread once the first is gone, so streams cannot be pooled for later sets;
+- the first `cuFileReadAsync` of the process synchronizes the device (once).
 
 Slots come from `detail::staging_pool` (`acquire(device, slot_bytes, cap, require_registered =
 gds_available())`), go back to it on destruction, and are never freed. A process-wide
@@ -570,14 +606,20 @@ A slice takes a lane when: fused reads are enabled and usable on this reactor; t
 read with a device destination only and no completion callback; the file is cuFile-registered;
 `is_lane_read(slice, file_size, slot_bytes)`; and its window is at least `gds_threshold`.
 
-Gate handling (the copies write the caller's memory, the read does not):
+Gate handling (the copies write the caller's memory, the read does not) -- **two-phase**:
 
 | Gate | Action |
 |---|---|
-| ready, or re-dispatched after parking | submit without a gate |
-| pending, and `gated() < max_gated_lanes` | submit with the gate: the read starts now, its copies wait on the GPU |
+| ready, or re-dispatched after parking | submit with its copies |
+| pending, and the set's `held() < gated_lane_limit()` | submit with `hold`: the read starts now (I/O overlaps the caller's compute); on the `held` result the worker queries the gate: fired → `copy_out`, pending → the op joins the reactor's held list, polled every pass (one query per distinct gate; the wait timeout is `poll_interval_us` while the list is non-empty) and copied out when its gate fires |
 | pending otherwise | `park_on_gate` (existing); re-dispatched when the gate fires |
 | unchecked (no submission-time gate) | `park_if_stream_busy` (existing), else submit |
+
+A pending gate counts against the limit only once its read is actually held (I/O done, gate
+still pending), so a merely busy caller stream no longer takes lanes from others.  Reads
+submitted with `hold` that all finish while their gates are still pending can overshoot the
+limit (at most the set's capacity); a lane read that then finds every lane held is served
+synchronously instead of waiting.  `lane_gated_reads` counts reads that were held.
 
 Completion (`reap` result) for the slice's `io_op_request`:
 
@@ -587,14 +629,40 @@ Completion (`reap` result) for the slice's `io_op_request`:
   then **fall back**: the slice's destinations are re-served through the synchronous path of
   this reactor (staged `cuFileRead` or POSIX), each taking a coordinator credit before the
   slice returns its own, exactly as the existing "fused slice that cannot be staged" path does.
-  The gate has passed by then. A fallback that also fails settles the read with its error.
+  The worker never waits for the gate: when it has not fired (a read refused at submission or
+  failed in its first phase), the destinations are parked behind it (`waiting_slice` with
+  `no_lanes`, re-dispatched without lanes). A fallback that also fails settles the read with
+  its error.
+- A held read whose coordinator stopped is released (its data dropped) and settles cancelled
+  at once; a gate query error settles it with that error.
+- The backlog's read is served synchronously (same credit pattern, parked behind a pending
+  gate) when its lane set has lost every lane, or every lane is held.
 - After `failure_limit` consecutive failures the reactor stops using lanes for `cooldown_s`
   seconds and logs a warning; a success resets the count.
 - A cancelled coordinator does not stop a read already in flight; it settles when the lane
   finishes, with the cancellation.
 
-Shutdown: cancel the backlogs (nothing was issued), `drain` the lane sets and the batch reader,
-settle with real results, destroy both on the worker, then run the existing teardown.
+Shutdown: cancel the backlogs (nothing was issued), release the held reads and settle them
+with the terminal error (without waiting for any caller stream), `drain` the lane sets (only
+lanes with I/O or copies queued, which wait on nothing foreign) and the batch reader, settle
+with real results, destroy both on the worker, then run the existing teardown.
+
+Routing follows usability: each reactor publishes whether it can serve lane reads on a GPU
+(`lanes_usable(device)`: not cooling down, its set there has lanes; a GPU it has not tried
+counts as usable).  The ioctx plans lane reads (`plan_fused_reads`) only when some lane
+reactor of every destination GPU is usable, and only such reactors are lane candidates;
+otherwise the request takes the legacy path end to end.  Inside one request, lane reads go to
+lane reactors and every other slice to the reactors its own role picks, under the request's
+one coordinator (`templated_ioctx::slice_class`).  Lane sets take at most the plan's lane
+quota of the GPU (`lane_slots`; unplanned GPUs: `min(reactors_per_device x
+lanes_per_reactor, max_lanes_per_device)`).  Parts that are contiguous in the file and in
+the destination are one copy; a window holds at most `max_parts_per_read` parts.
+
+Instrumentation (`reactor_stats`, always on, relaxed): `lane_submit_ns` (time in
+`submit`/`copy_out`), `lane_read_async_ns` (of it, in `cuFileReadAsync`), `lane_flight_ns`
+(reap minus first submit, per finished read), `lane_notify_ns` (callback mode: reap minus the
+completion callback), `lane_idle_ns` (of that, while lane work was waiting), `worker_wait_ns`
+and `worker_passes`.
 
 ### 8.4 Host batch path in `dispatch_slice`
 
