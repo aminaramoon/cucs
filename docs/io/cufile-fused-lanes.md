@@ -171,13 +171,35 @@ cuFile-registered file, uses the batch path when:
 
 Then:
 
-- the head and tail (each under 4 KiB) are read synchronously;
-- the body is cut into entries of at most `max_entry_bytes`, each reading straight into the
-  destination with `cuFileBatchIOSubmit`. A reactor keeps up to `depth` entries in flight;
+- the head and tail (each under 4 KiB) are read synchronously, before any entry is submitted;
+  if either fails the read fails and nothing is submitted;
+- the body is cut into entries of at most `max_entry_bytes` (boundaries at multiples of it from
+  the body's start), each reading straight into the destination. A reactor keeps up to `depth`
+  entries staged or in flight; a read whose entries do not all fit waits in a one-element
+  backlog, and the reactor takes no further slices until it is fully staged (like the lane
+  backlog), so excess reads wait in the queue where priorities apply;
+- the read holds one coordinator credit until its last entry settled. `batch_reads` counts such
+  reads and `batch_bytes` their payload including head and tail; they never also count in
+  `host_reads`/`host_bytes`, so the two say which path served a read;
 - an entry that comes back short or failed is completed synchronously for its missing bytes
-  (counted in `batch_failures`). The read fails only if that fails too;
-- after `failure_limit` consecutive rejected submits, or any `cuFileBatchIOGetStatus` error, the
-  reactor stops batching for good. It logs this and serves host reads synchronously.
+  (counted in `batch_failures`, logged once per file). The read fails (`io_error`) only if that
+  fails too;
+- after `failure_limit` consecutive rejected submits, a failed handle re-creation, or any
+  `cuFileBatchIOGetStatus` error, the reactor stops batching for good. It logs this and serves
+  host reads synchronously (the rest of a read already in progress included).
+
+Each batch reactor owns one reader with a **helper thread** that makes every `Submit` and
+`GetStatus` call: the worker stages entries, hands a wave over after each pass (one hand-off,
+no allocation) and settles what the helper published; the helper wakes the worker when a wave
+completed. The worker never blocks in cuFile for the batch (in compatibility mode `Submit`
+alone takes about 3 ms per wave of 1 MiB entries), so the reactor's one wait point and request
+latency are unchanged. The reader is created on the worker at the first eligible read and
+destroyed on it at shutdown, after its entries drained; a reactor that never started never
+touches cuFile.
+
+Shutdown drops the backlog's unstaged entries, waits for the entries in flight and settles each
+read with its real result (no synchronous re-read: a failed entry fails its read with the
+shutdown error).
 
 Every other host read (unaligned bodies, incongruent destinations, small reads, fragmented or
 cache destinations) takes the existing synchronous path.
@@ -189,6 +211,15 @@ libcufile quirks probed with 1.17.1 shaped these rules:
   own destination address as the base, with offset 0.
 - **Aligned only.** Entries whose offset, size or buffer are not 4 KiB-aligned take cuFile's
   POSIX pool and sporadically complete `CUFILE_FAILED`.
+- **Whole waves only (libcufile 1.17.1 use-after-free).** A `cuFileBatchIOGetStatus` call that
+  returns fewer events than the handle has in flight -- a poll that finds nothing, a timeout,
+  a partial return with `min_nr` below the outstanding count -- leaves a dangling pointer inside
+  cuFile. The next completion dereferences it and crashes the process (SIGSEGV in `GetStatus`)
+  as soon as the calling thread's allocator reused that memory. Reproduced through the raw API
+  in 5 of 5 runs; it is what crashed every "refill while pending" shape. So the helper submits a
+  wave only when the previous one was fully reaped and waits for the whole wave in one call
+  (`min_nr` = the wave, 1 s per call). Waves of different readers may overlap safely (measured
+  with heap spraying).
 - **Finite timeouts.** `cuFileBatchIOGetStatus` is always called with a finite timeout. A
   `GetStatus` without a timeout after a failed submit never returns.
 - **Capacity.** Submitting more entries than the handle's `SetUp` capacity fails the whole
@@ -300,8 +331,23 @@ invalid enabled block as a warning and plans without it.
 | `depth` | 64 | 1–1024 | Entries in flight per reactor (clamped to `max_batch_io_size`) |
 | `max_entry_bytes` | 8 MiB | multiple of 4 KiB, 4 KiB–1 GiB | Largest entry; a body is cut into entries of at most this |
 | `min_bytes` | 64 KiB | any | Aligned bodies smaller than this keep the synchronous path |
-| `poll_us` | 200 | 1–1,000,000 | Longest the reactor blocks in `GetStatus`; a request queued meanwhile waits at most this |
+| `poll_us` | 200 | 1–1,000,000 | Longest the worker sleeps with entries in flight without a wake-up from the helper (bounds a lost wake-up only) |
 | `failure_limit` | 4 | ≥ 1 | Consecutive rejected submits after which a reactor stops batching for good |
+| `submit_policy` | `exclusive` | `exclusive`, `per_reader`, `continuous` | When a reader submits; see below |
+
+`submit_policy` (`batch_submit_policy`):
+
+| Policy | Shape | libcufile 1.17.1, compatibility mode |
+|--------|-------|--------------------------------------|
+| `exclusive` (default) | whole waves; one wave in flight process-wide (a gate released when the wave completed) | 0 of 5 crash-probe runs crashed |
+| `per_reader` | whole waves per reader; waves of different readers overlap (the raw GDS-host benchmark's shape) | 0 of 5 crashed; 7.16 GB/s with 2 batch reactors on the test box (device-bound) |
+| `continuous` | refill while entries are pending, reap as they complete (`min_nr` 1) | 5 of 5 crashed |
+
+Qualify anything but `exclusive` on the target stack first with the hidden test
+`cucascade_io_tests "[host_batch_quirk]"`, which runs every policy and a raw-API reproducer in
+child processes and prints their crash counts. Readers alive at the same time share one
+policy: the first ones fix it, and a reactor configured differently logs a warning and uses
+it.
 
 ## Enabling it
 
@@ -360,8 +406,8 @@ counters:
 | `lane_resubmits` | short-read continuations |
 | `lane_failures` | lane reads that failed and were re-served synchronously (also in `cufile_failures`) |
 | `lane_gated_reads` | lane reads submitted with a pending caller gate |
-| `batch_reads`, `batch_bytes` | host-batch entries completed, and their bytes |
-| `batch_failures` | entries that came back short or failed and were completed synchronously |
+| `batch_reads`, `batch_bytes` | host reads served by the batch path, and their payload (head and tail included); disjoint from `host_reads`/`host_bytes` |
+| `batch_failures` | entries that came back short or failed (completed synchronously, or failing their read at shutdown) |
 
 Reading them:
 
@@ -455,3 +501,7 @@ To be filled in after the GDS-host runs.
   entries for GPU memory always took the POSIX fallback.
 - **Host batch needs aligned bodies:** unaligned or incongruent host reads keep the synchronous
   path.
+- **Host batch on this test box (local NVMe, compatibility mode):** host reads of 16 MiB, 16 in
+  flight, through `cufile_ioctx`: 7.1 GB/s with 1 or 2 batch reactors (any policy) against
+  4.5 GB/s for the synchronous reactors of a planned pool and 7.2 GB/s for a flat pool of 4
+  synchronous reactors -- the drive's ceiling. One batch reactor reaches it.

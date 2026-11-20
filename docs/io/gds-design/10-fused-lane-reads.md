@@ -58,6 +58,10 @@ the behaviours that matter.
     capacity; exceeding it fails the whole submit (5040), after which a `GetStatus` without a
     timeout never returns.
   - `Submit` of aligned entries can take milliseconds in compatibility mode.
+  - **A `GetStatus` that returns fewer events than are in flight (a poll finding nothing, a
+    timeout, a partial return) leaves a dangling pointer inside cuFile** (use-after-free): the
+    next completion crashes the process once the calling thread's allocator reused the memory.
+    Found during the integration (§7); it is what crashed every refill-while-pending shape.
 
 ## 2. Scope
 
@@ -160,8 +164,9 @@ struct host_batch_config {
   unsigned depth{64};                   // entries in flight per reactor, 1..1024
   std::size_t max_entry_bytes{8UL << 20};  // body cut into entries of at most this; 4 KiB multiple
   std::size_t min_bytes{64UL << 10};    // smaller aligned bodies keep the synchronous path
-  unsigned poll_us{200};                // longest the worker blocks in GetStatus
+  unsigned poll_us{200};                // bounds a lost helper wake-up (worker never blocks in cuFile)
   unsigned failure_limit{4};            // consecutive failed submits before batch is disabled
+  batch_submit_policy submit_policy{batch_submit_policy::exclusive};  // exclusive | per_reader | continuous (§7)
   void validate() const;
 };
 
@@ -436,22 +441,28 @@ struct batch_result {
   enum class status : std::uint8_t { ok, short_read, failed };
   std::uint64_t token{};
   status outcome{status::ok};
-  std::size_t bytes{};     // delivered (ok: rng.size)
-  int error{};             // cuFile status / error for diagnostics
+  std::size_t bytes{};     // delivered from the start (ok: rng.size)
+  int error{};             // failed: cuFile entry status or cuFile error code
 };
 
 class host_batch_reader {
  public:
-  host_batch_reader(unsigned depth, unsigned failure_limit);  // never throws; available() false on failure
-  ~host_batch_reader();                                       // requires in_flight() == 0
+  using wake_fn = void (*)(void*) noexcept;            // runs on the helper thread
+  host_batch_reader(unsigned depth, unsigned failure_limit,
+                    batch_submit_policy policy = batch_submit_policy::exclusive,
+                    wake_fn wake = nullptr, void* wake_context = nullptr) noexcept;
+  ~host_batch_reader();                                // requires in_flight() == 0
   [[nodiscard]] bool available() const noexcept;
-  [[nodiscard]] std::size_t in_flight() const noexcept;
-  [[nodiscard]] std::size_t free_entries() const noexcept;    // capacity - in flight - staged
-  /// Stage one entry for the next flush(). Requires free_entries() > 0.
-  void add(batch_read const& read) noexcept;
-  /// Submit the staged entries in one call. Rejected entries are reported by reap().
-  void flush() noexcept;
-  /// Collect completions; waits up to `wait` for the first one when it is non-zero.
+  [[nodiscard]] std::size_t capacity() const noexcept;
+  [[nodiscard]] std::size_t in_flight() const noexcept;    // handed to the helper, unreported
+  [[nodiscard]] std::size_t staged() const noexcept;       // added, not handed over
+  [[nodiscard]] std::size_t pending_failures() const noexcept;
+  [[nodiscard]] std::size_t free_entries() const noexcept; // 0 while unavailable
+  [[nodiscard]] batch_submit_policy policy() const noexcept;
+  [[nodiscard]] bool completions_pending() const noexcept; // any thread
+  [[nodiscard]] bool deferred() const noexcept;            // last flush left a wave staged
+  void add(batch_read const& read) noexcept;               // requires free_entries() > 0
+  void flush() noexcept;                                   // hand the staged wave over
   template <typename Done> std::size_t reap(std::chrono::microseconds wait, Done&& done);
   template <typename Done> void drain(Done&& done);
 };
@@ -459,31 +470,38 @@ class host_batch_reader {
 ```
 
 - One batch handle of `depth` entries (clamped to cuFile's `max_batch_io_size`); fixed
-  parameter, event and bookkeeping arrays; the cookie is the entry index. Outstanding plus
+  parameter, event and bookkeeping arrays; the cookie is the entry index + 1. Outstanding plus
   staged never exceeds the capacity.
-- `GetStatus` is always called with a finite timeout: zero for a poll, `wait` otherwise.
-- An event is `ok` when `status == CUFILE_COMPLETE` and `ret == size`; `short_read` when
+- **A helper thread per reader makes every `Submit` and `GetStatus` call.** The owner (the
+  reactor worker) stages entries and `flush()` hands the wave over (mutex-protected copy into a
+  fixed buffer, one condition-variable notify; no allocation). The helper submits, reaps, and
+  publishes the events; then it calls `wake` (the reactor's `notify_worker`). `reap()` collects
+  what was published and waits up to `wait` only on the hand-off condition variable. The owner
+  never blocks in cuFile; the helper never allocates and never logs.
+- **Whole waves.** Under `exclusive` and `per_reader` a reader hands a wave over only when its
+  previous wave was fully reported, and the helper reaps it with `GetStatus(min_nr = the whole
+  wave, 1 s)`, repeated while slower (counted in `partial_status`). This avoids the libcufile
+  use-after-free of §1. `exclusive` adds a process-wide gate: one wave in flight in the process,
+  released by the helper as soon as the wave completed -- not by the owner, so a reactor busy
+  with a long synchronous transfer never holds other readers back. `continuous` hands entries
+  over at once and reaps with `min_nr = 1` (crashes libcufile 1.17.1 in compatibility mode).
+  The default is `exclusive`; the policy is `host_batch_config::submit_policy`, and readers
+  alive together share the first one's (§4).
+- An event is `ok` when `status == CUFILE_COMPLETE` and `ret >= size`; `short_read` when
   complete with fewer bytes; `failed` otherwise.
-- A rejected `Submit` fails every entry of that call (reported through `reap`). After
-  `failure_limit` consecutive rejected submits, or any `GetStatus` error, the reader cancels
-  and destroys its handle once nothing is in flight and reports `available() == false` for
-  good; the reactor then uses the synchronous path.
-- `drain` polls with a bounded timeout until every outstanding entry reported, then destroys
-  the handle. It never abandons a destination cuFile may still write.
-- **Submit policy.** libcufile 1.17.1 in compatibility mode corrupts its batch state when a
-  `Submit` runs while batch entries are in flight, on the same handle or on another handle of
-  the process, and later crashes inside `GetStatus` (SIGSEGV; 30-85% of 3000-read runs at 32-64
-  entries in flight, also with one entry per submit; never with whole waves). The reader
-  therefore defaults to `batch_submit_policy::exclusive`: a process-wide gate lets one reader at
-  a time submit one wave, and only while nothing is in flight; entries staged meanwhile stay
-  staged (`flush` defers) and `reap` submits them when the gate frees. `continuous` (the API's
-  documented semantics) is opt-in, for a libcufile verified with the hidden
-  `[host_batch_quirk]` test.
-- A rejected submit's entries are reported only once the handle that rejected them has been
-  cancelled and destroyed (after the entries still in flight on it completed), so cuFile can no
-  longer write those destinations when the owner sees the failure.
-- In compatibility mode `Submit` does much of the I/O synchronously: about 3 ms per wave of
-  8-64 entries of 1 MiB, 35-90% of the reader's wall time. The worker blocks there.
+- A rejected `Submit` fails every entry of that call. The helper cancels, destroys and
+  re-creates the handle once nothing is in flight on it, and only then publishes the rejected
+  entries, so cuFile can no longer write their destinations when the owner sees them. After
+  `failure_limit` consecutive rejected submits, or when the re-creation fails, the reader is
+  unavailable for good.
+- A `GetStatus` error: the helper cancels and destroys the handle at once; every entry in
+  flight or staged is reported `failed`; the reader is unavailable for good.
+- `drain` hands over and reaps with a bounded wait until every entry reported, warning every
+  5 s. It never abandons a destination cuFile may still write. The destructor stops the helper
+  (after any wave in flight completed) and destroys the handle.
+- Measured (1 GiB file, 1 MiB entries, compatibility mode, local NVMe): 7.0-7.2 GB/s at depth
+  32-128 against 3.0-3.2 GB/s for a single-threaded `O_DIRECT` `pread`; `Submit` takes about
+  3 ms per wave (it does much of the I/O synchronously), now on the helper thread.
 
 ## 8. Reactor integration (`cufile_reactor`)
 
@@ -509,19 +527,18 @@ Requests are taken with `try_dequeue` only.
 ```
 poll_completions()                    # unchanged: parked gates, H2D copies, early staged reads
 reap lanes                            # settle, fall back, free; then refill from the backlog
-reap host batch (poll)
+collect host batch (non-blocking: what its helper published)
 ... cancellation checks, preempt_low (unchanged) ...
 for slices of the active request, while the pass budget lasts and no backlog is pending:
     dispatch_slice()                  # may start a lane read / stage batch entries / run sync
-flush host batch
+flush host batch                      # hand the pass's entries to the helper (may be deferred)
 if nothing more can be dispatched now:
-    choose the wait:
-      batch in flight and no lane in flight   -> batch reap(min(timeout, poll_us))
-      otherwise                               -> _wake.wait(timeout)
+    _wake.wait(timeout)               # lane callbacks and the batch helper signal it
     timeout = idle_wait_us when nothing is in flight or parked,
-              poll_interval_us while legacy copies / parked slices need polling
-              (also while batch entries fly together with lanes),
-              1 ms while only lanes are in flight (a lost wake-up costs at most this)
+              poll_interval_us while legacy copies / parked slices need polling, or a batch
+              wave waits for another reader's gate,
+              1 ms while lanes are in flight, host_batch.poll_us while batch entries are
+              (both only bound a lost wake-up)
 ```
 
 A slice that is a lane read but finds no free lane is parked in a one-element lane backlog and
@@ -563,15 +580,40 @@ settle with real results, destroy both on the worker, then run the existing tear
 
 ### 8.4 Host batch path in `dispatch_slice`
 
-A host-only read with a contiguous destination and no completion callback, on a
-cuFile-registered file, whose aligned body `[align_up(offset), align_down(min(end, file_size)))`
-is at least `min_bytes` and whose destination is congruent (`dst + (body.offset - offset)` is
-4 KiB-aligned) is served as: head and tail (each under 4 KiB) through the existing
-`read_host_direct`, synchronously; the body as entries of at most `max_entry_bytes` reading
-straight into the destination. Each entry takes its own coordinator credit. An entry that comes
-back `short_read` or `failed` is completed synchronously with `read_host_direct` for the
-missing bytes (counted in `batch_failures`); only if that fails does the read fail.
-Counters: `batch_reads`, `batch_bytes`, `batch_failures`.
+On a reactor with `host_batch.enabled && placement.host_batch`, a slice takes the batch path
+when it is a read with a host destination only, contiguous, without `on_complete`, on a
+cuFile-registered file with an O_DIRECT descriptor; its aligned body
+`[align_up(offset), align_down(min(end, file_size)))` is at least `min_bytes`; its destination is
+congruent (`dst + (body.offset - offset)` is 4 KiB-aligned); the reader is available; and the
+batch backlog is empty. Everything else takes the synchronous path, unchanged.
+
+- The reader is created on the worker at the first such slice (`depth`, `failure_limit`,
+  `submit_policy`, wake = `notify_worker`); unusable -> logged once at info, synchronous from
+  then on.
+- Head `[offset, body.offset)` and tail `[body.end, end)` (each under 4 KiB, possibly empty) are
+  read with `read_host_direct` before any entry is staged; a failure or short read fails the
+  slice and nothing is submitted.
+- The body becomes entries of at most `max_entry_bytes` (cut at multiples of it from
+  `body.offset`), each reading into `dst + (entry.offset - offset)`. The slice's state (request,
+  destination, cursor, entries outstanding, first error) lives in a slab with a free list; an
+  entry's token is (slab index << 32 | entry number). **One coordinator credit per slice**,
+  given back when the last entry settled.
+- Entries are staged while `free_entries() > 0`; the rest keeps a cursor in a one-element
+  backlog (`async_backlog_pending()`), continued after every collect. A stopped coordinator
+  stages nothing more; the entries already submitted finish and the slice settles with the
+  cancellation.
+- Results: `ok` -> bytes; `short_read` / `failed` -> the missing bytes are read synchronously
+  with `read_host_direct` (`batch_failures`, logged once per file); if that fails too, the slice
+  fails with `io_error`. If the reader became unavailable with a slice half staged, the rest of
+  the body is read synchronously.
+- Settlement: success -> `finish_success()`, `batch_reads` += 1, `batch_bytes` += the clamped
+  payload (head and tail included); never also `host_reads`/`host_bytes`. `_queued_bytes` keeps
+  the slice until it settles (as for lanes).
+- Shutdown (`drain_async`): the backlog's unstaged entries are dropped, the reader drained, a
+  failed entry fails its slice with the terminal error (no synchronous re-read), the reader is
+  destroyed on the worker.
+- The process gate cannot be held by a busy reactor (the helper releases it), so a flat pool
+  mixing batch reads with writes and device reads needs no extra rule.
 
 ## 9. Pool plan and ioctx
 
