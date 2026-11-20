@@ -13,6 +13,7 @@ Comprehensive documentation for the cuCascade GPU memory management library.
 | [cuFile / GPUDirect Storage backend](io/cufile-gds.md) | GDS read paths, per-GPU pool planning, registered staging, Storage Scale checklist |
 | [cuFile fused stream lanes and host batch reads](io/cufile-fused-lanes.md) | Opt-in: fused `cuFileReadAsync` device reads on stream lanes, cuFile-batch host reads; configuration, memory, observability |
 | [Fused lane reads: design](io/gds-design/10-fused-lane-reads.md) | Design of the fused-lane planner, lane set, host batch reader, reactor integration and pool plan |
+| [Fused lanes: Sirius integration handoff](io/gds-design/11-sirius-integration-handoff.md) | What an embedding engine must do to pin, configure, account for and test fused lanes and host batch reads |
 | [REST transport](io/rest-transport.md) | The io_uring S3 / REST read reactor |
 | [Development Guide](development-guide.md) | Building, testing, benchmarking, and contributing |
 | [Data Batch State Transitions](data_batch_state_transitions.md) | State machine reference for `data_batch` |
