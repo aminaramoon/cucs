@@ -183,12 +183,19 @@ Rules:
   registered when cuFile allows it and unregistered otherwise. With GDS, a lane exists only if
   its slot registered.
 - `max_lanes_per_device` guards the storage: the GPFS client on the reference host asserted
-  under 128 x 1 MiB asynchronous reads. Lane sets draw from one process-wide budget per GPU;
-  a set that cannot get lanes from it runs with fewer, or with none.
-- Registered memory: lanes take `lanes x (slot_bytes + 64 KiB)` per GPU from the staging pool,
-  inside `max_staging_bytes_per_device` and the plan's BAR1 / pinned-memory caps. The plan
-  budgets lanes first and warns, naming the value to raise, when the cap leaves lanes or
-  synchronous reactors without slots. The 1 GiB default cap holds 126 lanes of 8 MiB.
+  under 128 x 1 MiB asynchronous reads. Lanes are counted per GPU over the whole process; a
+  lane set takes lanes only while the process holds fewer than its own configured ceiling on
+  that GPU (with different values in different ioctxs, each set applies its own). A set that
+  cannot get lanes runs with fewer, or with none.
+- Registered memory: lanes take `lanes x (slot_bytes + 64 KiB)` per GPU (1032 MiB for the
+  default 128 lanes of 8 MiB) from the staging pool, **in addition to**
+  `max_staging_bytes_per_device`, which now bounds the synchronous staging only; account for
+  it when sizing a GPU memory pool. Half the free BAR1 and cuFile's pinned-memory limit (less
+  its bounce cache) bound the total: the plan budgets lanes first within them, gives the
+  synchronous staging the configured cap within what they leave, and warns, naming the limit,
+  when they cut lanes or leave the synchronous reactors without slots. A plan's
+  `staging_cap_bytes` (what the staging pool enforces) is the synchronous budget plus the
+  lane bytes; a flat pool adds `fused_lane_staging_bytes(cfg)` to the configured cap.
 
 ## 5. Planning fused reads (`fused_read_plan.hpp`)
 
