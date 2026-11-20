@@ -26,9 +26,11 @@ One lane, as it runs on the GPU:
  lane i = registered 8 MiB slot B_i + reactor-owned stream S_i (cuFileStreamRegister, flags 15)
  S_i runs in FIFO order:
    cuFileReadAsync(file, B_i, size = aligned window, file_offset = window start, buf_offset = 0)
-   cudaMemcpyAsync(dst(part 0), B_i + rel0, n0, D2D)   one copy per run of parts contiguous in
-   cudaMemcpyAsync(dst(part 1), B_i + rel1, n1, D2D)   the file and the destination; 5+ copies
-   ...                                                  go out as one cudaMemcpyBatchAsync
+   cudaMemcpyAsync(dst(part 0), B_i + rel0, n0, D2D)   one copy per part, never merged (two
+   cudaMemcpyAsync(dst(part 1), B_i + rel1, n1, D2D)   touching destinations can be separate
+   ...                                                  allocations, which CUDA refuses to span);
+                                                        5+ copies go out as one
+                                                        cudaMemcpyBatchAsync
    cudaEventRecord(done_i)       -> the reactor polls it (default completion `poll`); with
                                     `completion = callback`: cudaStreamAddCallback, which marks
                                     lane i finished and wakes the reactor

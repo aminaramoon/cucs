@@ -675,8 +675,11 @@ otherwise the request takes the legacy path end to end.  Inside one request, lan
 lane reactors and every other slice to the reactors its own role picks, under the request's
 one coordinator (`templated_ioctx::slice_class`).  Lane sets take at most the plan's lane
 quota of the GPU (`lane_slots`; unplanned GPUs: `min(reactors_per_device x
-lanes_per_reactor, max_lanes_per_device)`).  Parts that are contiguous in the file and in
-the destination are one copy; a window holds at most `max_parts_per_read` parts.
+lanes_per_reactor, max_lanes_per_device)`).  Every part is its own copy: parts contiguous in
+the file and in the destination are not merged, because two touching destinations can be
+separate allocations (one buffer per Parquet column chunk from a `cudaMallocAsync` pool) and
+CUDA rejects a copy that spans two of them with `cudaErrorInvalidValue`.  A window holds at
+most `max_parts_per_read` parts.
 
 Instrumentation (`reactor_stats`, always on, relaxed): `lane_submit_ns` (time in
 `submit`/`copy_out`), `lane_read_async_ns` (of it, in `cuFileReadAsync`), `lane_flight_ns`
