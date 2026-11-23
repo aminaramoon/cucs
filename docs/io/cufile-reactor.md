@@ -1,5 +1,11 @@
 # Operating the cuFile reactor and opt-in async engine
 
+> **Superseded.** This page describes the cuFile backend that was replaced by the lane
+> reactors of [cufile-gds.md](cufile-gds.md): the configuration fields, classes and
+> statistics it names no longer exist. It is kept for its measurements and for what it says
+> about libcufile itself (`cufile.json`, NIC selection, filesystem behaviour), which does not
+> depend on the backend.
+
 **Default: `mode=legacy`. Do not flip it globally.** Real-GDS qualification is
 not complete. In particular, the DISK/cuDF caller audit and CPU/soak/network
 qualification remain outstanding. This guide describes the code, not every

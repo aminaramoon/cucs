@@ -1,5 +1,11 @@
 # Fused stream lanes and host batch reads (cuFile backend, opt-in)
 
+> **Superseded.** This page describes the cuFile backend that was replaced by the lane
+> reactors of [cufile-gds.md](cufile-gds.md): the configuration fields, classes and
+> statistics it names no longer exist. It is kept for its measurements and for what it says
+> about libcufile itself (`cufile.json`, NIC selection, filesystem behaviour), which does not
+> depend on the backend.
+
 Two opt-in features of the cuFile backend (`cufile_ioctx`, see
 [cufile-gds.md](cufile-gds.md)) that keep many reads in flight per thread instead of one:
 

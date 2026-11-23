@@ -1,5 +1,11 @@
 # Phase 7 qualification (default remains legacy)
 
+> **Superseded.** This harness qualified the async engine of the cuFile backend that the
+> lane reactors replaced (`docs/io/cufile-gds.md`). `cucascade_cufile_engine_bench` and the
+> B-10 runner (`run_b10.sh`) were removed with that backend, so the engine steps (B-3 to B-9,
+> G-7), B-10 and the gates built on them cannot run. `topology`, `B-0`, `B-1` and `B-2`
+> (`--only`) measure libcufile itself and still do.
+
 Run from the repository root in the pixi environment. Compat/simulator results
 are **not GDS evidence**. No default flip is authorized by these tools.
 
